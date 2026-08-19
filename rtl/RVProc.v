@@ -174,15 +174,27 @@ module RVProc #(
     wire [MMU_PROT_WIDTH-1:0] mmu_ifu_prot;
 
     // Bare physical mapping: PA page number = the low MMU_PA_WIDTH bits of
-    // the VA page number, same cycle (no TLB, no page walk). PLACEHOLDER:
-    // `mmu_ifu_prot`'s exact encoding is not confirmed from refs/openc906 in
-    // this task's scope (M4 pins the real ITLB semantics) -- tied to "every
-    // bit set" here as a permissive stand-in, not a claim about the real
-    // encoding's bit meanings.
+    // the VA page number, same cycle (no TLB, no page walk).
+    //
+    // `mmu_ifu_prot[4:0]` encoding PINNED by Task 2 (ICache.v's own header,
+    // "MMU request-response" section) from icache.v's actual consumers:
+    // [4]=pgflt/deny (forces a fault report instead of a refill), [3]=supv,
+    // [2]=cacheable (allocate gate), [1]=bufferable, [0]=secure (unused M1).
+    // Task 1 left this field tied to all-1s as an "every bit set" permissive
+    // placeholder without pinning the bits; under the now-pinned encoding
+    // that ties bit[4]=1, i.e. EVERY fetch would report a permanent page
+    // fault -- clearly not the bare, fault-free M1 stub's intent. Fixed
+    // here (an internal wire assignment, not a port -- outside the Task 1.4
+    // freeze, which covers ICache.v/IFU.v/BPU.v/RVProc.v PORT LISTS only):
+    // cacheable/bufferable/supv permissively 1 (M1 has one flat memory
+    // region, no uncacheable window modeled by this stub yet -- the M1
+    // uncached-fetch test drives ICache.v's uncached path directly via its
+    // own MMU stub in the unit bench, not through this system-level tie-off),
+    // pgflt/secure 0 (no fault-capable MMU exists until M4).
     assign mmu_ifu_pa           = ifu_mmu_va[MMU_PA_WIDTH-1:0];
     assign mmu_ifu_pa_vld       = ifu_mmu_va_vld;
     assign mmu_ifu_access_fault = 1'b0;
-    assign mmu_ifu_prot         = {MMU_PROT_WIDTH{1'b1}};
+    assign mmu_ifu_prot         = {1'b0, 1'b1, 1'b1, 1'b1, 1'b0};   // {pgflt,supv,ca,ba,sec}
 
     //=========================================================================
     // IFU <-> BPU seam (see BPU.v's header for the port rationale)
