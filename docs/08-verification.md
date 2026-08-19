@@ -1,0 +1,262 @@
+# 8. Verification
+
+This chapter describes the M0 simulation scaffold as built: there is no CPU
+pipeline yet (that starts at M1/M2). The AXI fabric, memory controller, and
+interrupt controllers are real RTL (ported from rv12/rocketM); the "core" is
+`rtl/TestMaster.v`, a small FSM that exists only to drive the fabric end to
+end and prove the harness works. Section 8.6 is the checklist for whoever
+starts M2 and needs to retire `TestMaster.v` for a real core.
+
+## 8.1 Simulation stack
+
+```
+bin/verisim/testbench (RVProcTest.cpp: TB::step, main)
+    |
+    |  RVProcAXI_Verilator() -- one call per simulated cycle
+    v
+dut.cpp (DUT::step)
+    |  drives clk 0->1->0 across the Verilated model; moves the MEMCTLPin
+    |  bus and the UART AXI4-Lite channel across the C++/RTL boundary
+    v
+Verilated RVProcAXI (rtl/RVProcAXI.v, obj/verisim/VRVProcAXI*)
+    |
+    +-- u_core = TestMaster.v (M0 scaffold: an AXI-exerciser FSM, not a CPU;
+    |            axi_i_* (ICache-style master) is tied off/inactive,
+    |            axi_d_* (DCache-style master) drives the whole smoke test)
+    |
+    +-- AXICrossbar (2 masters x 4 slaves, rtl/AXICrossbar.v)
+             |
+             +-- slave 0 (SI_MEM,   0x8000_0000) -> MEMCTL_AXI4L_step -> mpin
+             |            (rtl/MEMCTL_AXI4L_step.RTL.v, C2RTL-generated)
+             +-- slave 1 (SI_CLINT, 0x0200_0000) -> AXIWidthAdapter -> CLINT.v
+             +-- slave 2 (SI_PLIC,  0x0C00_0000) -> AXIWidthAdapter -> PLIC.v
+             +-- slave 3 (SI_UART,  0x1000_0000, ch_2) -> external AXI4L channel
+                          (UART register file decoded at 0x1000_1000, §8.7)
+```
+
+Below the Verilated boundary, `TB::step()` in `RVProcTest.cpp` services the
+two external ports every simulated cycle:
+
+- `xmem.update(&io_pins.mpin)` -- `io/ExtMem.h`, backs `SI_MEM` (the `mpin`
+  pins MEMCTL exposes). A byte-addressable, page-based host memory model.
+- `uart_cvt.fsm(&axi_bus.s_ch[DI_UART], ...)` (`io/RVProc_io.h`'s
+  `AXI4L::Converter`) plus `axi_uart.update(...)` (`device/uart16550.cpp`'s
+  NS16550A model), backing `SI_UART`.
+
+`DUT::sync(cpu)` (`dut.cpp`) mirrors architectural state (currently just
+`gpr[]`) from the Verilated model into the global `CoreState cpu` after
+every step. In M0 this is entirely compiled out: `rtl/verisim.h` defines
+`VERISIM_NO_CPU_STATE`, which guards both the `DUT::init()` preload and the
+`DUT::sync()` copy with `#ifndef` — there is no `CPU_PC`/`CPU_GPR` Verilator
+internal-signal path to read yet, because `TestMaster.v` has no architectural
+register file (it is not a CPU; see §8.5).
+
+## 8.2 The tohost protocol
+
+M0 reuses the riscv-tests/HTIF-style `tohost`/`fromhost` handshake, unchanged
+from rv12's own scaffold:
+
+1. **ELF symbol lookup.** `TestBench::parse_arg()` (`testbench/TestBench.cpp`)
+   loads the target ELF via `load_elf()` (`testbench/load_elf.cpp`, using
+   `libelf`) and resolves the `tohost`, `fromhost`, `begin_signature`,
+   `end_signature`, and `_stack_top` symbols. The address itself has no
+   special meaning beyond agreement between the linker script and the RTL:
+   in M0 that address is `0x9000_1000`, fixed by `ADDR_TOHOST` in
+   `rtl/rvproc_pkg.sv`, by the `TOHOST_ADDR` localparam in
+   `rtl/TestMaster.v`, and by `test/smoke/smoke.ld`'s `.tohost` section
+   placement.
+2. **Host-side polling.** `TestBench::run()`'s main loop (`testbench/TestBench.cpp`)
+   calls `step()` once per cycle and, whenever `tohost != (uint64_t)-1` (the
+   symbol resolved), reads `read_mem(tohost)` every cycle. A value of `0`
+   means "not done yet."
+3. **Encoding.** Once nonzero, bit 0 of the tohost word distinguishes a
+   completion code from a syscall pointer:
+   - `tohost & 1`: completion, encoded as `(testnum << 1) | 1`. `testnum ==
+     0` (i.e. `tohost == 1`) is PASS; any other `testnum` is a failing test
+     number, printed as `FAIL. test no. = <testnum>`.
+   - `tohost & 1 == 0` (nonzero): a pointer to a syscall argument block
+     (`which`/`arg0`/`arg1`/`arg2`); the framework implements `which == 64`
+     (write). Not exercised by `TestMaster.v` (it only ever performs the
+     completion write) — this path exists for the firmware kit's
+     `syscalls.c`, unused until a real core runs it (M2+).
+   - `tohost >> 32 == 0x0101_0000`: single-character console output. Also
+     unused by the M0 smoke test.
+4. **10-cycle settle.** After the first nonzero read, `run()` waits 10 more
+   cycles (`tohost_wait`, decremented once per cycle) before treating the
+   value as final — a debounce inherited from the donor framework.
+5. Once settled, `main()` (`RVProcTest.cpp`) returns whatever `run()`
+   returns, and `run()` returns `out`, the raw tohost word — see §8.3 for
+   why the process exit code is that raw word, not a conventional 0/1 code.
+
+## 8.3 Build and run
+
+```bash
+make verisim
+timeout 30 bin/verisim/testbench --print-result test/smoke/smoke.out
+echo "exit=$?"
+```
+
+- **`--print-result` is required** to see `PASS.`/`FAIL. test no. = N` on
+  stdout at all — `TestBench::run()` only prints those lines when the flag
+  is set. Without it, a successful (or failing) run produces no PASS/FAIL
+  text; you would have to infer the result from the exit code alone.
+- **The process exit code is the raw tohost value, not a conventional
+  0-means-success code.** `main()` returns `TestBench::inst->run(...)`,
+  which returns `out` — the raw completion word read from `tohost`. So
+  `exit=1` means PASS (`testnum==0`, encoding `(0<<1)|1`); `exit=3` means the
+  first failing test is test number 1 (`(1<<1)|1`); and so on. This is by
+  design (the riscv-tests convention) — do not "fix" it to return 0 on
+  success.
+- `timeout N` is a safety net, not part of the protocol: `TestMaster.v`'s
+  own on-chip watchdog (13-bit counter, `rtl/TestMaster.v`) converts a
+  stalled fabric into a reported `FAIL. test no. = 1` after 8192 cycles, so
+  in practice the run terminates on its own well before any reasonable
+  timeout.
+
+## 8.4 Waveform tracing (FST)
+
+```bash
+make verisim VERISIM_TRACE=1
+timeout 30 bin/verisim/testbench --print-result test/smoke/smoke.out
+```
+
+`VERISIM_TRACE=1` (`verilator.mk`) recompiles with `--trace-fst` and
+`-DVERISIM_TRACE`, which makes `DUT::init()`/`DUT::step()` (`dut.cpp`) open
+`run/dump.fst` and dump full-depth (`vdut->trace(tfp, 99)`) waves on both
+clock phases of every step. Switching `VERISIM_TRACE` on or off invalidates
+the previous build via the `TRACE_STAMP` file in `obj/verisim/`, so the
+rebuild is automatic. Tracing is off by default (it costs simulation speed);
+`run/` is gitignored, so the trace file never needs manual cleanup.
+
+## 8.5 The M0 TestMaster smoke test
+
+`rtl/TestMaster.v` stands in for the CPU inside `RVProcAXI.v`. It drives only
+the DCache-style AXI master port (`axi_d_*`; the ICache port `axi_i_*` is
+tied off/inactive) through a seven-state FSM:
+
+1. `S_WRITE`: write a 64-byte line at `0x9000_2000` (`PATTERN_ADDR`) with
+   sentinel values in AXI data lanes 0 and 7 (`PATTERN = 0xC906_5AFE_A5A5_0000`,
+   `PATTERN7 = 0xDEAD_BEEF_0000_0007`) — exercising the full write path:
+   crossbar arbitration, MEMCTL, `ExtMem`.
+2. `S_R_ADDR`/`S_R_DATA`: read the same line back and compare both lanes
+   against the sentinels, proving the write landed and the AXI data path
+   routes both lanes correctly.
+3. `S_C_ADDR`/`S_C_DATA`: read `CLINT_MTIME` (`0x0200_BFF8`) through the
+   AXIWidthAdapter -> CLINT.v path.
+4. `S_TOHOST`: write the completion word (`1` if every check above passed,
+   `3` — i.e. `(1<<1)|1`, "test no. = 1" — otherwise) to `TOHOST_ADDR =
+   0x9000_1000`.
+5. `S_DONE`: park forever; `quitted` is tied to `1'b0` (completion is
+   reported purely via `tohost`).
+
+**Result:** the smoke test passes. `bin/verisim/testbench --print-result
+test/smoke/smoke.out` prints `test/smoke/smoke.out: PASS.` and exits with
+`exit=1`.
+
+**Fail-detection path, verified real.** To confirm the harness can actually
+detect a failure (and is not just always printing PASS), the lane-7 compare
+on the `S_R_DATA` state was temporarily inverted — from
+`axi_d_rdata[DATA_WIDTH-1 -: 64] != PATTERN7` to the complementary sense, so
+a check that should pass now deliberately fails — and the simulator was
+rebuilt and rerun. This reproduced `test/smoke/smoke.out: FAIL. test no. =
+1` with `exit=3`, confirming the tohost/testnum encoding and the
+`--print-result` path both work in the failure direction, not just the
+success direction. The change was then reverted, rebuilt, and `PASS.`/
+`exit=1` reconfirmed before proceeding.
+
+## 8.6 Open items
+
+- **CLINT read path.** The M0 plan flagged a risk that the
+  `AXIWidthAdapter` -> `CLINT.v` read (`S_C_ADDR`/`S_C_DATA` in
+  `TestMaster.v`) might stall and require dropping those states from the
+  FSM. In this rv906 run, the CLINT read completed cleanly on the first
+  attempt and no fallback was needed — the risk did not materialize, and the
+  states remain in the FSM as written.
+- Everything else considered open for M0 is folded into the M2 restore
+  checklist below, plus the PLIC `int_src` item, which is called out
+  separately since M6 (not M2) owns it.
+
+## 8.7 M2 restore checklist
+
+The M0 scaffold intentionally elides architectural-state plumbing that only
+matters once a real CPU core exists. This list is for whoever starts M2 and
+needs to retire `TestMaster.v`:
+
+1. **Define `CPU_PC`/`CPU_GPR` and drop the no-state guard.** `rtl/verisim.h`
+   currently only does `typedef VRVProcAXI VDUT;` plus `#define
+   VERISIM_NO_CPU_STATE 1` — there is no `CPU_PC`/`CPU_GPR` Verilator
+   internal-signal path defined because `TestMaster.v` has no architectural
+   register file to point at. M2 must add those paths (once the real core's
+   register file exists) and remove `VERISIM_NO_CPU_STATE`, so the
+   `#ifndef VERISIM_NO_CPU_STATE` blocks in `DUT::init()` and `DUT::sync()`
+   (`dut.cpp`) compile in and actually preload/mirror `pc`/`gpr[]`.
+2. **Restore a `read_mem` D-cache-mirror fast path once the real DCache
+   exists.** `TB::read_mem()` (`RVProcTest.cpp`) currently always reads
+   straight through `ExtMem` (there is no D-cache in the RTL to mirror or
+   go stale relative to). Once M2/M3 add a real DCache, restore a fast path
+   that reads through a mirror of the cache array instead of always hitting
+   `ExtMem`, and account for the write-hazard this reintroduces (a
+   `write_mem()`/`write_byte()` from the host side can leave a stale mirror
+   entry if the RTL's own D-cache still holds the old line).
+3. **Extend `CoreState`/`sync()` to carry the cache mirror.** `DUT::sync()`
+   only copies `gpr[]` today. When item 2 lands, extend `CoreState` and
+   `sync()` to carry the D-cache mirror too — consider syncing it lazily
+   (only when `TestBench` actually needs it, e.g. around a `read_mem`
+   fast-path lookup) rather than copying a full cache mirror every cycle.
+4. **Prefer a `RESET_VECTOR` parameter over a post-reset `CPU_PC` poke.**
+   `rtl/RVProcAXI.v` already instantiates `u_core` with a `RESET_VECTOR
+   (64'h8000_0000)` parameter (and `TestMaster.v` declares a matching
+   `RESET_VECTOR` module parameter), but `TestMaster.v` has no PC/fetch logic
+   to consume it — the parameter is currently structural only. `dut.cpp`'s
+   `DUT::init()` still pokes `rootp->CPU_PC = pc` directly (compiled out
+   under `VERISIM_NO_CPU_STATE` in M0). When the real core lands, wire
+   `RESET_VECTOR` through to wherever the core actually initializes its PC
+   at reset, and prefer that over relying on the post-reset poke as the
+   primary reset mechanism (the poke can remain as a convenience for
+   redirecting a test's start PC, but boot-time reset should not depend on
+   it).
+5. **MEMCTL's AXI slave port caps bursts at 16 beats.** Confirmed in
+   `rtl/RVProcAXI.v`: `mem_raddr_m_len` and `mem_waddr_m_len` are declared
+   `[3:0]` and assigned from `s_arlen[SI_MEM][3:0]` / `s_awlen[SI_MEM][3:0]`
+   (around lines 434/439/477/483) before being handed to
+   `MEMCTL_AXI4L_step`. AXI `len` is otherwise 8 bits end to end (see the
+   `axi_i_awlen`/`axi_d_awlen` port widths in `TestMaster.v` and the
+   crossbar's `m_awlen`/`s_awlen` buses), but MEMCTL only ever sees the low
+   4 bits — i.e. a cap of 16 beats per burst. The real core's ICache/DCache
+   AXI masters must never issue a burst longer than 16 beats against this
+   memory port, or the high bits of `len` are silently truncated and the
+   extra beats will be misinterpreted by MEMCTL.
+6. **UART/Converter C++ path compiles but is unexercised.** `uart_cvt.fsm()`
+   (`AXI4L::Converter`, `io/RVProc_io.h`) and `axi_uart` (an NS16550A model,
+   `device/uart16550.cpp`) are wired into `TB::step()` (`RVProcTest.cpp`)
+   and build cleanly, but `TestMaster.v` never issues a UART transaction, so
+   this path has never actually moved a byte. Treat it as unverified until
+   M2 firmware (`test/hello.c` et al., built but not yet run — see §8.8)
+   exercises it for real.
+7. **ISA staging (RVC).** The firmware kit (`test/Makefile`) builds with
+   `-march=rv64imac_zicsr` for every test except `test/smoke`, which
+   deliberately builds `-march=rv64i` only (see `test/smoke/Makefile`). A
+   real RV64IMAFDC core (C906's baseline, per the design doc) that does not
+   yet decode RVC cannot run the firmware kit's normal build at all. The M2
+   sub-spec must decide between (a) landing RVC decode as part of the M2
+   core itself, or (b) adding a no-C fallback build target
+   (`-march=rv64im_zicsr` or similar, no `A`, no `C`) to the firmware kit so
+   early core bring-up has something it can actually run before RVC decode
+   exists.
+8. **PLIC's `int_src` has no UART-IRQ wire yet.** `rtl/RVProcAXI.v` ties the
+   PLIC's external interrupt-source bus to zero: `.int_src (8'b0), // No
+   external interrupts for now`. The UART model
+   (`device/uart16550.cpp`) is not yet wired to raise an interrupt through
+   PLIC to the core. This is an explicit M6 to-do (interrupt path
+   integration), not M2 — M2's scope is the integer execute/retire path,
+   not interrupts.
+
+## 8.8 What "build-only" means for the firmware kit
+
+`test/` (hello/clint_test/plic_test/intr_test, plus the shared `entry.S`,
+`link.ld`, `syscalls.c`, `uart.c`/`uart.h`, `printf.c`) builds cleanly with
+the xpack toolchain in M0 (`make -C test`), but none of these `.out` ELFs
+are ever loaded into the simulator or run — there is no CPU to run them.
+They exist to prove the toolchain and link script are wired correctly ahead
+of M2, which is the first milestone with a core capable of executing them
+(subject to the RVC decision in §8.7 item 7).
