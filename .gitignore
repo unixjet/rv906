@@ -1,0 +1,10 @@
+refs/
+bin/
+obj/
+obj_dir/
+config.h
+*.log
+*.fst
+*.vcd
+run/
+test/**/*.out
