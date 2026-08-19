@@ -8,3 +8,7 @@ config.h
 *.vcd
 run/
 test/**/*.out
+# Agent worktrees and per-agent state. `git worktree add .claude/worktrees/...`
+# puts another agent's full checkout in here; committing it would nest a second
+# copy of the repo inside itself.
+.claude/
