@@ -30,6 +30,14 @@
  * RESET_VECTOR default / rvproc_pkg.sv's cp0_xx_mrvbr). */
 #define M1_TEXT_BASE 0x80000000
 
+/* Base of the UNCACHED code region (common.ld's .text.uncached, Task 6). VA
+ * byte-address bit 31 is the cacheable bit for rtl/RVProc.v's MMU stub (see
+ * that file's comment at the mmu_ifu_prot assignment); 0x7FFF0000 has bit 31
+ * clear and is 64 KB below the reset vector, so it stays in `jal` range
+ * (+-1 MB) of .text.init and routes to the SoC's default (wide MEM) AXI
+ * slave rather than one of CLINT/PLIC/UART (RVProcAXI.v's AXIAddrDecode). */
+#define M1_UNCACHED_BASE 0x7FFF0000
+
 /* The byte `.org` pads with. 0x0101 as a halfword is `c.addi x2, x2, 0`: a
  * 16-bit NON-control instruction, so a fill region that does get executed
  * (a bug, since every pad here is meant to be reached only via an indirect
@@ -91,6 +99,17 @@ pad_label:
 #define PAD_AT(off, label) \
     .org (off), M1_FILL; \
 label:
+
+/* Start of the uncached code region (Task 6): same shape as M1_TEXT_START but
+ * opens the separate output section common.ld places at M1_UNCACHED_BASE.
+ * Use it AFTER the .text.init body. `.org`/PAD_AT offsets inside it are
+ * section-relative, i.e. relative to M1_UNCACHED_BASE, not to
+ * _m1_text_base -- JR_PAD (anchored on _m1_text_base) must NOT be used here;
+ * use JR_TARGET_OFF(off) + PAD_AT directly instead (M1_UNCACHED_BASE is
+ * itself 64-byte aligned, so a section-relative offset has the same low bits
+ * as the full address and JR_TARGET_OFF works out of the box). */
+#define M1_UNCACHED_TEXT \
+    .section .text.uncached, "ax", @progbits
 
 /* The tohost/fromhost line the testbench looks up by ELF symbol and
  * FetchSink writes its report to. Emit once per test, after the code. */

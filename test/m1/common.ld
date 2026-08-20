@@ -24,6 +24,18 @@ ENTRY(_start)
 
 SECTIONS
 {
+    /* UNCACHED code region (test/m1/uncached.S, Task 6). rtl/RVProc.v's MMU
+     * stub derives the cacheable attribute from byte-address bit 31 of the
+     * fetch VA (Task 6 finding, RVProc.v's own comment at the mmu_ifu_prot
+     * assignment) -- 0x7FFF0000 has bit 31 clear, so this block is fetched
+     * uncached, one AXI beat per request, never allocated into the ICache
+     * array. It sits 64 KB BELOW the reset vector, well inside `jal`'s
+     * +-1 MB reach from .text.init, and it has to be placed before .text
+     * because a linker script's location counter only moves forward. Tests
+     * that emit nothing into .text.uncached are unaffected. */
+    . = 0x7FFF0000;
+    .text.uncached : { *(.text.uncached) }
+
     . = 0x80000000;
 
     .text : {

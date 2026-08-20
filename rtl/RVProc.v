@@ -195,15 +195,38 @@ module RVProc #(
     // fault -- clearly not the bare, fault-free M1 stub's intent. Fixed
     // here (an internal wire assignment, not a port -- outside the Task 1.4
     // freeze, which covers ICache.v/IFU.v/BPU.v/RVProc.v PORT LISTS only):
-    // cacheable/bufferable/supv permissively 1 (M1 has one flat memory
-    // region, no uncacheable window modeled by this stub yet -- the M1
-    // uncached-fetch test drives ICache.v's uncached path directly via its
-    // own MMU stub in the unit bench, not through this system-level tie-off),
-    // pgflt/secure 0 (no fault-capable MMU exists until M4).
+    // pgflt/secure 0 (no fault-capable MMU exists until M4), bufferable/supv
+    // permissively 1.
+    //
+    // CACHEABLE (Task 6 finding, revises Task 4.2's comment above): the
+    // system-level tie-off originally left `ca` permissively 1 everywhere,
+    // deferring the M1 spec S4.2 "uncached-region fetch" directed test to
+    // ICache.v's own unit bench (icache_tb.cpp T6) on the theory that the
+    // bare stub has "one flat memory region, no uncacheable window". That
+    // meant test/m1/uncached.S could never actually exercise ICache.v's
+    // bypass-refill path through the REAL wired-together pipeline (IFU +
+    // ICache + FetchSink) -- exactly the integration surface Task 6 exists to
+    // gate. A bare-physical-mapping MMU stub deciding cacheability from a
+    // fixed VA window is still a bare mapping (no TLB, no page walk, same
+    // cycle) -- it is simply address-decoded rather than a flat constant.
+    // rv906 adopts rv12's own resolution for the identical M0 SoC address map
+    // (rv12 RVProc.v's MMU stub, and rv12 test/m1/uncached.S's derivation):
+    // cacheable = VA BYTE ADDRESS BIT 31. `ifu_mmu_va[51:0]` is the VPN
+    // (icache.v: `ifu_mmu_va = icache_rd_addr[63:12]`), so VA bit 31 is
+    // `ifu_mmu_va[19]`. Addresses below 0x8000_0000 (bit 31 clear) -- e.g.
+    // test/m1/uncached.S's 0x7FFF_0000 window, common.ld -- are therefore
+    // fetched uncached (ICache.v: `alloc_r_r <= mmu_ifu_prot[2] && ...`, so
+    // no array allocation, one AXI beat per request, bypass_word every time);
+    // 0x8000_0000 and above (every other M1 test's .text.init) stay cacheable
+    // exactly as before. RVProcAXI.v's own crossbar (AXIAddrDecode.v,
+    // DEFAULT_SLAVE = SI_MEM) routes 0x7FFF_0000 to the same wide 512-bit MEM
+    // slave as 0x8000_0000 (it matches none of CLINT/PLIC/UART's base/mask
+    // pairs), so this is a genuine cacheable/uncacheable split of ONE
+    // otherwise-uniform memory, not a different device.
     assign mmu_ifu_pa           = ifu_mmu_va[MMU_PA_WIDTH-1:0];
     assign mmu_ifu_pa_vld       = ifu_mmu_va_vld;
     assign mmu_ifu_access_fault = 1'b0;
-    assign mmu_ifu_prot         = {1'b0, 1'b1, 1'b1, 1'b1, 1'b0};   // {pgflt,supv,ca,ba,sec}
+    assign mmu_ifu_prot         = {1'b0, 1'b1, ifu_mmu_va[19], 1'b1, 1'b0};   // {pgflt,supv,ca,ba,sec}
 
     //=========================================================================
     // IFU <-> BPU seam (see BPU.v's header for the port rationale)

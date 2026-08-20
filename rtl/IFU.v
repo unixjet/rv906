@@ -196,18 +196,23 @@ module IFU (
     // (real RTL numbering kept in comments so a diff against pcgen.v stays
     // legible; level 5 -- BTB's own early redirect -- does not exist as a
     // separate rv906 port, see header note above, so it is skipped):
-    //   1. boot_rst_vld                              (reset-vector pcload)
-    //   2. rtu_ifu_chgflw_vld || iu_ifu_tar_pc_vld || pred_pcgen_chgflw_vld
+    //   1. rtu_ifu_chgflw_vld || iu_ifu_tar_pc_vld || pred_pcgen_chgflw_vld
     //      ("delayed change-flow": RTU > IU/BJU > BPU's final redirect;
     //      RTU wins ties, pcgen.v:208-209)
-    //   3. pred_pcgen_curflw_vld && !pcgen_buf_chgflw && !icache_pcgen_grant
+    //   2. pred_pcgen_curflw_vld && !pcgen_buf_chgflw && !icache_pcgen_grant
     //      ("same-cycle correction": RAS-return / delay-replay -- dead in
     //      M1 since BPU.v ties pred_pcgen_curflw_vld to 0, see the livelock
     //      check below; wired for real once Task 7 lands)
-    //   4. ipack_pcgen_reissue && icache_pcgen_inst_vld
+    //   3. ipack_pcgen_reissue && icache_pcgen_inst_vld
     //      (IBUF-stall-triggered same-PC refetch, SECTION IPACK)
-    //   6. icache_pcgen_grant                        (sequential +4 advance)
+    //   6. icache_pcgen_grant                        (sequential +4 advance;
+    //      folds `boot_rst_vld` in for free on the reset cycle, see BUG FIX
+    //      #2 below -- this level is NOT preceded by its own boot term)
     //   7. else hold
+    //
+    // `boot_rst_vld` is NOT a distinct level in the SEQUENTIAL `pcgen_ifpc`
+    // update below (see BUG FIX #2) -- only in the COMBINATIONAL
+    // `pcgen_fetch_pc` mux that levels 3/6 both read from (BUG FIX #1).
     //
     // LIVELOCK CHECK (plan Task 3.2, explicit per-level audit): every level
     // above 6 is gated by an actual `_vld` wire sourced from FetchSink or
@@ -250,17 +255,70 @@ module IFU (
 
     // No BTB-direct mux term (pcgen_chgflw_btb): see header note, this level
     // does not exist on rv906's frozen ports for M1.
-    wire [63:0] pcgen_fetch_pc = pcgen_chgflw_cur
+    //
+    // BUG FIX (Task 6 bring-up, found via the very first fetch of every M1
+    // test): `boot_rst_vld` is a ONE-SHOT pulse that is HIGH during the same
+    // cycle `ctrl_icache_req_vld` already reads 1 (IBUF is trivially "not
+    // stalled" the instant reset deasserts, SECTION CTRL/IBUF -- nothing
+    // gates fetch-enable on boot state, unlike the real vec.v FSM this file's
+    // header documents collapsing away). Before this fix, `pcgen_fetch_pc`
+    // fell through to the OLD (not-yet-loaded) `pcgen_ifpc` register
+    // (reset value 0) on that exact cycle, since the reset-vector load
+    // (`pcgen_ifpc <= cp0_xx_mrvbr`, the sequential block below) only lands
+    // on THIS SAME clock edge -- one register stage later than
+    // `pcgen_icache_va`/ICache's grant needs it. The result: ICache's very
+    // first request captured `icache_rd_addr = 0`, not the reset vector, and
+    // fetched/committed garbage from address 0 as if it were instruction 0 of
+    // every test (root-caused with IFU.v/ICache.v $display tracing on
+    // iss_selftest.S: `icache_rd_addr=0` at the very first icache_rd_cen,
+    // `icache_ipack_inst=0` delivered and committed at PC 0x80000000 instead
+    // of the real first opcode). Folding `boot_rst_vld` in as pcgen_fetch_pc's
+    // OWN highest-priority term (mirroring how `pcgen_chgflw_cur` already
+    // overrides same-cycle, pcgen.v-style) makes the combinational fetch
+    // address agree with the sequential update on the very cycle both fire,
+    // closing the race with no change to the boot FSM's own one-shot shape.
+    wire [63:0] pcgen_fetch_pc = boot_rst_vld
+                               ? {{(64-PC_WIDTH){1'b0}}, cp0_xx_mrvbr}
+                               : pcgen_chgflw_cur
                                ? {{(64-PC_WIDTH){pred_pcgen_curflw_pc[PC_WIDTH-1]}}, pred_pcgen_curflw_pc}
                                : pcgen_ifpc;                                         // pcgen.v:281-283 (btb term dropped)
     wire [63:0] pcgen_ifpc_inc = {pcgen_fetch_pc[63:2], 2'b00} + 64'h4;              // pcgen.v:277
 
+    // BUG FIX #2 (Task 6 bring-up, found running iss_selftest.S at rung 1
+    // through the full RTL: entry #2's committed opcode at pc=0x80000004
+    // came back as the SAME 32-bit word already delivered for pc=0x80000000,
+    // i.e. the SECOND useful fetch silently re-read the FIRST one instead of
+    // advancing). ROOT CAUSE: an earlier revision of this fix added its own
+    // `else if (boot_rst_vld) pcgen_ifpc <= mrvbr;` branch HERE, in the
+    // SEQUENTIAL update, ranked above `icache_pcgen_grant` (level 6). But
+    // `icache_pcgen_grant` legitimately fires on the SAME cycle `boot_rst_vld`
+    // is high (rv906's boot model has no fetch-enable gating during reset the
+    // way the real vec.v FSM's `vec_ctrl_reset_mask` provides -- see the note
+    // above), so that extra branch was clobbering a real, same-cycle grant's
+    // advance: instead of latching `pcgen_ifpc_inc` (= mrvbr+4, correctly
+    // computed from `pcgen_fetch_pc`, which the FIX ABOVE already threads
+    // through `boot_rst_vld`), it re-latched mrvbr itself -- so `pcgen_ifpc`
+    // never left the reset vector, and the SECOND ICache request re-issued
+    // address 0 (now a cache HIT after the first refill), redelivering the
+    // first word forever. THE FIX: do not special-case `boot_rst_vld` in this
+    // sequential block at all. `pcgen_ifpc_inc` is already derived from
+    // `pcgen_fetch_pc` (fixed above), so the pre-existing, unmodified
+    // `icache_pcgen_grant` branch (level 6, below) already produces the
+    // correct mrvbr+4 result on cycle 0 once that combinational fix is in
+    // place -- no separate sequential priority level is needed or correct.
+    // (Compare `pcgen_pipe_ifpc`'s own block just below, which DOES keep an
+    // unconditional `boot_rst_vld` term: that register is BPU's ID-stage PC
+    // view only, never re-consulted for fetch addressing, and its shape is a
+    // faithful clone of the real RTL's own `vec_pcgen_rst_vld` handling of
+    // `pcgen_pipe_ifpc` -- pcgen.v:285-293 has the identical asymmetry. The
+    // real RTL gets away with an unconditional term in `pcgen_ifpc` too
+    // (pcgen.v:239-240) only because `vec_ctrl_reset_mask` there guarantees
+    // `icache_pcgen_grant` can never be 1 on the same cycle `vec_pcgen_rst_vld`
+    // fires -- a guarantee rv906's collapsed boot FSM does not provide, so the
+    // real RTL's shape does not transplant safely into this register.)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pcgen_ifpc <= 64'd0;
-        end
-        else if (boot_rst_vld) begin                                                // level 1
-            pcgen_ifpc <= {{(64-PC_WIDTH){1'b0}}, cp0_xx_mrvbr};
         end
         else if (iu_ifu_tar_pc_vld && !rtu_ifu_chgflw_vld) begin                     // level 2, IU/BJU wins:
             pcgen_ifpc <= iu_ifu_tar_pc;                                            // pass the full 64b target through unchanged (pcgen.v:210,261-262)
@@ -350,12 +408,12 @@ module IFU (
     // to go (no exception path to IDU exists yet, SECTION IPACK below), and
     // the second pair is provably always 0 while BPU.v ties both outputs
     // inactive (SECTION IBUF below, `ifu_idu_id_bht_pred`) -- all four are
-    // genuinely unused, not dropped by oversight; `h1_32bit_vld` (SECTION
-    // IPACK) mirrors a signal that is ALSO dead in the real ipack.v itself
-    // (assigned once, ipack.v:376, never read again there either).
+    // genuinely unused, not dropped by oversight. (`h1_32bit_vld` WAS in
+    // this bucket through Task 3/5 -- see BUG FIX #3 in SECTION IPACK below
+    // for why it is genuinely consumed now.)
     wire _unused_ok = &{1'b0, pred_ctrl_stall, icache_ctrl_stall, iu_ifu_pc_mispred,
                          icache_ipack_acc_err, icache_ipack_pgflt,
-                         pred_ibuf_br_taken0, pred_ibuf_br_taken1, h1_32bit_vld};
+                         pred_ibuf_br_taken0, pred_ibuf_br_taken1};
 
     //=========================================================================
     // SECTION: IPACK  (aq_ifu_ipack.v + _entry.v -- 3 flop entries, ported
@@ -396,7 +454,7 @@ module IFU (
 
     wire h0_vld       = entry0_vld && entry0_inst[1:0] == 2'b11;                     // ipack.v:373
     wire h1_16bit_vld = entry1_vld && entry1_inst[1:0] != 2'b11;                     // ipack.v:375
-    wire h1_32bit_vld = entry1_vld && entry1_inst[1:0] == 2'b11;                     // ipack.v:376 (unused downstream in M1, kept for traceability)
+    wire h1_32bit_vld = entry1_vld && entry1_inst[1:0] == 2'b11;                     // ipack.v:376 (BUG FIX #3 below: genuinely consumed here)
     wire h2_16bit_vld = entry2_vld && entry2_inst[1:0] != 2'b11;                     // ipack.v:378
     wire h2_32bit_vld = entry2_vld && entry2_inst[1:0] == 2'b11 && !pred_ipack_chgflw_vld0; // ipack.v:379-380
 
@@ -467,6 +525,45 @@ module IFU (
     wire ipack_all_vld = h0_vld && entry1_vld && h2_16bit_vld
                       && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall;         // ipack.v:412-414
 
+    // BUG FIX #3 (Task 6 bring-up, found running iss_selftest.S at rung 1:
+    // pc=0x104's `addi x0,x0,0` -- a lone 32-bit instruction filling
+    // entry1+entry2 with nothing else valid, no carry -- was silently
+    // dropped; entry1/entry2 got overwritten by the next cycle's fresh
+    // fetch before ever reaching IBUF, and the eventual push finally fired
+    // several cycles later carrying whatever WRONG-PATH halfwords happened
+    // to be sitting in entry1/entry2 by then). None of `ipack_one_16bit_vld`/
+    // `ipack_secnd_vld`/`ipack_all_vld` (ipack.v:399-414, ported verbatim
+    // above) cover this shape -- confirmed this is a REAL gap, not a
+    // misreading, by finding the exact needed term COMMENTED OUT in the
+    // real aq_ifu_ipack.v source:
+    //   //assign ipack_one_32bit_vld = !h0_vld && h1_32bit_vld && entry2_vld
+    //   //                           || h0_vld && entry1_vld && h2_32bit_vld;
+    //   //assign ipack_retire_two = ipack_one_32bit_vld || ipack_two_16bit_vld;
+    // i.e. real silicon's `ibuf.v` evidently does its OWN, fuller create-side
+    // classification directly off h0_vld/h1_16bit_vld/h2_16bit_vld/entry-
+    // valids (extraction note S9: "IBUF's mirrored create-side arbitration...
+    // ibuf.v:1259-1313", flagged there as not fully traced) rather than
+    // trusting ipack.v's three named retire-count flags as a complete
+    // enumeration -- those three flags are demonstrably incomplete even in
+    // the real chip. rv906's binary-pointer IBUF (this file's own SECTION
+    // IBUF header note) chose to trust exactly those three flags as its sole
+    // push-count source, so the gap real hardware papers over inside ibuf.v
+    // is a live, reachable bug here -- and a common one: it fires on EVERY
+    // standalone 32-bit instruction with nothing else valid the same cycle,
+    // which is the ordinary case for any straight-line run of non-RVC code.
+    // FIX: reinstate the real RTL's own (commented-out) formula, both
+    // OR-terms -- the first covers "entry1 starts + entry2 completes,
+    // no carry"; the second covers "carry(h0)+entry1 complete a 32-bit
+    // instruction the SAME cycle entry2 starts a fresh straddle" (the
+    // mirror-image case `entry0_create_en`'s own third OR-term already
+    // carries entry2 forward for). Both retire exactly 2 halfwords, and
+    // `ipack_first_inst`'s existing entry0-vs-entry1 priority mux (above)
+    // already reconstructs the right pair for either case, so this folds
+    // cleanly into the existing `ipack_ibuf_inst_two` slot rather than
+    // needing a fourth push-count value.
+    wire ipack_one_32bit_vld = (!h0_vld && h1_32bit_vld && entry2_vld)
+                            || (h0_vld && entry1_vld && h2_32bit_vld);
+
     wire        ipack_retire_vld  = entry1_vld || h2_16bit_vld;                      // ipack.v:419
     wire [47:0] ipack_retire_inst = {entry2_inst, ipack_first_inst};                 // ipack.v:424
 
@@ -474,7 +571,8 @@ module IFU (
     wire ipack_ibuf_inst_vld_raw = ipack_retire_vld;
     wire ipack_ibuf_inst_vld     = ipack_retire_vld && !ipack_buf_stall;
     wire ipack_ibuf_inst_one     = ipack_one_16bit_vld;
-    wire ipack_ibuf_inst_two     = ipack_secnd_vld && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall;
+    wire ipack_ibuf_inst_two     = (ipack_secnd_vld || ipack_one_32bit_vld)
+                                 && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall; // BUG FIX #3
     wire ipack_ibuf_inst_all     = ipack_all_vld;
     wire [47:0] ipack_ibuf_inst  = ipack_retire_inst;
 

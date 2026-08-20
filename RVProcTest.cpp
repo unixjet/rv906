@@ -103,6 +103,16 @@ static void set_inv(int which)
     M1_CFG_BTB_CLR(dut.vdut) = (which == 1);
 }
 
+// --fencei-patch (Task 6): pulse the ICache's own invalidate-all request for
+// one cycle. Same level-sensitive/rising-edge-detected convention as the
+// bht/btb bits above (ICache.v SECTION INVALIDATE: `inv_req_rise =
+// cp0_ifu_icache_inv_req && !inv_req_r`), so the caller must clear this
+// again the cycle after raising it.
+static void set_icache_inv(bool on)
+{
+    M1_CFG_ICACHE_INV(dut.vdut) = on ? 1 : 0;
+}
+
 // Committed stream + resolve event/kind (sampled once per simulated cycle).
 // ONE instruction, not a slot array -- C906 delivers a single
 // instruction/cycle to IDU (plan "Global contracts").
@@ -133,6 +143,24 @@ static unsigned perr_code()     { return M1_PERR_CODE(dut.vdut); }
 //   --inv-test         pulse cfg_bht_inv / cfg_btb_clr mid-run, one at a
 //                      time (pacing: see TB::inv_pulse_update() below).
 //   --sink-stall       FetchSink's pseudo-random id_stall mode.
+//   --fencei-patch=<addr>:<word32>[:<commit>]
+//                      the fence.i mechanism (Task 6.1; see test/m1/
+//                      fencei.S). M1 has no store unit and cannot execute
+//                      fence.i itself, so BOTH halves of a self-modifying-
+//                      code test are the host's job: at the COMMIT BOUNDARY
+//                      <commit> (default 1000, a count of instructions
+//                      already compared by the checker, not a cycle) the
+//                      host (a) writes <word32> into the ELF image in ExtMem
+//                      at <addr> and (b) pulses cfg_icache_inv for one
+//                      cycle. Both oracles switch images at EXACTLY that
+//                      boundary: the RTL because the invalidate throws out
+//                      the stale line and forces a refill from the patched
+//                      memory, the golden ISS because it reads the image
+//                      lazily, at the moment each instruction is committed
+//                      (m1_iss.h "LAZINESS"). If the flag is given the run
+//                      FAILS unless the patch actually fired -- otherwise
+//                      fencei.S would pass vacuously against an unpatched
+//                      image.
 //   --iss-selftest     run the golden ISS's own gate and exit (no RTL) --
 //                      plan Task 5.3.
 //   --no-checker       sample nothing, compare nothing (debug escape
@@ -147,6 +175,11 @@ struct M1Opts {
     bool     inv_test = false;
     bool     sink_stall = false;
     bool     checker_on = true;
+    // --fencei-patch
+    bool     fencei_armed = false;
+    uint64_t fencei_addr = 0;
+    uint32_t fencei_word = 0;
+    uint64_t fencei_commit = 1000;
 };
 static M1Opts m1_opts;
 
@@ -238,6 +271,12 @@ struct TB : public TestBench {
     static const int      INV_PULSES  = 6;   // 3 bht + 3 btb, alternating
     int  inv_issued = 0;
     bool inv_active = false;
+
+    // --fencei-patch bookkeeping (see the flag documentation above and
+    // test/m1/fencei.S for the program-side mechanism).
+    bool     fencei_fired = false;
+    bool     fencei_inv_active = false;
+    uint32_t fencei_before = 0;
 
     TB() {
         dtb_addr = 0x87000000;
@@ -376,8 +415,70 @@ struct TB : public TestBench {
     void sample_commit() {
         if (!m1_opts.checker_on)
             return;
-        if (m1sink::cmt_valid())
+        if (m1sink::cmt_valid()) {
             m1_chk.slot(tb_cycle, m1sink::cmt_pc(), m1sink::cmt_opcode());
+            // Strictly BETWEEN two compared commits: everything up to here
+            // was decoded from the old image (by both oracles), everything
+            // after it from the new one (Task 6 fencei mechanism).
+            if (m1_opts.fencei_armed && !fencei_fired &&
+                m1_chk.compared >= m1_opts.fencei_commit)
+                fencei_apply();
+        }
+    }
+
+    // --fencei-patch pacing/pulse-clear (Task 6.1; test/m1/fencei.S documents
+    // the program side). Same one-cycle "raise, then drop before the next
+    // sample" discipline as inv_pulse_update() below: cfg_icache_inv is
+    // rising-edge detected on ICache.v's own consumer side (SECTION
+    // INVALIDATE: `inv_req_rise = cp0_ifu_icache_inv_req && !inv_req_r`), so
+    // it must be dropped BEFORE sample_commit() could raise it again on a
+    // later commit -- dropping it later in the same step would clear the
+    // request before any clock edge ever sampled it.
+    void fencei_pulse_clear() {
+        if (fencei_inv_active) {
+            m1sink::set_icache_inv(false);
+            fencei_inv_active = false;
+        }
+    }
+
+    // The fence.i mechanism (plan Task 6.1). M1 has no store unit and no
+    // fence.i execution, so BOTH halves of a self-modifying-code test are the
+    // host's job:
+    //   * the WRITE: the host patches the ELF image in ExtMem, which is what
+    //     the RTL's next refill will read AND what the golden ISS's lazy
+    //     rd_half() will read from that point on;
+    //   * the INVALIDATE: the host pulses cfg_icache_inv, the wire
+    //     ICache.v's fence.i path is driven from (FetchSink.v's CP0
+    //     stand-in), so the ICache runs its real 256-set INV_ALL walk and the
+    //     patched line has to be refetched rather than served stale.
+    // Both must land at the SAME point in the committed stream in both
+    // worlds: the patch is applied after exactly `fencei_commit` instructions
+    // have been COMPARED (a stream position, not a cycle), so it is identical
+    // regardless of stalls/refills/--sink-stall -- the golden ISS sees the
+    // old bytes for every earlier instruction and the new bytes for every
+    // later one, by construction (m1_iss.h's laziness note). On the RTL side
+    // the guarantee is the test program's: fencei.S puts far more committed
+    // filler between the patch boundary and the next fetch of the patched
+    // line than the IBUF (6 halfwords) plus the pipeline's few stages can
+    // hold in flight, so nothing stale can still be buffered when the
+    // invalidate fires.
+    void fencei_apply() {
+        const uint64_t base = m1_opts.fencei_addr & ~7ULL;
+        const unsigned sh   = (m1_opts.fencei_addr & 4) ? 32 : 0;
+        uint64_t w = read_mem(base);
+        fencei_before = (uint32_t)(w >> sh);
+        w = (w & ~(0xFFFFFFFFULL << sh)) |
+            ((uint64_t)m1_opts.fencei_word << sh);
+        TestBench::inst->write_mem(base, w);
+
+        m1sink::set_icache_inv(true);      // one-cycle pulse, cleared above
+        fencei_inv_active = true;
+        fencei_fired = true;
+        printf("[m1] fence.i patch at commit %llu (cycle %llu): [%016llx] "
+               "%08x -> %08x, cfg_icache_inv pulsed\n",
+               (unsigned long long)m1_chk.compared, (unsigned long long)tb_cycle,
+               (unsigned long long)m1_opts.fencei_addr, fencei_before,
+               m1_opts.fencei_word);
     }
 
     // Mid-run invalidate sweeps for --inv-test: one bit at a time, held for
@@ -414,6 +515,7 @@ struct TB : public TestBench {
         // Post-clock: the committed-stream registers hold what this edge
         // retired, so sample before anything else disturbs the model.
         tb_cycle++;
+        fencei_pulse_clear();
         sample_commit();
         inv_pulse_update();
 
@@ -464,6 +566,10 @@ struct TB : public TestBench {
                (unsigned long long)mem_reads, (unsigned long long)mem_writes);
         if (m1_opts.inv_test)
             printf("[checker] %d invalidate pulses issued\n", inv_issued);
+        if (m1_opts.fencei_armed)
+            printf("[checker] fence.i patch %s (commit boundary %llu)\n",
+                   fencei_fired ? "applied" : "NEVER APPLIED",
+                   (unsigned long long)m1_opts.fencei_commit);
 
         const char *why = NULL;
         if (tohost == (uint64_t)-1)
@@ -481,6 +587,12 @@ struct TB : public TestBench {
             why = "the golden stream never reached the sentinel (missing tail)";
         else if (m1_chk.compared < m1_chk.iss.prefix_count + 1)
             why = "the run stopped before committing the sentinel";
+        else if (m1_opts.fencei_armed && !fencei_fired)
+            // Otherwise fencei.S would pass vacuously: with no patch, both
+            // oracles read the same unmodified image and the run "passes"
+            // without ever exercising the invalidate path at all.
+            why = "--fencei-patch was given but the patch never fired (the "
+                  "run ended before commit boundary was reached)";
 
         if (why) {
             printf("[checker] M1-CHECKER-FAIL: %s\n", why);
@@ -520,6 +632,53 @@ static bool m1_take_uint(const char *arg, const char *flag, uint64_t *out)
     return true;
 }
 
+// --fencei-patch=<addr>:<word32>[:<commit>] (Task 6.1) -- see the flag
+// documentation above and TB::fencei_apply()/TB::sample_commit() above.
+static bool m1_take_fencei(const char *arg)
+{
+    static const char flag[] = "--fencei-patch";
+    const size_t n = sizeof(flag) - 1;
+    if (strncmp(arg, flag, n) != 0 || arg[n] != '=')
+        return false;
+
+    const char *p = arg + n + 1;
+    char *end = NULL;
+    bool ok = true;
+
+    const unsigned long long addr = strtoull(p, &end, 0);
+    if (end == p || *end != ':')
+        ok = false;
+
+    unsigned long long word = 0;
+    if (ok) {
+        p = end + 1;
+        word = strtoull(p, &end, 0);
+        if (end == p || (*end != '\0' && *end != ':') || word > 0xFFFFFFFFULL)
+            ok = false;
+    }
+    if (ok && *end == ':') {
+        p = end + 1;
+        const unsigned long long at = strtoull(p, &end, 0);
+        if (end == p || *end != '\0' || at == 0)
+            ok = false;
+        else
+            m1_opts.fencei_commit = (uint64_t)at;
+    }
+    if (!ok) {
+        fprintf(stderr, "--fencei-patch=<addr>:<word32>[:<commit>] expected\n");
+        exit(M1_FAIL_STATUS);
+    }
+    if (addr & 3ULL) {
+        fprintf(stderr, "--fencei-patch: address must be 4-byte aligned\n");
+        exit(M1_FAIL_STATUS);
+    }
+
+    m1_opts.fencei_armed = true;
+    m1_opts.fencei_addr  = (uint64_t)addr;
+    m1_opts.fencei_word  = (uint32_t)word;
+    return true;
+}
+
 int main(int argc, char** argv)
 {
     std::vector<char *> kept;
@@ -534,6 +693,7 @@ int main(int argc, char** argv)
         if (strcmp(cp, "--inv-test") == 0)   { m1_opts.inv_test = true; continue; }
         if (strcmp(cp, "--sink-stall") == 0) { m1_opts.sink_stall = true; continue; }
         if (strcmp(cp, "--no-checker") == 0) { m1_opts.checker_on = false; continue; }
+        if (m1_take_fencei(cp))              continue;
         if (m1_take_uint(cp, "--m1-rung", &v)) {
             if (v < 1 || v > 4) {
                 fprintf(stderr, "--m1-rung must be 1..4\n");
