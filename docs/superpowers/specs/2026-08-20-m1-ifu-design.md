@@ -65,7 +65,9 @@ habit — every number below is cited from the C906 extraction notes.
   - **BTB**: 16 flop-based fully-associative entries (tag[16]+target[16]+
     valid each), round-robin FIFO replacement on miss, in-place replace on
     hit. Tag/target cover only PC[15:0] — a real 64KiB aliasing period,
-    clone as-is (see §2.3 deviations note on why this costs capacity only).
+    clone as-is (see §2.3.3: a genuine CAM wrong-hit, not a plain miss, but
+    harmless because every hit is unconditionally re-validated at ID stage
+    before it can affect which instructions commit).
   - **RAS**: 4 flop entries, each just a 24-bit PC (no valid/priv bits), one
     content array shared by a speculative-pop pointer and a confirmed-BJU
     pointer; misprediction recovery resyncs the pointer only, not entry
@@ -138,11 +140,56 @@ habit — every number below is cited from the C906 extraction notes.
    non-issue). Record whichever resolution is found in code and in
    `docs/03-bpu.md`.
 3. **BTB PC[15:0] aliasing**: real 64KiB aliasing period, clone as-is (it is
-   the shipped behavior). Per rv12's C910 precedent for an analogous PC[13]
-   alias: confirm during implementation whether the alias costs capacity
-   only (tag mismatch → miss, never a wrong hit) or can produce a genuine
-   mispredict, and document the actual finding — do not assume the C910
-   resolution transfers unchanged, since C906's BTB is a CAM not an SRAM set.
+   the shipped behavior). **RESOLVED during Task 8 implementation** by
+   reading `aq_ifu_btb_entry.v`/`aq_ifu_btb.v`/`aq_ifu_pred.v` directly
+   (not the extraction note's restatement): this is a **genuine wrong-hit**,
+   not a plain "tag mismatch → miss, costs capacity only" — but it is
+   architecturally harmless by design, for a specific, confirmed reason
+   (below), not merely by luck.
+
+   The entry's tag compare (`aq_ifu_btb_entry.v:147-150`) is a bare 16-bit
+   equality, `btb_tag[15:0] == btb_acc_tag[15:0] && btb_vld`, with **zero
+   disambiguation** against the address's upper 24 bits anywhere in either
+   file (no stored tag bits beyond PC[15:0], no secondary target-vs-address
+   cross-check). So two real addresses sharing PC[15:0] but differing above
+   bit 15 make the CAM report a confident **hit** (`btb_rd_hit_vld=1`), not
+   a miss, the instant one of them has a live entry — and this hit fires
+   purely from the address match: `aq_ifu_btb.v:642-645`'s `btb_flop_vld`
+   (the read-side redirect trigger) requires only `ctrl_btb_inst_fetch &&
+   icache_btb_grant && btb_rd_hit_vld && !pred_btb_mis_pred`, with no
+   requirement that the fetched bytes at that address even decode to a
+   branch. The reconstructed target splices the tag-matching entry's
+   stored low-16-bit target onto the **current (aliasing) fetch address's
+   own** upper bits (`aq_ifu_btb.v:740`: `{pcgen_btb_ifpc[39:16],
+   btb_hit_tgt[15:0]}`) — so at the moment it happens, an aliased hit is
+   structurally indistinguishable from a genuine intended one.
+
+   What makes this harmless: `aq_ifu_pred.v`'s `btb_mis_pred`
+   (`aq_ifu_pred.v:720-723`) unconditionally re-validates **every** BTB hit
+   against the immediate-decoded ground truth of whatever instruction
+   actually reached ID stage (`pred_br_tar = pred_cur_pc + pred_br_imm`,
+   `:596-598`), firing whenever the predicted target disagrees **or** the
+   actual outcome isn't even taken. An aliased entry's stored target
+   belongs to a different instruction than whatever real bytes sit at the
+   aliasing PC, so (barring the vanishing coincidence that the two targets
+   happen to agree) this check fires and drives the exact same
+   `pred_chgflw`/`pred_pcgen_chgflw_vld` correction path
+   (`aq_ifu_pred.v:725-726`) as any ordinary wrong BTB entry. The front end
+   makes **no distinction whatsoever** between "an ordinary stale/wrong
+   hit" and "an alias-caused wrong hit" — both are just a target/taken
+   mismatch, corrected identically, at the identical cost of one wasted
+   speculative redirect cycle, always before anything commits.
+
+   So: the alias is a real, confirmed wrong-hit at the CAM level (not a
+   miss), but C906's front end treats *every* BTB hit, aliased or not, as a
+   merely provisional prediction that is always re-validated before it can
+   affect which instructions commit — making this a normal, expected,
+   self-correcting case by construction, not a latent correctness bug.
+   rv906 clones this behavior exactly (`rtl/BPU.v`'s SECTION BTB:
+   `btb_mis_pred`, `btb_clr_one`); `thrash.S` (built to span the BTB's
+   64KiB alias period) and `ind_jr.S` pass the full checker-validated
+   regression at rung 3 with this exact CAM/validation shape in place,
+   consistent with the finding above.
 4. **RAS depth limitation** (§2.1): clone the 4-entry, pointer-only-resync
    behavior as-is; this is a real, shipped limitation, not a simplification
    rv906 is introducing.

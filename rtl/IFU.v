@@ -246,6 +246,14 @@ module IFU (
     // `cp0_ifu_ras_en` -- the redirect only ever pulses for the single
     // cycle IPACK's bundle is actually live/retiring, so this level still
     // falls through cleanly whenever RTU/IU/BPU are silent OR stalled.
+    // TASK 8 UPDATE: level 1's own BPU term, `pred_pcgen_chgflw_vld`, is now
+    // also real (BPU.v's BTB, gated at rung >= 3 by `cp0_ifu_btb_en`).
+    // Re-audited the same way: BPU.v's chgflw section applies the identical
+    // `!ibuf_ipack_stall` gate to its own output (see BPU.v's own comment
+    // at that exact line) for the identical reason -- `ipack_pred_inst0/1`
+    // are frozen for the same multi-cycle-stall duration level 2's audit
+    // already covers, so without the gate level 1 would face the same
+    // continuously-re-triggered-abort risk. No new livelock surface here.
     //=========================================================================
     reg  [63:0]         pcgen_ifpc;          // pcgen.v:100; low 40b architectural, hi 24b sign-ext
     reg  [PC_WIDTH-1:0] pcgen_pipe_ifpc;     // pcgen.v:101; 1-cycle-delayed copy for BPU's ID-stage view
