@@ -256,14 +256,16 @@ non-goals) and `Security` is PMP/M4 territory. Dropping them for M2 is a legitim
 simplification, not a fidelity gap the way VIPT-alias omission (§2.2) is — those bits govern
 features RV906 will never need to model at all.
 
-**Flagged, needs a human decision (carried to §8):** `ADDR_TOHOST = 64'h9000_1000`
+**Resolved (see §8): `tohost` moves to the uncached aperture.** `ADDR_TOHOST = 64'h9000_1000`
 (`rvproc_pkg.sv:25`, pinned in M0) falls **inside** the cacheable DRAM window above. With a
 real write-back DCache, a `tohost` store that hits (or even one that misses under
 write-allocate) may only dirty a cache line without ever reaching the AXI bus — the same
 hazard RV12's C910 clone hit and solved by keeping `tohost` in an explicitly uncached
-aperture. This is not something M2 can silently paper over by simply not testing the DCache;
-see §7.3 for why M2's own verification plan needs the DCache genuinely exercised, which makes
-this hazard real rather than moot.
+aperture. §8 confirms this is a real, live bug (not hypothetical) and pins the fix: relocate
+`ADDR_TOHOST`/`common.ld`'s `.tohost` into the `< 0x8000_0000` uncached aperture, plus
+`MHCR.wa=0` as defense in depth. This is not something M2 can silently paper over by simply
+not testing the DCache; see §7.3 for why M2's own verification plan needs the DCache
+genuinely exercised, which makes this hazard real rather than moot.
 
 #### 2.3.6 Minimal CSR set for M2
 
@@ -613,17 +615,51 @@ Carried forward from the extraction notes, plus what surfaced while writing this
   M4's real MMU lands, the omitted alias-detection logic becomes a real correctness gap, not a
   deferred feature. Budget the DCache tag-array bit layout so re-adding it at M4 doesn't
   require re-deriving the SRAM organization (LSU note cross-cutting #3's own recommendation).
-- **`tohost` placement vs. the write-back DCache — needs a human decision, not an M2-internal
-  one.** `ADDR_TOHOST = 0x9000_1000` (pinned in `rvproc_pkg.sv` during M0) sits inside the
-  cacheable DRAM window (§2.3.5). Once M2's boot preamble turns caches on (§7.3, required for
-  the DCache to be genuinely tested), a `tohost` store could dirty a line without ever
-  reaching the AXI bus the testbench watches. Options, none exercised yet: (a) carve a small
-  uncached PMA window around `ADDR_TOHOST` in the M2 sysmap table; (b) move `ADDR_TOHOST` to
-  an uncached region (touches M0-pinned test infrastructure, out of this milestone's own
-  authority to change unilaterally); (c) accept write-through-only DCache behavior for M2
-  (simpler DCache, less faithful to C906's real write-back policy) so every store — cached or
-  not — always reaches the bus. This needs sign-off before the M2 implementation plan commits
-  to a specific DCache write policy and boot-preamble recipe.
+- **`tohost` placement vs. the write-back DCache — RESOLVED** (controlling-session decision,
+  following RV12's own proven fix for the identical C910 hazard — see
+  `rv12/docs/superpowers/specs/2026-08-19-m2-integer-machine-design.md`'s "tohost visibility
+  (pinned)" note). Confirmed by direct inspection that this is a real, live bug as things
+  stand: `testbench/TestBench.cpp:38-44`'s `read_mem`/`write_mem` peek/poke the `ExtMem`
+  backing store directly (the same store AXI writes land in) — a `tohost` store absorbed into
+  a dirty write-back DCache line never reaches `ExtMem` until eviction, so the harness's
+  `while (tohost) ...` poll loop would spin forever. Also confirmed `ADDR_TOHOST` has **no
+  hardware decode dependency anywhere** — `grep`-confirmed its only RTL consumer is
+  `FetchSink.v`'s `TOHOST_ADDR` parameter, and FetchSink itself is retired as part of M2's own
+  core swap (same treatment M1 gave `TestMaster.v`), so moving this address is not "touching
+  M0-pinned test infrastructure" in any way that endangers M0/M1's already-merged,
+  already-verified results (no M0/M1 test's PASS/FAIL outcome depended on this address being
+  cacheable, since neither milestone had a working D$).
+
+  **Decision, in two parts, mirroring RV12's exact recipe:**
+  1. **Move `tohost`/`fromhost` into the uncached aperture** (PA `< 0x8000_0000`, the same
+     "bit31 clear ⇒ uncached" convention M1's `test/m1/uncached.S`/`common.ld` already
+     established and proved working end-to-end). Concretely: `rvproc_pkg.sv`'s `ADDR_TOHOST`
+     moves from `0x9000_1000` to an address in that aperture (e.g. `0x7FFF_F000`, chosen at
+     implementation time to sit cleanly alongside `common.ld`'s existing
+     `0x7FFF0000`-based `.text.uncached` layout without colliding); `common.ld` moves its
+     `.tohost` output section to match. For real upstream `riscv-tests` binaries (`rv64ui-p-*`,
+     `rv64um-p-*`), M2 needs its own `env`/linker override (a new deliverable, not something
+     upstream `riscv-tests` provides out of the box) so `.tohost`/`.fromhost` land in the same
+     uncached aperture when those tests are built against rv906 — this is exactly the "our
+     env/linker script" step RV12's note describes doing for C910.
+  2. **Default `MHCR.wa` (write-allocate, bit 2, LSU note B3/`ext_csr.v`) to 0** — the donor
+     RTL's own reset default — as defense in depth: a committed store that misses (or targets
+     an address the CPU-side PMA table marks uncached) writes straight through to the AXI bus
+     with no allocation; only a cache **hit** writes back+dirty. This does not, by itself, fix
+     an already-resident dirty hit on a cacheable `tohost` mapping — placement (part 1) is the
+     actual fix — but it means a stray or test-induced cacheable mapping of `tohost` fails safe
+     on the (far more likely) cold-miss case rather than silently absorbing the store, matching
+     RV12's own stated rationale ("robust even if a test maps tohost cacheable-but-non-resident").
+
+  Both parts are cheap, donor-faithful (real C906 RTL defaults `MHCR.wa` to 0; nothing about
+  clause 1 requires deviating from C906's real write-back DCache policy the way option (c) in
+  the original draft of this note would have), and keep the DCache's write-back fidelity intact
+  everywhere except the one address that was never meant to be architectural memory in the
+  first place. The M2 implementation plan should schedule the `ADDR_TOHOST`/`common.ld`
+  relocation in the same task that retires `FetchSink.v`, and should NOT defer it — a test that
+  happens to pass before caching is turned on, then silently hangs once it is, is exactly the
+  kind of bug this project's verification discipline (real oracles, no papering over) exists to
+  catch before it's mistaken for a passing milestone.
 - **M1's chicken-bit re-home was never written down as an explicit M1→M2 handoff obligation**
   (unlike RV12's M1 doc, which had a numbered §10.7.1/§10.7.2 obligations list) — §2.3.6 states
   what M2 must do (build real `MHCR`, re-point IFU's `icache_en` consumer), but whether this
