@@ -314,12 +314,25 @@ parameter [2:0] WB_INT_TYPE_ALU   = 3'd1;
 parameter [2:0] WB_INT_TYPE_BJU   = 3'd2;
 parameter [2:0] WB_INT_TYPE_MULT  = 3'd3;
 parameter [2:0] WB_INT_TYPE_LSU   = 3'd4;
-// TODO(Task 3): whether DIV reuses WB_INT_TYPE_MULT's tag or needs its own
-// 5th value is an open item (design doc S8; IDU note S5.1/S10 confirms the
-// donor's WBT only enumerates OTHER/ALU/BJU/MULT/LSU, no DIV entry). IU.v's
-// real body (Task 3.6) resolves this by reading aq_idu_id_wbt.v/
-// aq_iu_top.v/aq_idu_id_wbt.v directly and records the finding here -- do
-// not add a 5th value on a guess.
+// RESOLVED (Task 3.6b): DIV does NOT reuse WB_INT_TYPE_MULT's tag, and no
+// 5th value is needed. Confirmed directly in the donor's real producer-type
+// mux, aq_idu_id_dp.v:566-570:
+//   dp_wb_dst0_type[2:0] =
+//       {3{..._EU_ALU_SEL}}  & WB_INT_TYPE_ALU
+//     | {3{..._EU_BJU_SEL}}  & WB_INT_TYPE_BJU
+//     | {3{..._EU_MULT_SEL}} & WB_INT_TYPE_MULT
+//     | {3{..._EU_LSU_SEL}}  & WB_INT_TYPE_LSU;
+// -- an OR-mux with exactly four one-hot terms (ALU/BJU/MULT/LSU); there is
+// NO `EU_DIV_SEL` term anywhere in it. A DIV-dispatched instruction
+// therefore produces dp_wb_dst0_type == 3'b000 == WB_INT_TYPE_OTHER, the
+// same "no special type" default every non-ALU/BJU/MULT/LSU EU (CP0/CSR
+// included) falls into. Cross-checked against the consumer side,
+// aq_idu_id_ctrl.v:513-530: the RAW/WAW "except" clauses only special-case
+// `dst0_type == WB_INT_TYPE_LSU` and `== WB_INT_TYPE_MULT` -- DIV (tagged
+// OTHER) matches neither, so a DIV producer's dependent consumer gets the
+// generic (non-excepted) scoreboard stall treatment, NOT MULT's exception.
+// IDU's Task 5 WBT scoreboard must cite this finding rather than guessing
+// DIV shares MULT's fast-path exemption.
 
 //-----------------------------------------------------------------------------
 // M2 Task 2: CP0/EU_CP0 FUNC one-hot values (aq_idu_cfig.h:453-474, the "CP0
@@ -349,6 +362,109 @@ parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRC   = 20'h00041;  // cfig.h:471
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRWI  = 20'h00211;  // cfig.h:472
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRSI  = 20'h00221;  // cfig.h:473
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRCI  = 20'h00241;  // cfig.h:474
+
+//-----------------------------------------------------------------------------
+// M2 Task 3.6a: idu_iu_ex1_func bit-per-opcode table for ALU/BJU/MULT/DIV --
+// RESOLVES the design doc S8 open item. Cross-referenced two sources, both
+// read directly (never from memory, per the plan's traceability rule):
+//   1. aq_idu_id_decd.v's main casez table (casez({x_inst[31:25],
+//      x_inst[14:12],x_inst[6:2]}), decd.v:1541-2169) -- confirms WHICH
+//      `FUNC_*` literal the donor's real decoder emits per RV64I/M opcode
+//      (e.g. decd.v:1856-1858 "add" -> EU_ALU/FUNC_ADD; decd.v:1569-1571
+//      "beq" -> EU_BJU/FUNC_BEQ; decd.v:1926-1928 "mul" -> EU_MULT/FUNC_MUL;
+//      decd.v:1954-1956 "div" -> EU_DIV/FUNC_DIV) and the custom-opcode
+//      "perf" table (decd.v:3187-3325) for the XThead ALU ops this unit
+//      implements (srri/srriw/tstnbz/rev/ff0/ff1/tst/revw/mveqz/mvnez/ext/
+//      extu, decd.v:3197-3324).
+//   2. aq_idu_cfig.h's own `FUNC_*` literal defines (cfig.h:321-410,
+//      415-422) -- the actual bit patterns, confirmed bit-exact against
+//      IU's own consumer-side op-group tests (IU note S12/S13, S2/S4/S5/S6):
+//      bit0=adder-group/mul-inst64/div-word selects (per-unit meaning
+//      differs, since func[19:0] is a SHARED bus gated by each unit's own
+//      *_sel), bit1=shifter-group, bit2=logic-group/mul-inst32, bit3=misc-
+//      group/mul-inst16, bit6=BJU-conditional-branch-flag (FUNC_CONDBR_SEL
+//      per cfig.h:312, confirmed matching every BEQ/BNE/BLT/BGE/BLTU/BGEU
+//      value below), bit7=BJU-AUIPC-flag (FUNC_AUIPC_SEL per cfig.h:313).
+// rv906's IU.v (Task 3 real body) does NOT re-derive C906's internal onehot
+// operand-prepare bit games from these values (that mechanism is IU note
+// S2's prose, not a bit-for-bit port requirement) -- it decodes by exact
+// equality against these pinned constants, the same style CSR.v (Task 2)
+// already established for CP0_FUNC_*. Immediate-vs-register instruction
+// forms sharing one mnemonic (ADD/ADDI, SLL/SLLI, BEQ has no immediate
+// form, etc.) share ONE constant here, exactly as the donor's own decode
+// table does (e.g. decd.v:1730 "addi" and decd.v:1856 "add" both assign
+// `FUNC_ADD` -- IDU's Task 5 decode picks which operand (register or
+// sign-extended immediate) lands in src1_data, not a different func value).
+//-----------------------------------------------------------------------------
+// ALU (IU note S2; alu.v:187,287,572,594 confirm func[0]=adder,[1]=shifter,
+// [2]=logic,[3]=misc as the op-group select, matched here by exact value):
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_LUI    = 20'h41401;  // cfig.h:321
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_ADD    = 20'h60401;  // cfig.h:322 (ADD/ADDI/ADDDI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_ADDW   = 20'h08441;  // cfig.h:325 (ADDW/ADDIW)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SUB    = 20'h60601;  // cfig.h:327
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SUBW   = 20'h08641;  // cfig.h:328
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SLT    = 20'h60e81;  // cfig.h:329 (SLT/SLTI, signed)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SLTU   = 20'h04a81;  // cfig.h:331 (SLTU/SLTIU, unsigned)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SLL    = 20'h10022;  // cfig.h:345 (SLL/SLLI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SLLW   = 20'h10062;  // cfig.h:347 (SLLW/SLLIW)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRL    = 20'h18802;  // cfig.h:349 (SRL/SRLI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRLW   = 20'h14842;  // cfig.h:351 (SRLW/SRLIW)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRA    = 20'h08082;  // cfig.h:353 (SRA/SRAI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRAW   = 20'h010c2;  // cfig.h:355 (SRAW/SRAIW)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRRI   = 20'h08102;  // cfig.h:357 (XThead rotate)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_SRRIW  = 20'h02142;  // cfig.h:358
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_EXT    = 20'h18602;  // cfig.h:359 (XThead sign bitfield extract)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_EXTU   = 20'h18202;  // cfig.h:360 (XThead zero bitfield extract)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_AND    = 20'h00024;  // cfig.h:365 (AND/ANDI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_XOR    = 20'h00044;  // cfig.h:367 (XOR/XORI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_OR     = 20'h00084;  // cfig.h:369 (OR/ORI)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_FF0    = 20'h00608;  // cfig.h:375 (find-first-0)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_FF1    = 20'h00208;  // cfig.h:376 (find-first-1)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_REV    = 20'h00048;  // cfig.h:377 (byte-reverse, 64b)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_REVW   = 20'h00028;  // cfig.h:378 (byte-reverse, 32b)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_TST    = 20'h00108;  // cfig.h:379 (single-bit test)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_TSTNBZ = 20'h00088;  // cfig.h:380 (per-byte nonzero test)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_MVEQZ  = 20'h00c08;  // cfig.h:381 (conditional move if ==0)
+parameter [FUNC_WIDTH-1:0] ALU_FUNC_MVNEZ  = 20'h00808;  // cfig.h:382 (conditional move if !=0)
+// No ALU_FUNC_MAX/MIN/MAXU/MINU/ADDSL constants -- see IU.v's header for the
+// MAX/MIN-vs-ADDSL nuance this task's own re-verification found (MAX/MIN
+// genuinely unreachable from decode; ADDSL is decode-reachable and its
+// adder-side mechanism is NOT dead in alu.v, but is still out of M2's own
+// ISA target per the design doc's explicit ALU op enumeration -- not ported
+// either way, for a more precise reason than "dead in this C906 build").
+
+// BJU (IU note S4; bju.v:611-612 confirm func[6]=conditional-branch-flag,
+// func[1]=jalr-within-uncond-group, func[7]=auipc, matched here by value):
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BEQ    = 20'h00144;  // cfig.h:404
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BNE    = 20'h0014c;  // cfig.h:405
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BLT    = 20'h00152;  // cfig.h:406 (signed)
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BGE    = 20'h0015a;  // cfig.h:407 (signed)
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BLTU   = 20'h00142;  // cfig.h:408 (unsigned)
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_BGEU   = 20'h0014a;  // cfig.h:409 (unsigned)
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_JAL    = 20'h00921;  // cfig.h:402
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_JALR   = 20'h00822;  // cfig.h:403
+parameter [FUNC_WIDTH-1:0] BJU_FUNC_AUIPC  = 20'h00980;  // cfig.h:410 (rides BJU's wb bus, IU note S2/S3)
+
+// MULT (IU note S5; mul.v:227-235 confirm bit0=inst64,bit1=inst32,
+// bit2=inst16 width class -- MULW's decode-table value sets bit1, matching
+// "32x32" width; matched here by value, not by re-deriving the width bits):
+parameter [FUNC_WIDTH-1:0] MULT_FUNC_MUL    = 20'h00021;  // cfig.h:387
+parameter [FUNC_WIDTH-1:0] MULT_FUNC_MULW   = 20'h00022;  // cfig.h:388
+parameter [FUNC_WIDTH-1:0] MULT_FUNC_MULH   = 20'h00121;  // cfig.h:389 (signed x signed)
+parameter [FUNC_WIDTH-1:0] MULT_FUNC_MULHU  = 20'h00181;  // cfig.h:390 (unsigned x unsigned)
+parameter [FUNC_WIDTH-1:0] MULT_FUNC_MULHSU = 20'h00141;  // cfig.h:391 (signed x unsigned)
+
+// DIV (IU note S6; div.v:191-193 confirm func[0]=word,[1]=quotient-select,
+// [2]=signed -- DIV/DIVU/REM/REMU share one core, div_res_sel_quotient just
+// picks which result rides the bus, matched here by value):
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_DIV    = 20'h00006;  // cfig.h:415 (signed quotient)
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_DIVU   = 20'h00002;  // cfig.h:416 (unsigned quotient)
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_DIVW   = 20'h00007;  // cfig.h:417
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_DIVUW  = 20'h00003;  // cfig.h:418
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_REM    = 20'h00004;  // cfig.h:419 (signed remainder)
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_REMU   = 20'h00000;  // cfig.h:420 (unsigned remainder)
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_REMW   = 20'h00005;  // cfig.h:421
+parameter [FUNC_WIDTH-1:0] DIV_FUNC_REMUW  = 20'h00001;  // cfig.h:422
 
 //-----------------------------------------------------------------------------
 // M2: id_ex1_t -- IDU's single shared EX1 payload (design doc S4.2),

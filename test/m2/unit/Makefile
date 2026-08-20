@@ -13,6 +13,7 @@
 # this exact template -- do not restructure when they land.
 #
 #   make -C test/m2/unit csr        # build the CSR bench
+#   make -C test/m2/unit iu         # build the IU bench (plan Task 3.7)
 #   make -C test/m2/unit run        # build and run every bench (UNIT-SUITE-PASS/FAIL)
 #   make -C test/m2/unit clean
 
@@ -25,7 +26,7 @@ VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
 BIN_DIR = $(ROOT)/bin/unit
 
 .PHONY: all run clean
-all: csr
+all: csr iu
 
 #-----------------------------------------------------------------------------
 # CSR (plan task 2.2)
@@ -43,6 +44,22 @@ $(CSR_BIN): $(CSR_RTL) $(CURDIR)/csr_tb.cpp
 		-o $@ $(CSR_RTL) $(CURDIR)/csr_tb.cpp
 	$(MAKE) -C $(CSR_OBJ) -f VCSR.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
 
+#-----------------------------------------------------------------------------
+# IU (plan task 3.7)
+#-----------------------------------------------------------------------------
+IU_OBJ = $(ROOT)/obj/unit/iu
+IU_BIN = $(BIN_DIR)/iu_tb
+IU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/IU.v
+
+.PHONY: iu
+iu: $(IU_BIN)
+
+$(IU_BIN): $(IU_RTL) $(CURDIR)/iu_tb.cpp
+	@mkdir -p $(IU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module IU --Mdir $(IU_OBJ) \
+		-o $@ $(IU_RTL) $(CURDIR)/iu_tb.cpp
+	$(MAKE) -C $(IU_OBJ) -f VIU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
 # Run EVERY bench even when one fails, then report -- a recipe line that
 # exits non-zero would otherwise abort the target and hide the benches
 # behind it, exactly backwards for a regression run (test/m1/unit/Makefile
@@ -50,8 +67,9 @@ $(CSR_BIN): $(CSR_RTL) $(CURDIR)/csr_tb.cpp
 run: all
 	@rc=0; \
 	$(CSR_BIN) || rc=1; \
+	$(IU_BIN) || rc=1; \
 	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
 	exit $$rc
 
 clean:
-	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN)
+	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN)
