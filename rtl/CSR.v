@@ -607,16 +607,45 @@ module CSR #(
     // SECTION EX1 COMPLETION -- cp0_rtu_t (design doc S4.2): old-CSR-value
     // writeback riding the same single-cycle EX1 completion path as any
     // other producer (no FSM, CP0 note B1), plus the synchronous-exception
-    // declaration bus. `cp0_rtu_ex1_cmplt_dp` is CSR's one-hot completion-
-    // source-select bit for RTU's rbus arbiter (RTU note S3/S7) -- CP0 has
-    // no separate plain `_cmplt` the way IU/LSU do (only CSR ops ever
-    // produce a GPR result at all; ecall/ebreak/mret/fence/fence.i never
-    // reach the arbiter), so it is wired 1:1 with `wb_vld`.
+    // declaration bus.
+    //
+    // TASK 4 DISCOVERED BUG, FIXED HERE (same "documented amendment, not
+    // silent" discipline as this file's own "TASK 2 DISCOVERED GAP" note
+    // above): `cp0_rtu_ex1_cmplt_dp` is RTU's one-hot RETIRE-heartbeat leg
+    // (RTU note S2: `dp_cmplt_source[6:0] = {alu,mul,bju,div,lsu,cp0,
+    // vec}_cmplt_dp`, OR'd into `dp_ex1_cmplt_dp`, which gates whether
+    // RTU's EX1->EX2 retire register latches AT ALL this cycle) -- this is
+    // a DIFFERENT signal from `cp0_rtu_ex1_wb_vld`/`_wb_dp` (RTU's rbus
+    // GPR-writeback-source-select bit, RTU note S3). Confirmed directly
+    // against the donor: `cp0/rtl/aq_cp0_iui.v:752,804-809` drives these
+    // two families from DIFFERENT expressions --
+    // `cp0_rtu_ex1_wb_dp = iui_inst_dst_vld_dp = iui_inst_csr` (CSR-op-only,
+    // matches `wb_vld` below) vs. `cp0_rtu_ex1_cmplt_dp = idu_cp0_ex1_dp_sel`
+    // (ANY CP0-dispatched, non-internally-stalled instruction -- ecall/
+    // ebreak/mret/fence/fence.i included, no GPR-result filter at all) --
+    // and `rtu/rtl/aq_rtu_ctrl.v:190,197-199`'s `cmplt_clk_en = ctrl_ex1_
+    // cmplt_dp || ...` is the literal retire-latch enable this feeds.
+    // Tying `cp0_rtu_ex1_cmplt_dp` 1:1 with `is_csr_op` (the previous body
+    // of this file) meant ecall/ebreak/mret/fence/fence.i -- all of which
+    // set `idu_cp0_ex1_sel` but not `is_csr_op` (this file's own DECODE
+    // section note: "FENCE/FENCE.I ... produce none of the three
+    // completion signals below at all") -- would NEVER assert RTU's
+    // retire-latch-enable and could therefore never retire once RTU.v
+    // (Task 4) exists: a real, pipeline-wedging bug, not a style nit.
+    // Fix: `cp0_rtu_ex1_cmplt_dp` is wired to `ex1_active` (this file's own
+    // `idu_cp0_ex1_sel && !ex1_flush`, already computed in the DECODE
+    // section above) -- the direct rv906 analogue of the donor's dispatch-
+    // select-minus-internal-stall-and-flush -- while `cp0_rtu_ex1_wb_vld`
+    // correctly stays CSR-op-only (it already matched the donor's narrower
+    // `wb_dp`/`wb_vld` family and needed no change). RTU.v itself does not
+    // exist yet at the time of this fix (Task 4 lands it in the same
+    // commit) -- nothing was silently broken; this is the first cycle
+    // anything reads this port for real.
     //=========================================================================
     assign cp0_rtu_ex1_wb_vld   = is_csr_op;
     assign cp0_rtu_ex1_wb_data  = csr_rdata;
     assign cp0_rtu_ex1_wb_preg  = idu_cp0_ex1_dst0_reg;
-    assign cp0_rtu_ex1_cmplt_dp = is_csr_op;
+    assign cp0_rtu_ex1_cmplt_dp = ex1_active;
 
     // Synchronous exceptions CP0 itself detects: illegal instruction (any
     // CP0-dispatched op IDU already flagged illegal), ecall (M-mode only --

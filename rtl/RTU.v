@@ -1,10 +1,9 @@
 //=============================================================================
 // RTU.v - retire unit: one-hot completion OR, EX1->EX2 retire latch,
 //          exception/interrupt priority, flush FSM, rbus/wb arbitration
-//                                                (M2 SKELETON: ports frozen)
+//                                                     (M2 Task 4: real body)
 //=============================================================================
-// C906 files covered (real body arrives in plan Task 4; this file freezes
-// the port list only):
+// C906 files covered:
 //   gen_rtl/rtu/rtl/aq_rtu_top.v    (glue)
 //   gen_rtl/rtu/rtl/aq_rtu_ctrl.v   (one-hot cmplt OR -> retire_vld register)
 //   gen_rtl/rtu/rtl/aq_rtu_dp.v     (EX1->EX2 retire-packet pipe register)
@@ -18,37 +17,137 @@
 // sections, esp. S2 retire structure, S3 rbus/wb, S4 exception priority,
 // S6 flush/redirect signal inventory, S7 CSR-writeback timing).
 //
-// SEAM NOTES:
+// PORT-LIST AMENDMENTS (documented, not silent -- same discipline CSR.v's
+// Task 2 "TASK 2 DISCOVERED GAP" and IU.v's Task 3 "PORT-LIST AMENDMENT"
+// notes used):
+//  1. `cp0_rtu_trap_pc` (input, [PC_WIDTH-1:0]) -- CSR.v's OWN header
+//     ("TASK 2 DISCOVERED GAP, FIXED HERE") already anticipated exactly
+//     this: it added `cp0_rtu_trap_pc` as a CSR.v OUTPUT specifically
+//     because "RTU.v itself does not exist yet... it is wired for the
+//     first time when RTU.v's real body is built." Task 1's frozen RTU.v
+//     skeleton had no matching input at all -- added here, closing the
+//     loop CSR.v opened. Without it, NO trap could ever compute a redirect
+//     target (RTU note S5/S7: `cp0_rtu_trap_pc`, read combinationally by
+//     retire's changeflow-PC mux independent of CP0's own EX1 pulse).
+//  2. `lsu_rtu_ex2_dest_reg` (input, [GPR_IDX_WIDTH-1:0]) -- resolves the
+//     skeleton's own flagged open item (header note: "whether LSU's 3
+//     distinct donor-side writeback paths... collapse to the 2 paths this
+//     skeleton pins... is the exact open item RTU note S2 flags... Task
+//     4/6 resolve it together"). `rtu_idu_fwd2` (LSU-EX2 forward, RTU note
+//     S3) needs a DESTINATION REGISTER to be meaningful at all -- a
+//     forward with data but no target register cannot be consumed by
+//     IDU's forward mux. The skeleton had `lsu_rtu_ex2_data`/`_data_vld`
+//     but no matching preg; added here, mirroring the donor's own
+//     `lsu_rtu_ex2_dest_reg` (RTU note S3, `aq_rtu_rbus.v:334`) exactly.
+//     LSU.v itself does not exist yet (Task 6), so nothing drives this
+//     port for real today -- same "landing pad, no live effect yet"
+//     reasoning IU.v's Task 3 amendments used.
+//
+// TASK 4's RESOLUTION OF THE RTU NOTE S2 "LSU WRITEBACK PATH COUNT" OPEN
+// ITEM (the skeleton's own header flagged this for "Task 4/6... not
+// guessed here"): the donor has THREE distinct LSU->RTU write-adjacent
+// buses (`lsu_rtu_ex1_wb_*` feeding the rbus EX1-group arbiter;
+// `lsu_rtu_ex2_*` feeding fwd2; `lsu_rtu_wb_*` feeding wb1 directly,
+// bypassing the arbiter). M2's frozen skeleton only carries TWO LSU write-
+// adjacent signal GROUPS, and -- critically -- their NAMES match the
+// donor's `lsu_rtu_wb_*` (wb1) and `lsu_rtu_ex2_*` (fwd2) exactly, NOT the
+// donor's separately-named `lsu_rtu_ex1_wb_*` (rbus EX1-group leg). Task 4
+// therefore resolves this by NOT folding LSU into the rbus EX1-group
+// arbiter at all: `lsu_rtu_wb_data/_preg/_vld` drives `rtu_idu_wb1`
+// DIRECTLY (matching the donor's own aq_rtu_wb.v:180-197 treatment of its
+// identically-named port, bit for bit), and the rbus's "EX1 group" is
+// therefore ALU+BJU+CP0 only for M2 (not ALU+BJU+CP0+LSU-ex1 as in the
+// full donor) -- DIV and MUL-EX3 still arbitrate against this narrowed EX1
+// group with the exact same priority (EX1 group > DIV > MUL-EX3, RTU note
+// S3). This gives LSU an uncontested, dedicated write port instead of
+// forcing it to race ALU/BJU/CP0/DIV/MUL for `rtu_idu_wb0` -- a reasonable
+// reading of the ACTUAL port names available, but a genuine judgment call;
+// flagged prominently in the Task 4 completion report, not guessed
+// silently. `lsu_rtu_ex1_cmplt`/`_cmplt_dp` remain independent of this
+// choice -- they feed ONLY the one-hot completion/retire-heartbeat bus,
+// never the rbus writeback arbiter, exactly like every other producer.
+//
+// KNOWN, DOCUMENTED SCOPE GAPS (flagged, not silently modeled as fully
+// accurate -- Task 4 completion report restates these):
+//  * `retire_cpu_no_op`/`retire_pipeline_empty` (RTU note S6, the flush
+//    FSM's drain gate) omit the donor's `iu_xx_no_op`/`lsu_rtu_no_op`
+//    qualifiers: NEITHER port exists anywhere in M2's contracts (IU.v,
+//    already committed, exposes no `iu_xx_no_op`; LSU.v does not exist
+//    yet). This body approximates drain status from what RTU itself can
+//    observe (`!ex2_retire_vld && !wb0_vld && !wb1_vld`) -- LSU's STB is
+//    explicitly NOT gated on this either way (contract 4: "STB drains
+//    unconditionally... no queued/commit-gated write mechanism"), so
+//    omitting the donor's `!lsu_rtu_ex1_buffer_vld` term is a deliberate,
+//    contract-sanctioned simplification, not a gap; the `iu_xx_no_op` omission
+//    is the one genuine fidelity gap, likely benign (IU's own `_full`/
+//    `_issue_stall` backpressure already blocks new dispatch for as long
+//    as MULT/DIV are busy, and both terminate with a wb pulse RTU DOES
+//    see) but not independently proven -- Task 6 (which needs its own
+//    `lsu_rtu_no_op`-analogous signal for its STB reasoning, contract 4)
+//    is the natural place to revisit this together.
+//  * CP0-sourced exceptions carry NO `tval` value on any port anywhere:
+//    CSR.v exports `expt_vld/_int/_vec` only, no `expt_tval`. Illegal-
+//    instruction (vec=2) IS nominally in the mtval allowlist (real RISC-V
+//    semantics populate mtval with the offending opcode there), but this
+//    body's `ex1_tval` is sourced ONLY from LSU's `lsu_rtu_tval` (gated on
+//    `lsu` being the cmplt source) -- a CP0-sourced illegal-instruction
+//    trap reads mtval=0 rather than the offending opcode. Not required for
+//    M2's rv64ui/um pass bar (mtval's value is not part of the
+//    RVTEST_PASS/FAIL protocol) and not silently worked around -- flagged
+//    here and in the Task 4 completion report for whichever milestone
+//    wants spec-exact mtval-on-illegal-instruction behavior (would need a
+//    new CSR.v output port).
+//  * `iu_rtu_ex1_div_cmplt`/`_cmplt_dp` (and, for a narrow multiply with no
+//    split needed, `iu_rtu_ex1_mul_cmplt`/`_cmplt_dp`) are, per IU.v's own
+//    already-committed body AND the real donor (confirmed directly,
+//    `gen_rtl/iu/rtl/aq_iu_div.v:755-756`: `iu_rtu_ex1_div_cmplt =
+//    idu_iu_ex1_div_sel`), a plain LEVEL echo of the dispatch-select input,
+//    held high for as long as IDU (Task 5, not yet built) holds `_sel`
+//    asserted -- i.e. for DIV's *entire* multi-cycle busy span, not a
+//    single-cycle pulse (iu_tb.cpp's own `div_op()` helper documents and
+//    exercises exactly this: "the real 'is the DATA ready yet' signal is
+//    iu_rtu_div_wb_vld, drained next"). This body ORs that signal into the
+//    one-hot completion bus EXACTLY as specified (task 4.1's "OR'd into
+//    dp_ex1_cmplt" and the donor's own `aq_rtu_ctrl.v`/`aq_rtu_dp.v`, which
+//    apply no extra qualification either) -- faithful, not a bug Task 4
+//    introduced or should "fix". Consequence, flagged for Tasks 5/8/9: once
+//    IDU/the full pipe exist, `ex2_retire_vld` will be held high across a
+//    multi-cycle DIV's *entire* residency, not just its final cycle --
+//    anything that wants "one pulse per architecturally-retiring
+//    instruction" (a future minstret auto-increment arm, the per-retire
+//    oracle trace of design doc S7.3/contract 13) MUST edge-qualify this
+//    signal or gate on the wb0/wb1 valid pulse instead of raw
+//    `ex2_retire_vld`, not assume it is already a clean per-instruction
+//    pulse. Design doc S7.3's "retire and architectural writeback are the
+//    same cycle for every source" holds for the *final* cycle of any
+//    producer's completion, but for DIV/narrow-MUL specifically,
+//    `ex2_retire_vld` can precede the matching `rtu_idu_wb0_vld` pulse by
+//    several cycles while the same instruction is still resident.
+//  * `ifu_rtu_warm_up` (the donor's reset/pipeline-fill signal, gating
+//    every donor register's "or warm_up" term) has no corresponding M2
+//    port anywhere -- omitted outright, matching M1's own reset-vector-only
+//    warm-up model (no separate warm-up pulse exists in this design).
+//  * vstart/fs_dirty/vs_dirty/`vpu_rtu_*`/HPCP/DTU/MMU (RTU note S2/S3/S6):
+//    M4/M5-only concepts with ZERO corresponding ports anywhere in M2's
+//    contracts -- not modeled at all, not even as a dead-but-present leg,
+//    since there is no port to attach one to (unlike the pending-
+//    breakpoint/interrupt/debug-breakpoint legs, which DO have a
+//    structural home in the exception-priority chain below).
+//
+// SEAM NOTES (rv906 decomposition, carried over from the skeleton):
 //  * RTU is NOT a reorder buffer (contract/RTU note S0/S9) -- one un-
 //    buffered EX1->EX2 pipeline register, retiring at most 1/cycle, 0/cycle
-//    on any stall, no queue. `rtu_ex2_t` (design doc S4.2) is RTU-internal
-//    (Task 4's own packed struct), never a port.
-//  * The one-hot completion bus's 7th source, `vec_cmplt_dp`, has NO M2
-//    port here at all -- there is no VPU in M2 (contract/RTU note S2's
-//    `{alu,mul,bju,div,lsu,cp0,vec}_cmplt_dp`); Task 4's real body ties
-//    that leg to 0 internally rather than accepting an external wire for
-//    it.
-//  * `rtu_ifu_chgflw_vld`/`_pc`/`rtu_ifu_flush_fe` are reused UNCHANGED from
-//    M1 -- names/widths copied verbatim from rtl/RVProc.v's current wire
-//    declarations (lines 287-289), already consumed by IFU.v since M1.
-//  * KNOWN, DELIBERATE GAP (mirrors CSR.v's/M1's BPU.v Task-7-amendment
-//    precedent, not a freeze violation): no `cp0_rtu_int_vld`-shaped
-//    pre-masked-interrupt-vector input exists on this port list. M2's
-//    minimal mie/mip model (contract 7) is far simpler than the donor's
-//    full 15-source `cp0_rtu_int_vld[14:0]` (RTU note S5) -- whether M2's
-//    interrupt-priority leg (wired-but-never-fires, contract 1) computes
-//    priority from mie/mip directly inside RTU.v itself, or still takes a
-//    pre-masked vector from CSR.v, is left for Task 4 to decide and record
-//    (RTU note S5's own open item: the vector-building module lives in
-//    cp0/rtl and was not traced). Adding this deliberately here rather
-//    than guessing a shape/width now.
-//  * Likewise, whether LSU's 3 distinct donor-side writeback paths (EX1
-//    rbus-fast, EX2 one-cycle-later forward, and a separate late "wb port1"
-//    -- RTU note S2/S3) collapse to the 2 paths this skeleton pins
-//    (`lsu_rtu_ex1_*`/`_cmplt_dp` for rbus+one-hot-cmplt, `lsu_rtu_ex2_*`
-//    for fwd2) or need a 3rd port added is the exact open item RTU note S2
-//    flags as "not fully resolved from RTU-side RTL alone" -- Task 4/6
-//    resolve it together against LSU's real body, not guessed here.
+//    on any stall, no queue.
+//  * The one-hot completion bus's 7th source, `vec_cmplt_dp`, has no M2
+//    port -- tied 0 internally (no VPU in M2).
+//  * `cp0_rtu_int_vld`-shaped interrupt input: DELIBERATELY not added.
+//    M2's minimal mie/mip model (contract 7) computes no masked interrupt
+//    vector anywhere (CSR.v exports no such port either), so the
+//    interrupt-cause priority encoder below (a faithful clone of
+//    `aq_rtu_int.v`'s casez table) is fed an internal, permanently-0
+//    vector -- structurally present, provably never fires, exactly per
+//    task 4.1's "wired but structurally never fire" framing. A future
+//    milestone wiring real interrupts adds the port and threads it in.
 //=============================================================================
 
 import rvproc_pkg::*;
@@ -107,8 +206,9 @@ module RTU (
     output wire                     rtu_iu_div_wb_grant,
 
     //=========================================================================
-    // LSU -> RTU : lsu_rtu_t (design doc S4.2) -- see the header's "known,
-    // deliberate gap" note on the exact path count.
+    // LSU -> RTU : lsu_rtu_t (design doc S4.2) -- see the header's LSU-
+    // writeback-path resolution note. `lsu_rtu_ex2_dest_reg` is a Task 4
+    // port amendment (see header).
     //=========================================================================
     input  wire                     lsu_rtu_ex1_cmplt,
     input  wire                     lsu_rtu_ex1_cmplt_dp,
@@ -117,6 +217,7 @@ module RTU (
     input  wire                     lsu_rtu_wb_vld,
     input  wire [63:0]              lsu_rtu_ex2_data,
     input  wire                     lsu_rtu_ex2_data_vld,
+    input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_ex2_dest_reg,
     input  wire                     lsu_rtu_expt_vld,
     input  wire [4:0]               lsu_rtu_expt_vec,
     input  wire [63:0]              lsu_rtu_tval,
@@ -131,7 +232,9 @@ module RTU (
     output wire                     rtu_lsu_expt_exit,
 
     //=========================================================================
-    // CSR -> RTU : cp0_rtu_t (design doc S4.2).
+    // CSR -> RTU : cp0_rtu_t (design doc S4.2). `cp0_rtu_trap_pc` is a
+    // Task 4 port amendment (see header) -- CSR.v (Task 2) already exports
+    // it, anticipating exactly this.
     //=========================================================================
     input  wire                     cp0_rtu_ex1_cmplt_dp,
     input  wire [63:0]              cp0_rtu_ex1_wb_data,
@@ -142,6 +245,7 @@ module RTU (
     input  wire [4:0]               cp0_rtu_ex1_expt_vec,
     input  wire                     cp0_rtu_ex1_chgflw,
     input  wire [PC_WIDTH-1:0]      cp0_rtu_ex1_chgflw_pc,
+    input  wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc,
 
     //=========================================================================
     // RTU -> CSR : trap-entry capture (RTU note S7).
@@ -192,54 +296,514 @@ module RTU (
 );
 
     //=========================================================================
-    // SKELETON BODY (plan Task 4 replaces it): every output inactive/0 --
-    // nothing ever commits, nothing ever grants, nothing ever redirects.
+    // FEEDBACK SECTION (umbrella S6.2 rule 4) -- RTU is the terminal stage
+    // of the M2 pipe, so essentially every OUTPUT below is itself a
+    // backward-flowing signal (redirect/flush/commit info flowing back to
+    // IFU/IDU/CSR/LSU/IU against the nominal ID->EX1->EX2 flow). The only
+    // genuinely-forward INPUTS are the five producers' completion/writeback
+    // buses (IU x4, LSU, CP0) and `cp0_rtu_trap_pc` (a feedback INPUT from
+    // CSR, consumed only by the changeflow-PC mux below).
     //=========================================================================
-    assign rtu_iu_mul_wb_grant = 1'b0;
-    assign rtu_iu_div_wb_grant = 1'b0;
 
-    assign rtu_lsu_expt_ack  = 1'b0;
-    assign rtu_lsu_expt_exit = 1'b0;
+    //=========================================================================
+    // SECTION ONE-HOT COMPLETION BUS (task 4.1, RTU note S2 -- aq_rtu_dp.v
+    // :318-326) -- `{alu,mul,bju,div,lsu,cp0,vec}_cmplt_dp`, vec tied 0 (no
+    // VPU in M2), OR'd into the single un-skidded EX1->EX2 retire enable.
+    //=========================================================================
+    wire ex1_alu_cmplt_dp = iu_rtu_ex1_alu_cmplt_dp;
+    wire ex1_mul_cmplt_dp = iu_rtu_ex1_mul_cmplt_dp;
+    wire ex1_bju_cmplt_dp = iu_rtu_ex1_bju_cmplt_dp;
+    wire ex1_div_cmplt_dp = iu_rtu_ex1_div_cmplt_dp;
+    wire ex1_lsu_cmplt_dp = lsu_rtu_ex1_cmplt_dp;
+    wire ex1_cp0_cmplt_dp = cp0_rtu_ex1_cmplt_dp;
+    wire ex1_vec_cmplt_dp = 1'b0;   // no VPU in M2
 
-    assign rtu_yy_xx_expt_vld = 1'b0;
-    assign rtu_yy_xx_expt_int = 1'b0;
-    assign rtu_yy_xx_expt_vec = 5'd0;
-    assign rtu_yy_xx_flush_fe = 1'b0;
-    assign rtu_yy_xx_flush    = 1'b0;
-    assign rtu_yy_xx_dbgon    = 1'b0;
-    assign rtu_cp0_epc        = {PC_WIDTH{1'b0}};
-    assign rtu_cp0_tval       = 64'd0;
+    wire [6:0] dp_cmplt_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_dp,
+                                   ex1_div_cmplt_dp, ex1_lsu_cmplt_dp, ex1_cp0_cmplt_dp,
+                                   ex1_vec_cmplt_dp};
+    wire dp_ex1_cmplt_dp = |dp_cmplt_source;
 
-    assign rtu_ifu_chgflw_vld = 1'b0;
-    assign rtu_ifu_chgflw_pc  = {PC_WIDTH{1'b0}};
-    assign rtu_ifu_flush_fe   = 1'b0;
+    // The donor's own PLAIN (non-`_dp`) completion family
+    // (`iu_rtu_ex1_alu_cmplt`/`_mul_cmplt`/`_bju_cmplt`/`_div_cmplt`,
+    // `lsu_rtu_ex1_cmplt` -- aq_rtu_ctrl.v:131-148's `ctrl_ex1_*_cmplt`)
+    // remains on this module's frozen port list but is intentionally left
+    // UNUSED by this body: every M2 producer already ties its plain
+    // `_cmplt` identically to its own `_cmplt_dp` (IU.v's ALU/BJU/MUL/DIV:
+    // the literal same expression assigned twice; CSR.v exposes only ONE
+    // cp0 signal at all), so `dp_ex1_cmplt_dp` above already carries the
+    // same information the donor's separate `ctrl_ex1_cmplt` bus would.
+    // Flagged here rather than silently ignored -- a future milestone
+    // whose producers legitimately diverge the two families would need to
+    // build the donor's second bus for real.
 
-    assign rtu_idu_fwd0_data = 64'd0;
-    assign rtu_idu_fwd0_reg  = {GPR_IDX_WIDTH{1'b0}};
-    assign rtu_idu_fwd0_vld  = 1'b0;
-    assign rtu_idu_fwd1_data = 64'd0;
-    assign rtu_idu_fwd1_reg  = {GPR_IDX_WIDTH{1'b0}};
-    assign rtu_idu_fwd1_vld  = 1'b0;
-    assign rtu_idu_fwd2_data = 64'd0;
-    assign rtu_idu_fwd2_reg  = {GPR_IDX_WIDTH{1'b0}};
-    assign rtu_idu_fwd2_vld  = 1'b0;
-    assign rtu_idu_wb0_data  = 64'd0;
-    assign rtu_idu_wb0_reg   = {GPR_IDX_WIDTH{1'b0}};
-    assign rtu_idu_wb0_vld   = 1'b0;
-    assign rtu_idu_wb1_data  = 64'd0;
-    assign rtu_idu_wb1_reg   = {GPR_IDX_WIDTH{1'b0}};
-    assign rtu_idu_wb1_vld   = 1'b0;
+    //=========================================================================
+    // SECTION 4.2a -- one-hot assertion (design doc S8 risk this unit owns;
+    // RTU note S2's own `// TODO add assertion here: cmplt_dp is onehot.`).
+    // Classic bit trick: `v & (v-1)` is nonzero iff v has 2+ bits set (v==0
+    // gives 0, v with exactly one bit gives 0, anything else is nonzero) --
+    // exposed as a `verilator public` debug flag so the unit bench can poll
+    // it directly, per the task's explicit instruction.
+    //=========================================================================
+    wire dbg_onehot_violation /* verilator public */;
+    assign dbg_onehot_violation = |(dp_cmplt_source & (dp_cmplt_source - 7'd1));
 
-    // A stuck-low `rtu_idu_commit`/high `rtu_idu_flush_stall` would wedge
-    // IDU's EX1 issue-gate forever once real bodies exist; the skeleton
-    // still ties every output inactive/0 per the M1 precedent (Tasks 2-6
-    // never wire these modules into RVProc.v, so this has no live effect
-    // until Task 7).
-    assign rtu_idu_flush_fe      = 1'b0;
-    assign rtu_idu_flush_stall   = 1'b0;
-    assign rtu_idu_flush_wbt     = 1'b0;
-    assign rtu_idu_commit        = 1'b0;
-    assign rtu_idu_commit_for_bju= 1'b0;
-    assign rtu_idu_pipeline_empty= 1'b0;
+    //=========================================================================
+    // SECTION RBUS ARBITER (task 4.1, RTU note S3 -- aq_rtu_rbus.v) -- EX1
+    // group (ALU/BJU/CP0 in M2, see header's LSU-path resolution note) >
+    // DIV > MUL-EX3, by if/else-if priority (aq_rtu_rbus.v:441-461); safe
+    // only because the EX1 group is one-hot by IDU's single-issue dispatch
+    // and DIV/MUL report independently on their own multi-cycle completion.
+    //=========================================================================
+
+    // ---- EX1-group forward merge: ALU/BJU only (donor's own fwd0 mux,
+    // aq_rtu_rbus.v:277-321, never includes CP0 either -- carried forward
+    // unchanged, same "not a bug to fix" discipline as the mtval quirk
+    // below: CP0's old-CSR-value write is NOT forwarded to a same-cycle-
+    // dependent instruction in the real donor). LSU is absent from this
+    // merge for M2 (header's LSU-path resolution: LSU writes via wb1
+    // directly, never through this arbiter).
+    wire [1:0] ex1_fwd_src_vld = {iu_rtu_ex1_alu_wb_dp, iu_rtu_ex1_bju_wb_dp};
+    reg  [GPR_IDX_WIDTH-1:0] ex1_fwd_preg;
+    reg  [63:0]              ex1_fwd_data;
+    always @* begin
+        case (ex1_fwd_src_vld)
+            2'b01: begin ex1_fwd_preg = iu_rtu_ex1_bju_preg; ex1_fwd_data = iu_rtu_ex1_bju_data; end
+            2'b10: begin ex1_fwd_preg = iu_rtu_ex1_alu_preg; ex1_fwd_data = iu_rtu_ex1_alu_data; end
+            default: begin ex1_fwd_preg = {GPR_IDX_WIDTH{1'b0}}; ex1_fwd_data = 64'd0; end
+        endcase
+    end
+    wire ex1_fwd_vld = |ex1_fwd_src_vld;
+
+    // ---- EX1-group overall winner: ALU/BJU-merged-fwd vs CP0 (mutually
+    // exclusive by single-issue dispatch; aq_rtu_rbus.v:372-407).
+    wire [1:0] ex1_wb_src_vld = {ex1_fwd_vld, cp0_rtu_ex1_wb_vld};
+    reg  [GPR_IDX_WIDTH-1:0] ex1_wb_preg;
+    reg  [63:0]              ex1_wb_data;
+    always @* begin
+        case (ex1_wb_src_vld)
+            2'b01: begin ex1_wb_preg = cp0_rtu_ex1_wb_preg; ex1_wb_data = cp0_rtu_ex1_wb_data; end
+            2'b10: begin ex1_wb_preg = ex1_fwd_preg;        ex1_wb_data = ex1_fwd_data;        end
+            default: begin ex1_wb_preg = {GPR_IDX_WIDTH{1'b0}}; ex1_wb_data = 64'd0; end
+        endcase
+    end
+    wire ex1_wb_dp  = |ex1_wb_src_vld;
+    wire ex1_wb_vld = iu_rtu_ex1_alu_wb_vld || iu_rtu_ex1_bju_wb_vld || cp0_rtu_ex1_wb_vld;
+
+    // ---- Top arbiter + writeback-race grants (aq_rtu_rbus.v:467-468).
+    wire div_wb_grant = !ex1_wb_dp;
+    wire mul_wb_grant = !ex1_wb_dp && !iu_rtu_div_wb_dp;
+    assign rtu_iu_div_wb_grant = div_wb_grant;
+    assign rtu_iu_mul_wb_grant = mul_wb_grant;
+
+    reg        rbus_wb_vld;
+    reg [GPR_IDX_WIDTH-1:0] rbus_wb_preg;
+    reg [63:0] rbus_wb_data;
+    always @* begin
+        if (ex1_wb_dp) begin
+            rbus_wb_vld  = ex1_wb_vld;
+            rbus_wb_preg = ex1_wb_preg;
+            rbus_wb_data = ex1_wb_data;
+        end else if (iu_rtu_div_wb_dp) begin
+            rbus_wb_vld  = iu_rtu_div_wb_vld;
+            rbus_wb_preg = iu_rtu_div_preg;
+            rbus_wb_data = iu_rtu_div_data;
+        end else if (iu_rtu_ex3_mul_wb_vld) begin
+            // MUL has no separate wb_dp port -- wb_vld doubles as dp,
+            // matching the donor exactly (rbus_mul_wb_dp = iu_rtu_ex3_mul_wb_vld).
+            rbus_wb_vld  = iu_rtu_ex3_mul_wb_vld;
+            rbus_wb_preg = iu_rtu_ex3_mul_preg;
+            rbus_wb_data = iu_rtu_ex3_mul_data;
+        end else begin
+            rbus_wb_vld  = 1'b0;
+            rbus_wb_preg = {GPR_IDX_WIDTH{1'b0}};
+            rbus_wb_data = 64'd0;
+        end
+    end
+    //=========================================================================
+    // SECTION FORWARD PORTS (task 4.1 -- fwd0=EX1 group, fwd1=MUL-EX3,
+    // fwd2=LSU-EX2). All three are purely combinational bypass ports, never
+    // registered (aq_rtu_rbus.v:479-489) -- they exist so a back-to-back
+    // dependent instruction can see the value one cycle before the
+    // architectural write (wb0/wb1 below) actually lands.
+    //=========================================================================
+    assign rtu_idu_fwd0_vld  = ex1_fwd_vld;
+    assign rtu_idu_fwd0_reg  = ex1_fwd_preg;
+    assign rtu_idu_fwd0_data = ex1_fwd_data;
+
+    assign rtu_idu_fwd1_vld  = iu_rtu_ex3_mul_wb_vld;
+    assign rtu_idu_fwd1_reg  = iu_rtu_ex3_mul_preg;
+    assign rtu_idu_fwd1_data = iu_rtu_ex3_mul_data;
+
+    assign rtu_idu_fwd2_vld  = lsu_rtu_ex2_data_vld;
+    assign rtu_idu_fwd2_reg  = lsu_rtu_ex2_dest_reg;
+    assign rtu_idu_fwd2_data = lsu_rtu_ex2_data;
+
+    //=========================================================================
+    // SECTION 4.2b -- fwd0/fwd1/fwd2 destination-register collision
+    // assertion (design doc S8 / IDU note S6's flagged reliance on this
+    // exact invariant). x0 is a legitimate exception: two producers both
+    // targeting x0 is harmless (neither write is architecturally visible)
+    // and must NOT trip this flag.
+    //=========================================================================
+    wire fwd_reg_is_x0_0 = (ex1_fwd_preg == {GPR_IDX_WIDTH{1'b0}});
+    wire fwd_reg_is_x0_1 = (iu_rtu_ex3_mul_preg == {GPR_IDX_WIDTH{1'b0}});
+
+    wire fwd01_collision = rtu_idu_fwd0_vld && rtu_idu_fwd1_vld
+                         && (ex1_fwd_preg == iu_rtu_ex3_mul_preg) && !fwd_reg_is_x0_0;
+    wire fwd02_collision = rtu_idu_fwd0_vld && rtu_idu_fwd2_vld
+                         && (ex1_fwd_preg == lsu_rtu_ex2_dest_reg) && !fwd_reg_is_x0_0;
+    wire fwd12_collision = rtu_idu_fwd1_vld && rtu_idu_fwd2_vld
+                         && (iu_rtu_ex3_mul_preg == lsu_rtu_ex2_dest_reg) && !fwd_reg_is_x0_1;
+
+    wire dbg_fwd_collision /* verilator public */;
+    assign dbg_fwd_collision = fwd01_collision || fwd02_collision || fwd12_collision;
+
+    //=========================================================================
+    // SECTION EX1->EX2 RETIRE REGISTER (task 4.1, RTU note S2 -- the single
+    // un-skidded pipe register: retiring at most 1/cycle, 0/cycle on any
+    // stall, no queue, no second entry). Unlike the donor's conditional-hold
+    // `dp_ex2_*` register (aq_rtu_dp.v:434-454, gated on `dp_ex1_cmplt` to
+    // save ASIC clock-gating power), this body uses a PLAIN unconditional
+    // register for every field: functionally equivalent because every
+    // consumer below ANDs in `ex2_retire_vld` (or an is-this-field's-source-
+    // cmplt qualifier) before trusting the field's value -- the donor's own
+    // retire_trap_vld/chgflw_vld/etc. pattern -- and RTL simulation has no
+    // need to preserve an ASIC-only power optimization. `ex2_retire_vld`
+    // itself (the donor's `ctrl_ex2_cmplt`/`retire_ex2_retire_vld`,
+    // aq_rtu_ctrl.v:174-182) is ALREADY unconditional in the donor.
+    //=========================================================================
+    wire ex1_inst_chgflw = ex1_cp0_cmplt_dp && cp0_rtu_ex1_chgflw;   // mret (M2's only chgflw source)
+    wire [PC_WIDTH-1:0] ex1_next_pc = ex1_inst_chgflw ? cp0_rtu_ex1_chgflw_pc : iu_rtu_ex1_next_pc;
+
+    // Exception vec/tval mux (aq_rtu_dp.v:409-415): prefer CP0 when CP0 is
+    // the cmplt source, else LSU when LSU is, else neither -- avoids
+    // leaking a stale LSU tval/vec into a CP0-sourced (or no) exception.
+    wire ex1_inst_expt = cp0_rtu_ex1_expt_vld || (lsu_rtu_expt_vld && ex1_lsu_cmplt_dp);
+    wire [4:0] ex1_expt_vec = ex1_cp0_cmplt_dp ? cp0_rtu_ex1_expt_vec
+                            : ex1_lsu_cmplt_dp ? lsu_rtu_expt_vec
+                            :                     5'd0;
+    wire [63:0] ex1_tval = ex1_lsu_cmplt_dp ? lsu_rtu_tval : 64'd0;   // CP0 has no tval port, see header
+
+    reg        ex2_retire_vld;
+    reg [PC_WIDTH-1:0] ex2_cur_pc, ex2_next_pc;
+    reg        ex2_inst_expt;
+    reg [4:0]  ex2_expt_vec;
+    reg [63:0] ex2_tval;
+    reg        ex2_inst_chgflw;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ex2_retire_vld  <= 1'b0;
+            ex2_cur_pc      <= {PC_WIDTH{1'b0}};
+            ex2_next_pc     <= {PC_WIDTH{1'b0}};
+            ex2_inst_expt   <= 1'b0;
+            ex2_expt_vec    <= 5'd0;
+            ex2_tval        <= 64'd0;
+            ex2_inst_chgflw <= 1'b0;
+        end else begin
+            ex2_retire_vld  <= dp_ex1_cmplt_dp;
+            ex2_cur_pc      <= iu_rtu_ex1_cur_pc;
+            ex2_next_pc     <= ex1_next_pc;
+            ex2_inst_expt   <= ex1_inst_expt;
+            ex2_expt_vec    <= ex1_expt_vec;
+            ex2_tval        <= ex1_tval;
+            ex2_inst_chgflw <= ex1_inst_chgflw;
+        end
+    end
+
+    //=========================================================================
+    // SECTION INTERRUPT PRIORITY ENCODER (RTU note S5 -- aq_rtu_int.v:52-81,
+    // a faithful clone of the 15-source casez cause table). Fed by an
+    // internal, permanently-0 vector -- see header's "deliberately not
+    // added" note. `retire_int_inst` is therefore provably always 0
+    // (the `|int_vld_raw` term forces it), matching task 4.1's "wired but
+    // structurally never fire" framing exactly.
+    //=========================================================================
+    wire [14:0] int_vld_raw = 15'd0;
+
+    reg [4:0] int_vec_enc;
+    always @* begin
+        casez (int_vld_raw)
+            15'b1?????????????? : int_vec_enc = 5'd16; // mcip
+            15'b01????????????? : int_vec_enc = 5'd18; // mhip
+            15'b001???????????? : int_vec_enc = 5'd11; // meip
+            15'b0001??????????? : int_vec_enc = 5'd3;  // msip
+            15'b00001?????????? : int_vec_enc = 5'd7;  // mtip
+            15'b000001????????? : int_vec_enc = 5'd9;  // seip
+            15'b0000001???????? : int_vec_enc = 5'd1;  // ssip
+            15'b00000001??????? : int_vec_enc = 5'd5;  // stip
+            15'b000000001?????? : int_vec_enc = 5'd17; // moip
+            15'b0000000001????? : int_vec_enc = 5'd16; // mcip
+            15'b00000000001???? : int_vec_enc = 5'd18; // mhip
+            15'b000000000001??? : int_vec_enc = 5'd9;  // seip
+            15'b0000000000001?? : int_vec_enc = 5'd1;  // ssip
+            15'b00000000000001? : int_vec_enc = 5'd5;  // stip
+            15'b000000000000001 : int_vec_enc = 5'd17; // moip
+            default              : int_vec_enc = 5'd0; // donor uses X here; 0 is lint/sim-friendlier for a dead leg
+        endcase
+    end
+
+    wire dtu_int_mask_tied0  = 1'b0;   // no DTU in M2
+    wire int_ex2_split_tied0 = 1'b0;   // no split-instruction concept in M2
+
+    wire       retire_int_inst = (|int_vld_raw) && !dtu_int_mask_tied0 && !int_ex2_split_tied0;
+    wire [4:0] retire_int_vec  = int_vec_enc;
+
+    //=========================================================================
+    // SECTION EXCEPTION/INTERRUPT PRIORITY CHAIN (task 4.1, RTU note S4 --
+    // aq_rtu_retire.v:481-501's exact if/else-if order): pending-breakpoint
+    // > interrupt > LSU async bus error > ebreak/debug breakpoint > the
+    // synchronous EX1 exception CP0/LSU already decided. Legs 1
+    // (pending-breakpoint) and 4 (ebreak/debug breakpoint) are permanently 0
+    // -- no DTU in M2 (ebreak itself already retires via leg 5: CSR.v
+    // declares it as a plain synchronous EX1 exception, vec=3, not via a
+    // separate debug-trigger path). Leg 2 (interrupt) is permanently 0 per
+    // the section above. Leg 3 (LSU async bus error) is REAL and wired for
+    // real -- it is simply 0 today because LSU.v (Task 6) does not exist
+    // yet. M2 has no debug unit and no directed interrupt test, so legs 1/2/4
+    // are wired but structurally never fire, per task 4.1's own framing.
+    //=========================================================================
+    wire retire_pending_bkpt_expt = 1'b0;                      // leg 1: no DTU
+    // retire_int_inst                                          // leg 2: see above
+    wire retire_async_expt        = lsu_rtu_async_expt_vld;    // leg 3: real, LSU-sourced
+    wire retire_bkpt_expt         = 1'b0;                      // leg 4: no DTU
+
+    reg [4:0] retire_trap_vec;
+    always @* begin
+        if (retire_pending_bkpt_expt)
+            retire_trap_vec = 5'd3;
+        else if (retire_int_inst)
+            retire_trap_vec = retire_int_vec;
+        else if (retire_async_expt)
+            retire_trap_vec = lsu_rtu_async_ld_inst ? 5'd5 : 5'd7;
+        else if (retire_bkpt_expt)
+            retire_trap_vec = 5'd3;
+        else
+            retire_trap_vec = ex2_expt_vec;                    // leg 5: CP0/LSU sync exception
+    end
+
+    // retire_mmu_trap (RTU note S4, aq_rtu_retire.v:503-505): carried
+    // forward UNCHANGED, including the donor's own {1,13,15} (not
+    // {12,13,15}) quirk -- design doc S8 flags this as an M4 question; this
+    // is NOT a bug for Task 4 to fix. No M2 consumer exists for this signal
+    // (no MMU port on RTU.v's frozen list -- MMU is M4 scope), so it is
+    // computed here purely to document the carry-forward, matching the
+    // donor's own logic exactly, not exposed as a port.
+    wire retire_mmu_trap = (retire_trap_vec == 5'd1)
+                        || (retire_trap_vec == 5'd13)
+                        || (retire_trap_vec == 5'd15);
+
+    // Sync/overall exception classification (aq_rtu_retire.v:434-464,
+    // simplified: retire_pending_bkpt_expt/retire_bkpt_expt are both 0).
+    wire retire_sync_expt = ex2_inst_expt;
+    wire retire_expt_inst = retire_sync_expt || retire_async_expt;
+
+    // mtval allowlist (RTU note S4, aq_rtu_retire.v:514-522): {1,2,4,5,6,7,
+    // 12,13,15} -- carried forward UNCHANGED, do not "fix". Checked against
+    // the SYNCHRONOUS leg's own vec (ex2_expt_vec), exactly matching the
+    // donor's `retire_inst_expt_vec` (not the final, priority-resolved
+    // `retire_trap_vec`) -- equivalent by construction since this term is
+    // only reached once legs 1-4 have all already been ruled out.
+    function automatic vec_in_tval_allowlist(input [4:0] vec);
+        vec_in_tval_allowlist = (vec == 5'd1)  || (vec == 5'd2)  || (vec == 5'd4)
+                             || (vec == 5'd5)  || (vec == 5'd6)  || (vec == 5'd7)
+                             || (vec == 5'd12) || (vec == 5'd13) || (vec == 5'd15);
+    endfunction
+
+    // tval selection (aq_rtu_retire.v:530-550).
+    wire [63:0] retire_trap_tval =
+          retire_pending_bkpt_expt ? 64'd0
+        : retire_int_inst          ? 64'd0
+        : retire_async_expt        ? lsu_rtu_tval
+        : retire_bkpt_expt         ? 64'd0
+        : vec_in_tval_allowlist(ex2_expt_vec) ? ex2_tval
+        :                                       64'd0;
+
+    // epc selection (aq_rtu_retire.v:564-577, simplified: M2 has no split-
+    // instruction concept, so the donor's `&& dp_retire_ex2_inst_split`
+    // async-epc-uses-cur-pc term never applies here).
+    wire [PC_WIDTH-1:0] retire_trap_epc = retire_sync_expt ? ex2_cur_pc : ex2_next_pc;
+
+    // Trap-taken ack (aq_rtu_retire.v:585-589, simplified: halt_req/
+    // dbg_mode_on are both permanently 0/false -- no DTU in M2).
+    wire retire_trap_vld = ex2_retire_vld && (retire_expt_inst || retire_int_inst);
+    wire retire_trap_int = retire_int_inst && !retire_pending_bkpt_expt;
+
+    //=========================================================================
+    // SECTION FLUSH FSM (task 4.1, RTU note S6 -- aq_rtu_retire.v:929-978),
+    // 5 states: IDLE -> FE -> [WAIT] -> BE -> IDLE, WAIT inserted between FE
+    // and BE only if the pipe isn't drained yet. The async-debug
+    // IDLE->FE_BE->IDLE shortcut is cloned as dead-but-present (design doc's
+    // "clone the FSM shape as-is" note): `halt_req_dm_async_tied0` is
+    // permanently 0 (no DTU in M2), so the `else if` branch checking it is
+    // structurally present but never taken.
+    //=========================================================================
+    localparam FLUSH_IDLE  = 3'b000;
+    localparam FLUSH_FE    = 3'b001;
+    localparam FLUSH_WAIT  = 3'b100;
+    localparam FLUSH_BE    = 3'b010;
+    localparam FLUSH_FE_BE = 3'b011;
+
+    wire halt_req_dm_async_tied0 = 1'b0;   // no DTU / async-debug-halt request in M2
+
+    // rv906's CSR.v (Task 2, already committed) exposes no
+    // `cp0_rtu_ex1_flush`-shaped bit at all -- only `_chgflw`/`_chgflw_pc`
+    // (mret) and nothing whatsoever for fence/fence.i's serializing role
+    // (CSR.v's own DECODE-section note: a deliberate M2 scope decision, not
+    // an oversight). `retire_flush_fe_set` below therefore ORs in
+    // `ex2_inst_chgflw` (mret) directly rather than a separate
+    // `ex2_inst_flush` term (which would be permanently 0 anyway, since no
+    // such CSR.v port exists) -- functionally covering the donor's "xret"
+    // leg of `dp_retire_ex2_inst_flush` while faithfully carrying forward
+    // the also-permanently-0 fence leg per CSR.v's own scope decision. This
+    // is the real donor's own intent (mret needs a front-end flush) even
+    // though the specific bit path differs due to CSR.v's simpler,
+    // collapsed signal shape.
+    wire retire_inst_flush_fe_set = ex2_retire_vld
+                                  && (retire_expt_inst || retire_int_inst || ex2_inst_chgflw);
+    // vstart_updt/bkpt_expt_t1/debug_flush/halt_req/halt_req_t1 all omitted
+    // -- no vector/debug unit anywhere in M2's contracts (see header).
+
+    wire retire_bju_flush_req = iu_rtu_ex2_bju_ras_mispred || iu_rtu_depd_lsu_chgflow_vld;
+    wire retire_flush_fe_set  = retire_inst_flush_fe_set || retire_bju_flush_req;
+
+    wire retire_commit_clear         = retire_inst_flush_fe_set || retire_bju_flush_req || retire_flush_fe;
+    wire retire_commit_clear_for_bju = retire_inst_flush_fe_set || iu_rtu_ex2_bju_ras_mispred || retire_flush_fe;
+
+    // Drain gate (aq_rtu_retire.v:980-987, simplified per header's
+    // documented gap: no `iu_xx_no_op`/`lsu_rtu_no_op` port anywhere in M2;
+    // the donor's `!lsu_rtu_ex1_buffer_vld` STB check is omitted per
+    // contract 4's own "STB drains unconditionally" resolution, not a gap).
+    wire wb_no_op   = !rtu_idu_wb0_vld_int && !rtu_idu_wb1_vld_int;
+    wire cpu_no_op  = !ex2_retire_vld && wb_no_op;
+    wire pipeline_empty = cpu_no_op;
+
+    reg [2:0] flush_state;
+    wire [2:0] flush_next_state =
+          (flush_state == FLUSH_IDLE)   ? (retire_flush_fe_set ? FLUSH_FE : FLUSH_IDLE)
+        : (flush_state == FLUSH_FE)     ? (cpu_no_op ? FLUSH_BE : FLUSH_WAIT)
+        : (flush_state == FLUSH_WAIT)   ? (cpu_no_op ? FLUSH_BE : FLUSH_WAIT)
+        : (flush_state == FLUSH_BE)     ? FLUSH_IDLE
+        : (flush_state == FLUSH_FE_BE)  ? FLUSH_IDLE
+        :                                  FLUSH_IDLE;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            flush_state <= FLUSH_IDLE;
+        else if (halt_req_dm_async_tied0)          // dead-but-present shortcut, see header
+            flush_state <= FLUSH_FE_BE;
+        else
+            flush_state <= flush_next_state;
+    end
+
+    wire retire_flush_wait = (flush_state == FLUSH_WAIT);
+    wire retire_flush_fe   = flush_state[0];
+    wire retire_flush_be   = flush_state[1];
+
+    assign rtu_idu_commit         = !retire_commit_clear;
+    assign rtu_idu_commit_for_bju = !retire_commit_clear_for_bju;
+
+    //=========================================================================
+    // SECTION CHANGEFLOW (task 4.1, RTU note S5/S6/S7): the trap-redirect
+    // and mret-redirect sequencing, registered exactly as the donor's own
+    // `retire_trap_chgflw_vld`/`retire_xret_vld` (aq_rtu_retire.v:993-1019).
+    //=========================================================================
+    reg retire_trap_chgflw_vld;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                       retire_trap_chgflw_vld <= 1'b0;
+        else if (retire_trap_vld)         retire_trap_chgflw_vld <= 1'b1;
+        else if (retire_flush_be)         retire_trap_chgflw_vld <= 1'b0;
+    end
+
+    wire retire_ex2_retire_normal = ex2_retire_vld && !retire_sync_expt;
+
+    reg retire_xret_vld;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                                                  retire_xret_vld <= 1'b0;
+        else if (retire_ex2_retire_normal && ex2_inst_chgflw)         retire_xret_vld <= 1'b1;   // mret (no sret in M2)
+        else if (retire_flush_be)                                    retire_xret_vld <= 1'b0;
+    end
+
+    // Changeflow-PC mux (aq_rtu_retire.v:1026-1039, simplified: no DTU
+    // `retire_exit_debug`/`dtu_rtu_dpc` leg in M2).
+    wire [PC_WIDTH-1:0] retire_chgflw_pc = retire_trap_chgflw_vld ? cp0_rtu_trap_pc : ex2_next_pc;
+
+    // Changeflow-valid (aq_rtu_retire.v:1003-1008, simplified: no
+    // `dp_retire_ex2_inst_flush`/vstart/exit_debug legs in M2 -- see the
+    // flush-FSM section's note on why `ex2_inst_chgflw` alone covers this).
+    wire retire_chgflw_vld = (ex2_retire_vld && !retire_trap_vld && ex2_inst_chgflw)
+                           || (retire_trap_chgflw_vld && retire_flush_fe);
+
+    //=========================================================================
+    // SECTION WB0/WB1 REGISTER (task 4.1 -- 2 architectural GPR write
+    // ports). wb0 = the rbus arbiter's winner, registered ONE cycle behind
+    // the EX1-cycle producer signals -- the SAME single register stage as
+    // the retire packet above (design doc S7.3: "retire and architectural
+    // writeback are the same cycle... RTU's EX2 retire register *is* the
+    // point where the GPR write ports are driven"), NOT an additional
+    // second stage (aq_rtu_wb.v:160-166's "Rbus Datapath" register captures
+    // rbus.v's OWN combinational output exactly once, at the same pipeline
+    // depth as dp.v's dp_ex2_* latch -- confirmed by re-reading both
+    // register enables side by side). wb1 = LSU's OWN dedicated late write
+    // port, a PURE combinational passthrough of `lsu_rtu_wb_*` with NO
+    // register at all (aq_rtu_wb.v:155,180-197 -- the donor adds no
+    // register here either), per the header's LSU-writeback-path
+    // resolution note.
+    //=========================================================================
+    reg        wb0_vld_r;
+    reg [GPR_IDX_WIDTH-1:0] wb0_preg_r;
+    reg [63:0] wb0_data_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wb0_vld_r  <= 1'b0;
+            wb0_preg_r <= {GPR_IDX_WIDTH{1'b0}};
+            wb0_data_r <= 64'd0;
+        end else begin
+            wb0_vld_r  <= rbus_wb_vld;
+            wb0_preg_r <= rbus_wb_preg;
+            wb0_data_r <= rbus_wb_data;
+        end
+    end
+
+    assign rtu_idu_wb0_vld  = wb0_vld_r;
+    assign rtu_idu_wb0_reg  = wb0_preg_r;
+    assign rtu_idu_wb0_data = wb0_data_r;
+
+    assign rtu_idu_wb1_vld  = lsu_rtu_wb_vld;
+    assign rtu_idu_wb1_reg  = lsu_rtu_wb_preg;
+    assign rtu_idu_wb1_data = lsu_rtu_wb_data;
+
+    // Internal aliases so the drain-gate section above (which is written
+    // textually before this section) can read wb0/wb1 vld without a
+    // forward-reference to the `assign`-only output wires.
+    wire rtu_idu_wb0_vld_int = wb0_vld_r;
+    wire rtu_idu_wb1_vld_int = lsu_rtu_wb_vld;
+
+    //=========================================================================
+    // SECTION OUTPUT -- the remaining RTU-originated signal inventory (RTU
+    // note S6): broadcast to CSR, redirect to IFU, flush/commit/drain to
+    // IDU, "point of no return" acks to LSU.
+    //=========================================================================
+    assign rtu_yy_xx_expt_vld = retire_trap_vld;
+    assign rtu_yy_xx_expt_int = retire_trap_int;
+    assign rtu_yy_xx_expt_vec = retire_trap_vec;
+    assign rtu_yy_xx_flush_fe = retire_flush_fe;
+    assign rtu_yy_xx_flush    = retire_flush_be;
+    assign rtu_yy_xx_dbgon    = 1'b0;   // no DTU in M2
+
+    assign rtu_cp0_epc  = retire_trap_epc;
+    assign rtu_cp0_tval = retire_trap_tval;
+
+    assign rtu_ifu_chgflw_vld = retire_chgflw_vld;
+    assign rtu_ifu_chgflw_pc  = retire_chgflw_pc;
+    assign rtu_ifu_flush_fe   = retire_flush_fe;
+
+    assign rtu_idu_flush_fe      = retire_flush_fe;
+    assign rtu_idu_flush_stall   = retire_flush_wait || retire_flush_be;
+    assign rtu_idu_flush_wbt     = retire_flush_be;
+    assign rtu_idu_pipeline_empty= pipeline_empty;
+
+    assign rtu_lsu_expt_ack  = retire_trap_chgflw_vld && retire_flush_be;
+    assign rtu_lsu_expt_exit = retire_xret_vld && retire_flush_be;
 
 endmodule

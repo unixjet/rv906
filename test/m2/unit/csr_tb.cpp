@@ -467,10 +467,20 @@ static void test_ecall_ebreak_illegal(void) {
 static void test_fence_no_op(void) {
     DispatchResult r_fence  = dispatch(CP0_FUNC_FENCE, 0, 0, 0);
     DispatchResult r_fencei = dispatch(CP0_FUNC_FENCEI, 0, 0, 0);
-    check(!r_fence.wb_vld && !r_fence.expt_vld && !r_fence.chgflw && !r_fence.cmplt_dp,
-          "fence: no wb/expt/chgflw/cmplt_dp (plain no-side-effect completion)");
-    check(!r_fencei.wb_vld && !r_fencei.expt_vld && !r_fencei.chgflw && !r_fencei.cmplt_dp,
-          "fence.i: no wb/expt/chgflw/cmplt_dp (plain no-side-effect completion)");
+    check(!r_fence.wb_vld && !r_fence.expt_vld && !r_fence.chgflw,
+          "fence: no wb/expt/chgflw (plain no-GPR-result completion)");
+    check(!r_fencei.wb_vld && !r_fencei.expt_vld && !r_fencei.chgflw,
+          "fence.i: no wb/expt/chgflw (plain no-GPR-result completion)");
+    // TASK 4 FIX (rtl/CSR.v): cmplt_dp is RTU's one-hot RETIRE-heartbeat
+    // leg, not a GPR-writeback-select bit -- it must fire for ANY
+    // non-flushed CP0 dispatch (ecall/ebreak/mret/fence/fence.i included),
+    // or RTU's retire register would never latch these instructions and
+    // they could never retire. Previously this file asserted the OPPOSITE
+    // (cmplt_dp==0 for fence/fence.i), encoding the bug Task 4 found and
+    // fixed (CSR.v's "TASK 4 DISCOVERED BUG" note) -- updated here to
+    // match the corrected, donor-faithful contract instead of the bug.
+    check(r_fence.cmplt_dp, "fence: cmplt_dp asserted (retire heartbeat, not gated on wb)");
+    check(r_fencei.cmplt_dp, "fence.i: cmplt_dp asserted (retire heartbeat, not gated on wb)");
     test_result("T14 FENCE/FENCE.I: recognized dispatch, no side effects (M2 scope)");
 }
 
