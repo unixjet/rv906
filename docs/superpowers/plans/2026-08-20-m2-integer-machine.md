@@ -207,22 +207,23 @@ but needed for every task to agree):**
     minimal single-line victim-writeback path (not the full `aq_lsu_vb.v`
     module's generality) as part of the DCache/LSU base path, not as a
     deferred item.
-12. **Oracle: Spike is the intended reference (umbrella §7.2's "Spike diff"
-    plan; design doc §7.3 also permits "an in-repo ISS of equivalent
-    fidelity" as an explicit fallback of last resort).** M2 does **not**
-    grow M1's `m1_iss.h` (a ~200-line, deliberately fetch-stream-only
-    oracle) into a full architectural simulator by default — a hand-rolled
-    RV64IMC semantics+trap+memory model duplicates Spike's already-verified
-    work at much higher risk of a second, independently-wrong
-    implementation, which is exactly the failure mode this project's
-    verification discipline exists to avoid. **Flagged for the controlling
-    session (see final report): no `spike` binary and no `riscv-isa-sim`
-    source were found anywhere searched in this environment during
-    planning.** Task 8 tries Spike first (system package, or building
-    `riscv-isa-sim` from source) and falls back to a from-scratch
-    architectural ISS — sized exactly to the retire-export tuple below —
-    only if Spike genuinely cannot be stood up; Task 8's steps are written
-    to make that decision concrete rather than silently picking one.
+12. **Oracle: resolved to a from-scratch in-repo ISS, not Spike** (umbrella
+    §7.2's "Spike diff" plan was the aspiration; design doc §7.3 explicitly
+    permits "an in-repo ISS of equivalent fidelity" as a fallback, and the
+    controlling session has now exercised that fallback rather than leaving
+    it open — see task 8.1). No `spike` binary and no `riscv-isa-sim`
+    source exist anywhere in this environment; internet access is
+    available but building Spike from source is a real side-quest (its own
+    toolchain/dtc/boost dependencies) for a tool that isn't load-bearing —
+    rv906's own oracle-pair architecture already proved itself through all
+    of M1 without Spike, and **RV12's own M2 never used Spike either**
+    (zero references in its plan; it built `m2_iss.h` from scratch, the
+    exact precedent this task follows). M2 does **not** grow M1's
+    `m1_iss.h` (a ~200-line, deliberately fetch-stream-only oracle) into
+    this full architectural simulator — task 8.1 explains why a full
+    RV64IMC semantics+trap+memory model deserves its own independent
+    implementation rather than an ad-hoc extension of a file scoped to a
+    narrower problem.
 13. **Per-retire trace tuple (design doc §7.3), the exact fields every
     oracle-diff task must agree on:** `{pc, insn, rd, wdata_valid, wdata,
     is_store, store_addr, store_bytes, store_data, trap_taken, cause, epc,
@@ -700,27 +701,33 @@ M2 only rewrites `RVProc.v`'s internals.
 ## Task 8: Verification infrastructure — reference model + riscv-tests build
 
 **Files:** Create `test/m2/` (common.ld, macros.h, unit/Makefile already
-exist from earlier tasks); Create the reference-model integration (exact
-files depend on 8.1's Spike-vs-fallback decision — see below); Modify
+exist from earlier tasks); Create `m2_iss.h` (the from-scratch
+architectural reference model, contract 12 — resolved, not Spike); Modify
 `rtl/RVProcTest.cpp` (retire-trace export + online/offline diff driver).
 
-- [ ] **8.1** **Decide Spike vs. in-repo ISS, concretely, and record the
-  decision at the top of whatever file this produces** (contract 12).
-  Check for a `spike` binary or a buildable `riscv-isa-sim` source tree
-  (none was found anywhere searched during planning — check again at
-  execution time, tool availability can change). If Spike can be stood up
-  within a reasonable time budget: configure it for RV64IMC bare-metal
-  M-mode, confirm it can emit a per-retired-instruction commit log in a
-  format containing (or trivially post-processable into) contract 13's
-  tuple. If not: build a from-scratch architectural reference model in
-  C++, sized exactly to contract 13's tuple and RV64IMC + the minimal CSR
-  set (contract 7) + the trap-priority/vec-allowlist rules (RTU note §4) —
-  **do not attempt this by mechanically growing `m1_iss.h`**; that file's
-  entire design point is being a narrow, predictor-agnostic fetch-stream
-  checker (M1 plan's own framing), and a full architectural model has a
-  different job (real register/memory/CSR semantics) that deserves an
-  independent implementation, not an ad-hoc extension of a file scoped to
-  a different problem.
+- [ ] **8.1** **Resolved (controlling-session decision, not left for
+  execution time): build the from-scratch architectural reference model,
+  do not attempt Spike.** No `spike` binary and no `riscv-isa-sim` source
+  exist anywhere in this environment (confirmed by search during M2
+  planning); internet access IS available, but building Spike from source
+  (autoconf, dtc, boost, device-tree/target toolchain dependencies) is a
+  real side-quest with its own failure modes, for a tool that is not load
+  bearing here — rv906's own oracle-pair verification architecture (two
+  independently-derived checkers cross-validated against each other) is
+  already proven end-to-end through the whole of M1's predictor ladder
+  without Spike, catching every real bug found there. Decisively: **RV12
+  itself never used Spike for its own M2 either** — its M2 plan has zero
+  Spike references and it built `m2_iss.h` from scratch, the exact
+  precedent this task follows. Build a from-scratch architectural
+  reference model in C++, sized exactly to contract 13's tuple and RV64IMC
+  + the minimal CSR set (contract 7) + the trap-priority/vec-allowlist
+  rules (RTU note §4). **Do not attempt this by mechanically growing
+  `m1_iss.h`**; that file's entire design point is being a narrow,
+  predictor-agnostic fetch-stream checker (M1 plan's own framing), and a
+  full architectural model has a different job (real register/memory/CSR
+  semantics) that deserves an independent implementation, not an ad-hoc
+  extension of a file scoped to a different problem. Record this decision
+  (with this reasoning) at the top of `m2_iss.h`.
 - [ ] **8.2** RTL-side retire-trace export: add `verisim.h` paths (or a
   `verilator public` export block in `RTU.v` itself, whichever is more
   direct) for contract 13's tuple, sourced from RTU's real EX2 retire
