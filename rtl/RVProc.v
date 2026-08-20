@@ -1,5 +1,5 @@
 //=============================================================================
-// RVProc.v - rv906 core shell v0.1  (M1 SKELETON: outer ports frozen)
+// RVProc.v - rv906 core shell v0.1  (M1: real body, TASK 4.2)
 //=============================================================================
 // C906 files covered:
 //   gen_rtl/ifu/rtl/aq_ifu_top.v   (the IFU/ICache/BPU glue, 863 lines of it)
@@ -8,11 +8,20 @@
 // stub + FetchSink, drop-in replacement for TestMaster"), umbrella spec S6.2
 // rule 1 ("top file is the table of contents").
 //
-// The outer port list is TestMaster.v's, VERBATIM (plan Task 1.3), so Task
-// 4.2 turns RVProcAXI.v's core instance into RVProc with a one-word change.
-// Until that swap, TestMaster.v and this file coexist and Verilator reports
-// MULTITOP when both are on the same --lint-only invocation without a
-// --top-module pin.
+// The outer port list is TestMaster.v's, VERBATIM (plan Task 1.3). Task 4.2
+// turned RVProcAXI.v's core instance into RVProc with the planned one-word
+// swap (rtl/RVProcAXI.v); TestMaster.v and test/smoke/ are retired (design
+// doc S4.3).
+//
+// The internal instantiation below (ICache/IFU/BPU/FetchSink, fully wired)
+// was already complete as of Task 1's frozen skeleton -- every internal wire
+// name and width was fully determined once IFU.v/ICache.v/BPU.v/FetchSink.v's
+// port lists were pinned, so there was nothing left for Task 4.2 to add here
+// structurally. Task 4.2's actual work for this milestone landed in
+// FetchSink.v's real body (plan Task 4.1), rtl/verisim.h's M1 export paths,
+// and the RVProcAXI.v/README/Makefile retirement housekeeping described
+// above -- confirmed by re-linting this file after FetchSink.v went from
+// skeleton to real body and finding no port mismatch.
 //
 // M1 stage of the core: there is no decode, no execute and no retire yet.
 // FetchSink stands in for IDU+IU+RTU+CP0 (design doc S4.1) and hosts the

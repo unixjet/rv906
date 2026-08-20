@@ -11,38 +11,49 @@ design document.
 
 ## Status
 
-**M0: simulation scaffold complete.** There is no CPU pipeline yet — no
-IFU, no decode, no execute. What exists and works:
+**M1: front end bring-up in progress.** `RVProcAXI` now instantiates the
+real core shell (`rtl/RVProc.v`): IFU + ICache + BPU (predictor structures
+still land in later M1 tasks) + `FetchSink.v` (an M1-only scaffold that
+plays fake BJU/RTU/CP0 until the real IDU/IU/RTU exist in M2). What exists
+and works:
 
 - **A full AXI SoC simulation stack**: Verilator-simulated `RVProcAXI`
   fabric (crossbar, memory controller, CLINT, PLIC — all real RTL) wired to
   a C++ testbench (ELF loading, the tohost/fromhost protocol, FDT
   generation, an NS16550A UART model).
-- **`rtl/TestMaster.v`**, a placeholder core: not a CPU, just a small FSM
-  that exercises the AXI write/read/CLINT-read path and reports the result
-  through `tohost`. It stands in for the real core until M2.
-- **A passing end-to-end AXI smoke test** (`test/smoke/`): `PASS.`,
-  `exit=1`. The fail-detection path was also verified real — a deliberate
-  mismatch was injected, correctly produced `FAIL. test no. = 1` / `exit=3`,
-  then reverted.
+- **`rtl/ICache.v`** (complete + unit-tested) and **`rtl/IFU.v`** (complete,
+  predictor-less pipeline) — see `docs/superpowers/plans/2026-08-20-m1-ifu.md`
+  for the task-by-task history.
+- **`rtl/FetchSink.v`**, the M1 scaffolding core-shell tenant: consumes the
+  IFU's single-instruction-per-cycle delivery, resolves every control
+  transfer against its own predictor-independent oracle (direction rule,
+  decoded immediates, a 16-entry shadow call stack, the JR_TARGET formula),
+  and reports through `tohost` exactly as M0's `TestMaster.v` did.
+- **M0's `rtl/TestMaster.v` and `test/smoke/` are RETIRED** (design doc
+  S4.3): TestMaster's D-side AXI write FSM was lifted verbatim into
+  FetchSink.v, and every M1 test exercises a strict superset of what the
+  smoke test covered.
 - **A bare-metal firmware kit** (`test/`) that builds with the xpack
   RISC-V toolchain but does not run yet — running it needs a real core
   (M2).
 
-M1 (front end: IFU + ICache + branch predictor) is the next milestone. See
-`docs/08-verification.md` for the simulation stack, the tohost protocol, and
-the M2 restore checklist (what has to change once a real core replaces
-`TestMaster.v`).
+The M1 directed test suite, the C++ fetch-ISS/online checker, and the
+chicken-bit predictor ladder (Tasks 5-10 of the M1 plan) are still being
+built — there is no runnable M1 test target yet. A full M1 test-matrix
+quick-start lands with Task 10; until then, `make verisim` (below) is the
+build-correctness gate. See `docs/08-verification.md` for the simulation
+stack and the tohost protocol, and
+`docs/superpowers/plans/2026-08-20-m1-ifu.md` for the M1 task plan.
 
 ## Directory map
 
 | Path | Contents |
 |------|----------|
-| `rtl/` | Verilog/SystemVerilog RTL: AXI fabric (`AXICrossbar.v`, `AXIAddrDecode.v`, `AXIWidthAdapter.v`, `AXI4LSlave.v`), memory controller (`MEMCTL_AXI4L_step.RTL.v`), CLINT/PLIC, the SoC wrapper (`RVProcAXI.v`), the shared parameter package (`rvproc_pkg.sv`), and the M0 placeholder core (`TestMaster.v`) |
+| `rtl/` | Verilog/SystemVerilog RTL: AXI fabric (`AXICrossbar.v`, `AXIAddrDecode.v`, `AXIWidthAdapter.v`, `AXI4LSlave.v`), memory controller (`MEMCTL_AXI4L_step.RTL.v`), CLINT/PLIC, the SoC wrapper (`RVProcAXI.v`), the shared parameter package (`rvproc_pkg.sv`), the behavioral SRAM model (`SRAM.v`), and the core shell (`RVProc.v`: `IFU.v` + `ICache.v` + `BPU.v` + `FetchSink.v`) |
 | `testbench/` | C++ simulation harness: ELF loader (`load_elf.cpp`), FDT builder (`fdt.cpp`), the tohost/fromhost `TestBench` base class |
 | `io/` | AXI4-Lite C++ models: external memory (`ExtMem.h`), the generic AXI4L slave/converter templates (`RVProc_io.h`) |
 | `device/` | Peripheral device models (NS16550A UART, tty server) |
-| `test/` | Bare-metal firmware kit (build-only until M2) and `test/smoke/`, the M0 AXI smoke test firmware |
+| `test/` | Bare-metal firmware kit (build-only until M2) and `test/m1/unit/`, the M1 standalone RTL unit benches (`icache_tb.cpp`, `fetchsink_tb.cpp`) |
 | `docs/` | Verification notes (`08-verification.md`) and the specs/plans under `docs/superpowers/` |
 | `refs/` | Reference RTL pulled in for porting/comparison (gitignored, not part of this repository's source) |
 
@@ -53,21 +64,25 @@ the M2 restore checklist (what has to change once a real core replaces
 - `libelf` and `libfdt` development headers/libraries (`-lelf -lfdt`)
 - The xpack RISC-V toolchain, expected at
   `/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-` (used to build
-  `test/smoke` and the `test/` firmware kit)
+  the `test/` firmware kit and the M1 directed test suite as it lands)
 
 ## Quick start
+
+**M0's smoke test is retired** (design doc S4.3) along with `TestMaster.v` —
+there is no end-to-end runnable test target yet. M1 bring-up is in progress;
+a full M1 test-matrix quick-start (`test/m1/run_all.sh` across the
+chicken-bit predictor ladder) lands with plan Task 10. For now:
 
 ```bash
 make verisim                    # build the simulator (bin/verisim/testbench)
 
-make -C test/smoke              # build the M0 smoke firmware (test/smoke/smoke.out)
-timeout 30 bin/verisim/testbench --print-result test/smoke/smoke.out
-echo "exit=$?"                  # expect: "test/smoke/smoke.out: PASS." and exit=1
+make -C test/m1/unit icache && bin/unit/icache_tb   # ICache standalone unit bench
+make -C test/m1/unit fetchsink && bin/unit/fetchsink_tb  # FetchSink standalone unit bench
 ```
 
-`--print-result` is required to see the `PASS.`/`FAIL. test no. = N`
-message; the process exit code is the **raw tohost value** (1 = PASS), not a
-conventional 0/1 success code — see `docs/08-verification.md` for why.
+Each unit bench prints one line per check and ends with `UNIT-PASS` or
+`UNIT-FAIL`; see `docs/superpowers/plans/2026-08-20-m1-ifu.md` for what each
+task's gate actually is.
 
 To build the bare-metal firmware kit (build-only until M2 brings up a real
 core):

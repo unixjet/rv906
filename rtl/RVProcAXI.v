@@ -1,14 +1,15 @@
 //=============================================================================
-// RVProcAXI.v - rv906 M0 SoC Wrapper (Top-Level System Integration)
+// RVProcAXI.v - rv906 SoC Wrapper (Top-Level System Integration)
 //=============================================================================
 // Adapted from the donor rocket-chip project's rocketM wrapper
 // ($RC/rtl/rocketM/RVProcAXI.RTL.v). Top-level wrapper that provides G_
 // prefix interface for testbench compatibility.
 //
 // Internally instantiates:
-//   - u_core: M0 scaffold core (TestMaster). This is a placeholder CPU-core
-//     stand-in with the same AXI port list as the eventual real core; it is
-//     replaced by the real core starting at M2.
+//   - u_core: the rv906 core shell (RVProc.v, M1: IFU+ICache+BPU+FetchSink).
+//     M0's TestMaster placeholder core occupied this same instance name and
+//     AXI port list; plan Task 4.2 swapped it for RVProc with a one-word
+//     change, per the port-identical freeze from Task 1.3.
 //   - AXICrossbar (2 masters x 4 slaves)
 //   - MEMCTL_AXI4L_step (C2RTL generated memory controller)
 //   - CLINT and PLIC (interrupt controllers)
@@ -806,9 +807,10 @@ module RVProcAXI (
     );
 
     //=========================================================================
-    // M0 Scaffold Core (TestMaster; replaced by the real core from M2 on)
+    // rv906 core (M1: front end only -- IFU+ICache+BPU+FetchSink, see
+    // RVProc.v; M0's TestMaster scaffold is retired, plan Task 4.2/spec S4.3)
     //=========================================================================
-    TestMaster #(
+    RVProc #(
         .XLEN(64),
         .ILEN(32),
         .RESET_VECTOR(64'h80000000),
