@@ -211,15 +211,59 @@ struct Entry {
 };
 
 //-----------------------------------------------------------------------------
-// RAS-FAITHFUL GRADING HOOK -- see the header comment above. Deliberately
-// empty: Task 7.1's job once BPU.v's real RAS exists to read the resync
-// logic from. Nothing in Task 5/6 rung-1 grading consults this.
+// RAS-FAITHFUL GRADING HOOK -- filled in now that BPU.v's real RAS exists to
+// mirror (plan Task 7.1; see rtl/BPU.v's RAS section for the aq_ifu_ras.v
+// pointer-resync findings this reproduces, and rtl/FetchSink.v's own
+// "SECTION RAS-FAITHFUL GRADING MODEL" for the identical model built there).
+// DIAGNOSTIC ONLY: the online checker's committed-stream comparison is
+// already invariant to RAS prediction accuracy (design doc S4.1's
+// "predictors change WHEN, never WHICH"), so this is not consulted by
+// next()'s own walk (which keeps using the unbounded `stack` above,
+// unconditionally, at every rung -- exactly as it always has). It exists so
+// a caller CAN cross-check, instruction by instruction, whether the real
+// 4-entry/pointer-only-resync RAS would have predicted a given return
+// correctly -- useful for confirming callret.S's Phase 2 (6 unreturned
+// calls stacked, 2 past the 4-entry limit) actually exercises the shipped
+// limitation the way it is designed to.
+//
+// Mirrors aq_ifu_ras.v exactly: ONE one-hot 4-bit pointer (push rotates -1
+// mod 4 / right-rotate, pop rotates +1 mod 4 / left-rotate), one physical
+// 4-entry content array, NO content resync on misprediction, NO
+// empty-stack special case (an under-flowed pop just reads whatever is
+// physically in the pointed-to entry, zero if never written -- unlike
+// Iss::pop()'s own fall-through substitute above, which models FetchSink's
+// ACTUAL architectural behavior, not the predictor's). Driven by the same
+// push/pop CALL SITES as the unbounded `stack` (see push()/pop() below),
+// i.e. the confirmed/committed view -- it cannot see genuine speculative
+// wrong-path RAS corruption, which only BPU.v's own ID-stage stream could;
+// this is a best-effort cross-check, not a substitute for reading BPU.v's
+// trace directly.
 //-----------------------------------------------------------------------------
 struct RasFaithfulView {
-    // TODO(Task 7.1): mirror aq_ifu_ras.v's 4-entry, pointer-only
-    // misprediction resync here (no content resync -- design doc S2.1/S4.1)
-    // so rung-2+ tests near shadow-stack depth 4 can be graded against the
-    // RAS's actual shipped behaviour instead of the 16-entry stack below.
+    uint64_t entry[4];
+    unsigned pop_idx;   // 0..3, the one-hot pointer's bit position
+
+    RasFaithfulView() : pop_idx(0) { entry[0] = entry[1] = entry[2] = entry[3] = 0; }
+
+    // Returns the target the real RAS would have predicted for THIS pop,
+    // sampled before the pointer rotates (aq_ifu_ras.v's own read-then-
+    // rotate order), then advances the pointer.
+    uint64_t pop()
+    {
+        uint64_t predicted = entry[pop_idx];
+        pop_idx = (pop_idx + 1) & 0x3U;   // left-rotate: +1 mod 4
+        return predicted;
+    }
+
+    // Pushes fall_through into the slot the pointer is about to rotate
+    // INTO (right-rotate: -1 mod 4, i.e. +3 mod 4), then advances the
+    // pointer there -- matching aq_ifu_ras.v's "write target = the slot
+    // the pointer is rotating into" (BPU notes S3.2).
+    void push(uint64_t fall_through)
+    {
+        pop_idx = (pop_idx + 3U) & 0x3U;   // right-rotate: -1 mod 4
+        entry[pop_idx] = fall_through;
+    }
 };
 
 //-----------------------------------------------------------------------------
@@ -239,10 +283,17 @@ struct Iss {
     uint64_t              prefix_count; // instructions produced BEFORE the sentinel
     bool                  sentinel_seen;
     bool                  depth_warned;
-    RasFaithfulView        ras_view;    // Task 7.1 hook; unused through rung 1
+    RasFaithfulView        ras_view;      // Task 7.1: driven alongside `stack`
+                                           // below, diagnostic only (see its
+                                           // own header comment)
+    bool                   ras_faithful_mispredict; // valid only right after
+                                                     // a pop() that popped
+    uint64_t               ras_faithful_pred_pc;    // the model's own guess
+                                                     // for that same pop
 
     Iss() : pc(RESET_VECTOR), count(0), prefix_count(0),
-            sentinel_seen(false), depth_warned(false) {}
+            sentinel_seen(false), depth_warned(false),
+            ras_faithful_mispredict(false), ras_faithful_pred_pc(0) {}
 
     void reset(ReadHalf reader, uint64_t start_pc)
     {
@@ -253,6 +304,9 @@ struct Iss {
         prefix_count = 0;
         sentinel_seen = false;
         depth_warned = false;
+        ras_view = RasFaithfulView();
+        ras_faithful_mispredict = false;
+        ras_faithful_pred_pc = 0;
     }
 
     //-- shadow call stack -----------------------------------------------------
@@ -268,16 +322,28 @@ struct Iss {
             depth_warned = true;
         }
         stack.push_back(fall_through);
+        ras_view.push(fall_through);
     }
 
-    // Pop-on-empty returns the fall-through PC (spec S4.1, verbatim).
+    // Pop-on-empty returns the fall-through PC (spec S4.1, verbatim). The
+    // RAS-faithful model has no such rule (real hardware has no empty
+    // detection either) -- it is polled unconditionally so
+    // ras_faithful_mispredict/ras_faithful_pred_pc are always set from
+    // THIS pop, whether or not the real 16-entry ground-truth stack was
+    // itself empty.
     uint64_t pop(uint64_t fall_through)
     {
-        if (stack.empty())
-            return fall_through;
-        uint64_t t = stack.back();
-        stack.pop_back();
-        return t;
+        uint64_t faithful = ras_view.pop();
+        uint64_t actual;
+        if (stack.empty()) {
+            actual = fall_through;
+        } else {
+            actual = stack.back();
+            stack.pop_back();
+        }
+        ras_faithful_mispredict = (faithful != actual);
+        ras_faithful_pred_pc    = faithful;
+        return actual;
     }
 
     //-- the walk ---------------------------------------------------------------

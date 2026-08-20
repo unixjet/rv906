@@ -408,19 +408,70 @@ module FetchSink #(
     // design doc S2.1/S4.1; plan Task 7.1): the real aq_ifu_ras.v is 4 flop
     // entries with POINTER-ONLY misprediction resync (no entry-content
     // resync) -- a materially different, shallower object than this
-    // general-purpose 16-entry oracle. When BPU.v's real RAS lands in Task
-    // 7, a SEPARATE comparison path that mirrors aq_ifu_ras.v's pointer-
-    // resync logic exactly (not this array) must be added HERE to grade
-    // rung-2+ tests near depth 4 against the RAS's actual shipped behavior;
-    // this 16-entry stack remains the general/rung-1 oracle for everything
-    // else. Task 4 only lays the stack down and marks this hook -- the
-    // comparison logic itself is Task 7.1's job, not built here.
+    // general-purpose 16-entry oracle. FILLED IN below (SECTION RAS-FAITHFUL
+    // GRADING MODEL) now that BPU.v's real RAS exists to mirror -- this
+    // 16-entry stack remains the general/rung-agnostic CORRECTNESS oracle
+    // (unchanged); the grading model is a separate, diagnostic-only
+    // cross-check, not a replacement.
     //=========================================================================
     localparam integer SST_N = 16;
     reg [PC_WIDTH-1:0] sst_mem [0:SST_N-1];
     reg [4:0]          sst_sp;             // tracks true depth past SST_N too
 
     wire sst_has_entry = (sst_sp != 5'd0) && (sst_sp <= SST_N[4:0]);
+
+    //=========================================================================
+    // SECTION: RAS-FAITHFUL GRADING MODEL (plan Task 7.1's hook, filled in
+    // now that BPU.v's real RAS exists to mirror -- see this file's header
+    // "RAS-FAITHFUL GRADING HOOK" note above, and BPU.v's own RAS section
+    // for the aq_ifu_ras.v pointer-resync findings this model reproduces).
+    //
+    // DIAGNOSTIC ONLY, does not gate pass/fail: the online checker's
+    // committed-stream comparison is already invariant to RAS prediction
+    // accuracy by design (design doc S4.1's "predictors change WHEN an
+    // instruction is fetched, never WHICH instructions commit") -- a real
+    // RAS misprediction near depth 4 costs BPU.v some wasted speculative
+    // fetch cycles that FetchSink's own resolve (Task 7.2, unconditional
+    // for every jalr-family instruction) always corrects before commit.
+    // This model exists so a trace can CONFIRM the real 4-entry/pointer-
+    // only-resync limitation is actually being exercised the way
+    // callret.S's Phase 2 (6 unreturned calls stacked, 2 past the 4-entry
+    // limit) intends, not to re-decide correctness.
+    //
+    // Mirrors aq_ifu_ras.v's algorithm exactly: ONE one-hot 4-bit pointer
+    // (push rotates -1 mod 4, i.e. right-rotate; pop rotates +1 mod 4, i.e.
+    // left-rotate), one physical 4-entry content array, NO content resync
+    // on misprediction, NO empty-stack special case (real hardware has no
+    // valid bit either -- an under-flowed pop just reads whatever is
+    // physically in the pointed-to entry, reset-zero if never written).
+    // Driven by FetchSink's own COMMITTED push/pop events (do_push/do_pop
+    // below), NOT BPU's speculative ID-stage stream -- the two views
+    // coincide exactly whenever the wrong-path window between a call's
+    // fetch and its resolve never itself contains another call/return,
+    // which is true of this directed suite (a divergence would show up as
+    // a committed-stream mismatch in Task 6/7's own bring-up, since BPU.v's
+    // classification runs on the SAME x1-only rule independently). A model
+    // built on the confirmed-only view structurally cannot see genuine
+    // speculative/wrong-path RAS corruption -- BPU.v's own trace is the
+    // only ground truth for that; this is a best-effort cross-check, not a
+    // substitute.
+    //=========================================================================
+    reg [PC_WIDTH-1:0] rasf_entry0, rasf_entry1, rasf_entry2, rasf_entry3;
+    reg [3:0]          rasf_pop;
+
+    wire [3:0] rasf_push_next = {rasf_pop[0], rasf_pop[3:1]};   // right-rotate (push)
+    wire [3:0] rasf_pop_next  = {rasf_pop[2:0], rasf_pop[3]};   // left-rotate  (pop)
+
+    reg [PC_WIDTH-1:0] rasf_read;
+    always @* begin
+        case (rasf_pop)
+            4'b0001: rasf_read = rasf_entry0;
+            4'b0010: rasf_read = rasf_entry1;
+            4'b0100: rasf_read = rasf_entry2;
+            4'b1000: rasf_read = rasf_entry3;
+            default: rasf_read = {PC_WIDTH{1'b0}};
+        endcase
+    end
 
     //=========================================================================
     // SECTION: RESOLVE  (combinational decode of THIS cycle's delivered
@@ -556,6 +607,16 @@ module FetchSink #(
     // gap left by oversight.
     reg [3:0]  perr_code     /* verilator public */;
 
+    // RAS-faithful grading model export (diagnostic only, see SECTION
+    // RAS-FAITHFUL GRADING MODEL above -- does not gate pass/fail).
+    // rasf_mispredict pulses for one cycle whenever a committed preturn's
+    // ACTUAL target (this module's own ground truth) differs from what the
+    // mirrored 4-entry/pointer-only-resync model would have predicted --
+    // i.e. exactly the cycles where the real RAS's depth-4 limitation would
+    // have produced a genuine wrong speculative redirect.
+    reg        rasf_mispredict /* verilator public */;
+    reg [63:0] rasf_pred_pc    /* verilator public */;
+
     reg [63:0] report_val;          // drives the tohost write
     reg [15:0] lfsr;
     wire       lfsr_fb = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
@@ -580,6 +641,13 @@ module FetchSink #(
             r_stall    <= 1'b0;
             lfsr       <= 16'hACE1;
             sst_sp     <= 5'd0;
+            rasf_pop     <= 4'b0001;
+            rasf_entry0  <= {PC_WIDTH{1'b0}};
+            rasf_entry1  <= {PC_WIDTH{1'b0}};
+            rasf_entry2  <= {PC_WIDTH{1'b0}};
+            rasf_entry3  <= {PC_WIDTH{1'b0}};
+            rasf_mispredict <= 1'b0;
+            rasf_pred_pc    <= 64'd0;
 
             r_tar_pc_vld  <= 1'b0;
             r_tar_pc      <= {PC_WIDTH{1'b0}};
@@ -619,6 +687,28 @@ module FetchSink #(
             else if (commit_en && do_pop) begin
                 if (sst_sp != 5'd0) sst_sp <= sst_sp - 5'd1;
             end
+
+            //-----------------------------------------------------------
+            // RAS-faithful grading model (diagnostic only, SECTION
+            // RAS-FAITHFUL GRADING MODEL above): driven by the SAME
+            // commit-time do_push/do_pop pulses as the shadow call stack,
+            // but through the real RAS's own 4-entry/pointer-only-resync
+            // algorithm instead of an unbounded array. `rasf_read` (the
+            // model's prediction) is sampled BEFORE the pointer rotates,
+            // matching aq_ifu_ras.v's own read-then-rotate ordering.
+            //-----------------------------------------------------------
+            if (commit_en && do_push) begin
+                if (rasf_push_next[0]) rasf_entry0 <= fall;
+                if (rasf_push_next[1]) rasf_entry1 <= fall;
+                if (rasf_push_next[2]) rasf_entry2 <= fall;
+                if (rasf_push_next[3]) rasf_entry3 <= fall;
+                rasf_pop <= rasf_push_next;
+            end
+            else if (commit_en && do_pop) begin
+                rasf_pop <= rasf_pop_next;
+            end
+            rasf_mispredict <= commit_en && do_pop && (rasf_read != actual_next);
+            rasf_pred_pc    <= {{(64-PC_WIDTH){1'b0}}, rasf_read};
 
             //-----------------------------------------------------------
             // Architectural PC and the commit counter

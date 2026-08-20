@@ -123,6 +123,13 @@ module IFU (
     output wire                     ipack_pred_h0_create,   // straddle-carry state
     output wire                     ipack_pred_h0_vld,
     output wire                     ipack_pred_unalign,
+    // TASK 7.1 PORT-FREEZE AMENDMENT (see BPU.v's header note at its own
+    // matching input): real C906 fans aq_ifu_ibuf.v's own room-check output
+    // into aq_ifu_pred.v too (not just aq_ifu_ipack.v) so RAS push/pop
+    // doesn't re-fire every cycle a bundle sits stalled-but-unretired in
+    // IPACK. Same net this file already computes as `ibuf_ipack_stall`
+    // below (SECTION IBUF) -- just also exposed as a port now.
+    output wire                     ibuf_ipack_stall,
 
     //=========================================================================
     // BPU -> IFU : the two redirect channels (BPU notes S4.3) + IPACK/IBUF
@@ -200,9 +207,10 @@ module IFU (
     //      ("delayed change-flow": RTU > IU/BJU > BPU's final redirect;
     //      RTU wins ties, pcgen.v:208-209)
     //   2. pred_pcgen_curflw_vld && !pcgen_buf_chgflw && !icache_pcgen_grant
-    //      ("same-cycle correction": RAS-return / delay-replay -- dead in
-    //      M1 since BPU.v ties pred_pcgen_curflw_vld to 0, see the livelock
-    //      check below; wired for real once Task 7 lands)
+    //      ("same-cycle correction": RAS-return / delay-replay -- LIVE as of
+    //      Task 7: BPU.v's real RAS drives this whenever it predicts a
+    //      return, gated by cp0_ifu_ras_en so it stays silent at rung 1,
+    //      see BPU.v's RAS section)
     //   3. ipack_pcgen_reissue && icache_pcgen_inst_vld
     //      (IBUF-stall-triggered same-PC refetch, SECTION IPACK)
     //   6. icache_pcgen_grant                        (sequential +4 advance;
@@ -217,15 +225,27 @@ module IFU (
     // LIVELOCK CHECK (plan Task 3.2, explicit per-level audit): every level
     // above 6 is gated by an actual `_vld` wire sourced from FetchSink or
     // BPU.v, never by an unconditional/default-active internal signal.
-    // BPU.v's OWN Task-1 skeleton ties `pred_pcgen_chgflw_vld` and
-    // `pred_pcgen_curflw_vld` to constant 0 while every predictor is
-    // disabled, so levels 2's BPU term and level 3 are structurally
-    // incapable of firing in M1's configuration -- confirmed by reading
-    // BPU.v's body (all predictor outputs `assign`ed to inactive constants),
-    // not assumed. No level here defaults toward an active/valid state when
-    // its source doesn't exist; the chain always falls through cleanly to
-    // level 6 (or level 7) when RTU/IU/BPU are silent. Unlike rv12's C910
-    // finding, no fix was needed here -- confirmed, not guessed.
+    // Through Task 6, BPU.v's skeleton tied `pred_pcgen_chgflw_vld` and
+    // `pred_pcgen_curflw_vld` to constant 0 while every predictor was
+    // disabled, so levels 2's BPU term and level 3 were structurally
+    // incapable of firing -- confirmed by reading BPU.v's body, not assumed.
+    // TASK 7 UPDATE: `pred_pcgen_curflw_vld` is now real (BPU.v's RAS), so
+    // this level DOES fire whenever a return is predicted at rung >= 2.
+    // Re-audited for livelock at that point: `pcgen_chgflw_cur`'s own
+    // `!pcgen_buf_chgflw` term only blocks a re-trigger for the one cycle
+    // right after a LEVEL-1 (delayed chgflw) event, not after a level-2
+    // (curflw) one -- so a curflw pulse held high for many consecutive
+    // cycles (the risk Task 7 specifically analyzed: this file's own
+    // binary-pointer IBUF, unlike the real one-hot design, can hold IPACK's
+    // entries valid-but-unretired for a long `--sink-stall` backpressure
+    // run, during which the SAME classified bundle would otherwise be
+    // re-presented every cycle) could pin `pcgen_ifpc`/`pcgen_icache_va` at
+    // the same curflw target forever. BPU.v's RAS section closes this by
+    // gating its `pred_pcgen_curflw_vld` output with `!ibuf_ipack_stall`
+    // (a new Task 7.1 port, see BPU.v's header) in addition to
+    // `cp0_ifu_ras_en` -- the redirect only ever pulses for the single
+    // cycle IPACK's bundle is actually live/retiring, so this level still
+    // falls through cleanly whenever RTU/IU/BPU are silent OR stalled.
     //=========================================================================
     reg  [63:0]         pcgen_ifpc;          // pcgen.v:100; low 40b architectural, hi 24b sign-ext
     reg  [PC_WIDTH-1:0] pcgen_pipe_ifpc;     // pcgen.v:101; 1-cycle-delayed copy for BPU's ID-stage view
@@ -444,8 +464,9 @@ module IFU (
 
     wire icache_inst_vld    = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
     wire ipack_align_create = icache_inst_vld && !icache_ipack_unalign;                        // ipack.v:255
-    // fwd decl: driven in SECTION IBUF below.
-    wire ibuf_ipack_stall;
+    // ibuf_ipack_stall is now a MODULE OUTPUT PORT (Task 7.1 amendment,
+    // see the port-list note) driven in SECTION IBUF below -- no separate
+    // internal fwd-declared wire needed, the port net serves both roles.
     wire ipack_buf_stall = pred_ipack_ret_stall || ibuf_ipack_stall;                           // ipack.v:256
     wire ipack_buf_flush = rtu_ifu_flush_fe || iu_ifu_tar_pc_vld || rtu_ifu_chgflw_vld;         // ipack.v:251-252, direct RTU/IU wiring (bypasses ctrl hub)
 

@@ -240,6 +240,7 @@ module RVProc #(
     wire                     ipack_pred_h0_create;
     wire                     ipack_pred_h0_vld;
     wire                     ipack_pred_unalign;
+    wire                     ibuf_ipack_stall;   // Task 7.1 port-freeze amendment (BPU.v header)
 
     wire                     pred_pcgen_chgflw_vld;
     wire [PC_WIDTH-1:0]      pred_pcgen_chgflw_pc;
@@ -384,6 +385,7 @@ module RVProc #(
         .ipack_pred_h0_create    (ipack_pred_h0_create),
         .ipack_pred_h0_vld       (ipack_pred_h0_vld),
         .ipack_pred_unalign      (ipack_pred_unalign),
+        .ibuf_ipack_stall        (ibuf_ipack_stall),
 
         .pred_pcgen_chgflw_vld   (pred_pcgen_chgflw_vld),
         .pred_pcgen_chgflw_pc    (pred_pcgen_chgflw_pc),
@@ -433,6 +435,7 @@ module RVProc #(
         .ipack_pred_h0_create    (ipack_pred_h0_create),
         .ipack_pred_h0_vld       (ipack_pred_h0_vld),
         .ipack_pred_unalign      (ipack_pred_unalign),
+        .ibuf_ipack_stall        (ibuf_ipack_stall),
 
         .pred_pcgen_chgflw_vld   (pred_pcgen_chgflw_vld),
         .pred_pcgen_chgflw_pc    (pred_pcgen_chgflw_pc),
@@ -453,6 +456,7 @@ module RVProc #(
         .iu_ifu_pc_mispred       (iu_ifu_pc_mispred),
         .iu_ifu_link_vld         (iu_ifu_link_vld),
         .iu_ifu_ret_vld          (iu_ifu_ret_vld),
+        .iu_ifu_tar_pc_vld       (iu_ifu_tar_pc_vld),
 
         .rtu_ifu_flush_fe        (rtu_ifu_flush_fe)
     );
