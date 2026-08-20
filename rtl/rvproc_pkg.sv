@@ -322,6 +322,35 @@ parameter [2:0] WB_INT_TYPE_LSU   = 3'd4;
 // not add a 5th value on a guess.
 
 //-----------------------------------------------------------------------------
+// M2 Task 2: CP0/EU_CP0 FUNC one-hot values (aq_idu_cfig.h:453-474, the "CP0
+// Decoder" section). These are the exact bit patterns the donor's decoder
+// produces for the CSRRW/S/C(+I)/ECALL/EBREAK/MRET/FENCE/FENCE.I encodings
+// -- read directly out of the donor's IDU config header (not the CP0 files
+// CSR.v's own header cites) because Task 5 (IDU's real decode) has not run
+// yet and CSR.v (Task 2) needs a pinned, donor-faithful value to dispatch
+// against NOW. Pinned here (rather than left for Task 5) so Task 5's real
+// decode has a fixed target to hit instead of inventing its own encoding
+// after the fact. Every value below is `{FUNC_WIDTH-10{1'b0}}` zero-extended
+// from the donor's own 10-bit literal -- confirmed bit-exact, not
+// re-derived. SRET/WFI/DRET/SFENCE/SYNC/SYNCI/CACHE/VSETVL/VSETVLI (the
+// donor's other EU_CP0 sub-ops) are deliberately NOT pinned: M2's IDU never
+// emits them (contracts 2.2/2.3.4/10), so they are DECLARED-YET-
+// PERMANENTLY-UNREACHABLE the same way EU_VGROUP_SEL/EU_FP_SEL/EU_VEC_SEL
+// are above -- no constant is declared for them at all.
+//-----------------------------------------------------------------------------
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_ECALL   = 20'h00012;  // cfig.h:455
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_EBREAK  = 20'h00022;  // cfig.h:456
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_MRET    = 20'h00042;  // cfig.h:457
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_FENCE   = 20'h00028;  // cfig.h:461
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_FENCEI  = 20'h00024;  // cfig.h:462
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRW   = 20'h00011;  // cfig.h:469
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRS   = 20'h00021;  // cfig.h:470
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRC   = 20'h00041;  // cfig.h:471
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRWI  = 20'h00211;  // cfig.h:472
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRSI  = 20'h00221;  // cfig.h:473
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRCI  = 20'h00241;  // cfig.h:474
+
+//-----------------------------------------------------------------------------
 // M2: id_ex1_t -- IDU's single shared EX1 payload (design doc S4.2),
 // field-sliced per consumer (IU/LSU/CSR each take their own view) rather
 // than four separate structs routed to four destination registers (matches

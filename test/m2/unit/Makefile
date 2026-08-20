@@ -1,0 +1,57 @@
+# rv906 M2 unit benches -- standalone Verilator models, one obj dir per
+# bench, parallel to test/m1/unit/ (contract 15: NEW directory, same exact
+# structural pattern -- one --top-module per bench target, obj/unit/<name>,
+# bin/unit/<name>_tb, a run/UNIT-SUITE-PASS aggregate target).
+#
+# Pattern copied verbatim from test/m1/unit/Makefile: each RTL bench
+# verilates ONE rtl module (plus what it instantiates) with its own --Mdir
+# under obj/unit/, and links a plain C++ main. Nothing here touches the
+# full-stack build in verilator.mk.
+#
+# CSR.v is the only bench today (plan Task 2.2); Tasks 3-6 (IU/RTU/IDU/
+# LSU+DCache+MMU) each add their own target here the same way, following
+# this exact template -- do not restructure when they land.
+#
+#   make -C test/m2/unit csr        # build the CSR bench
+#   make -C test/m2/unit run        # build and run every bench (UNIT-SUITE-PASS/FAIL)
+#   make -C test/m2/unit clean
+
+ROOT      := $(abspath $(CURDIR)/../../..)
+VERILATOR ?= verilator
+CXX_TOOL  ?= clang++
+
+VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
+
+BIN_DIR = $(ROOT)/bin/unit
+
+.PHONY: all run clean
+all: csr
+
+#-----------------------------------------------------------------------------
+# CSR (plan task 2.2)
+#-----------------------------------------------------------------------------
+CSR_OBJ = $(ROOT)/obj/unit/csr
+CSR_BIN = $(BIN_DIR)/csr_tb
+CSR_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/CSR.v
+
+.PHONY: csr
+csr: $(CSR_BIN)
+
+$(CSR_BIN): $(CSR_RTL) $(CURDIR)/csr_tb.cpp
+	@mkdir -p $(CSR_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module CSR --Mdir $(CSR_OBJ) \
+		-o $@ $(CSR_RTL) $(CURDIR)/csr_tb.cpp
+	$(MAKE) -C $(CSR_OBJ) -f VCSR.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
+# Run EVERY bench even when one fails, then report -- a recipe line that
+# exits non-zero would otherwise abort the target and hide the benches
+# behind it, exactly backwards for a regression run (test/m1/unit/Makefile
+# precedent).
+run: all
+	@rc=0; \
+	$(CSR_BIN) || rc=1; \
+	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
+	exit $$rc
+
+clean:
+	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN)
