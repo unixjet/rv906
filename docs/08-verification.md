@@ -1,11 +1,21 @@
 # 8. Verification
 
-This chapter describes the M0 simulation scaffold as built: there is no CPU
-pipeline yet (that starts at M1/M2). The AXI fabric, memory controller, and
-interrupt controllers are real RTL (ported from rv12/rocketM); the "core" is
-`rtl/TestMaster.v`, a small FSM that exists only to drive the fabric end to
-end and prove the harness works. Section 8.6 is the checklist for whoever
-starts M2 and needs to retire `TestMaster.v` for a real core.
+Sections 8.1-8.8 describe the M0 simulation scaffold as originally built: at
+that point there was no CPU pipeline (`rtl/TestMaster.v` stood in for one),
+and every claim in those sections should be read as a description of that
+M0-era state, kept for the historical record and because the fabric/protocol
+facts it documents (the tohost encoding, the AXI stack, the M2 restore
+checklist) are still exactly true. `rtl/TestMaster.v` and `test/smoke/` are
+now retired (design doc S4.3, M1 plan Task 4) — `rtl/RVProc.v` (IFU + ICache
++ BPU + FetchSink) is the real core shell in `RVProcAXI.v` today, and every
+M1 test exercises the same tohost path TestMaster's smoke test did, plus a
+great deal more. Section 8.9 is the M1 harness this milestone added: the
+two-oracle architecture, the CLI flags, the directed test suite, the full
+regression matrix and its slot-count invariant, and the unit benches. The
+AXI fabric, memory controller, and interrupt controllers are still real RTL
+(ported from rv12/rocketM). Section 8.6 remains the checklist for whoever
+starts M2 and needs to retire the FetchSink-as-core-shell arrangement for a
+real IDU/IU/RTU.
 
 ## 8.1 Simulation stack
 
@@ -260,3 +270,204 @@ are ever loaded into the simulator or run — there is no CPU to run them.
 They exist to prove the toolchain and link script are wired correctly ahead
 of M2, which is the first milestone with a core capable of executing them
 (subject to the RVC decision in §8.7 item 7).
+
+## 8.9 The M1 harness
+
+M1 has a fetch pipeline (`rtl/IFU.v`), an instruction cache (`rtl/ICache.v`)
+and a branch predictor (`rtl/BPU.v`) but no decode or execute stage — there
+is no register file and no ALU to check results against. What M1 verifies
+is narrower and different in kind from a normal CPU test: not "did the
+program compute the right answer" but "did the front end fetch and commit
+the right *stream of instructions, in the right order*, regardless of which
+predictor configuration was steering it." `docs/02-ifu.md` §6 and
+`docs/03-bpu.md` §5 point back here for exactly this reason.
+
+### 8.9.1 Two-oracle architecture
+
+Two independent implementations of the same behavioral contract (design doc
+S4.1) are compared online, every simulated cycle:
+
+- **`rtl/FetchSink.v`** (RTL) stands in for IDU + IU + RTU + CP0. It
+  consumes the IFU's single delivered instruction per cycle, plays a fake
+  branch unit (a fixed direction rule `taken = ^pc[7:4]`, decoded B/CB/J/CJ
+  immediates, a 16-entry shadow call stack, the `JR_TARGET(pc)` formula for
+  every other indirect jump) and a fake retire unit (retire pulses that
+  drive BPU's architectural GHR shift and RAS/BTB updates), hosts the
+  harness's config register bank (§8.9.2), and reports over `tohost` exactly
+  as M0's `TestMaster.v` did.
+- **`m1_iss.h`**, a C++ golden fetch-ISS driven from `RVProcTest.cpp`, walks
+  the *same* contract over the ELF image loaded in `ExtMem` — its own
+  independent shadow call stack, its own `JR_TARGET` formula, its own
+  sentinel-stop logic.
+
+**Neither was ported from the other.** They were implemented independently
+from the spec text specifically so that a shared bug between them validates
+nothing (the same rule rv12's own M1 harness used). `RVProcTest.cpp`'s
+`M1Checker::slot()` samples the committed instruction via `verisim.h`'s
+`m1sink` accessors every cycle, compares `(pc, opcode)` against the ISS's
+next expected entry in order, and on the first divergence prints both
+streams' last 16 entries plus the cycle number before exiting
+(`M1_FAIL_STATUS = 2`).
+
+The one place FetchSink has to *observe* the front end rather than purely
+model it is the jalr-family mispredict rule: since FetchSink cannot see BPU
+internals, it compares the actual target (from its own shadow stack or
+`JR_TARGET`) against **the PC delivered behind the jump** — whatever the
+front end actually fetched next, be that a RAS pop at rung 2, a BTB-fed
+sequential continuation at rung 1, or anything else. One comparison rule
+therefore covers every rung without a rung-specific special case.
+
+### 8.9.2 CLI flags
+
+Parsed out of `argv` in `RVProcTest.cpp` before `TestBench::parse_arg` ever
+sees it (the M0 harness's own `parse_arg`, not Verilator plusargs — same
+mechanism rv12 used), then poked into FetchSink's config register bank via
+`verisim.h`'s `m1sink` accessors after `dut.init()`:
+
+| Flag | Meaning |
+|---|---|
+| `--m1-rung=<1..4>` | predictor chicken-bit ladder, cumulative: 1 = all predictors off, 2 = +RAS, 3 = +BTB, 4 = +BHT |
+| `--max-insts=<N>` | FetchSink's commit budget (default 200000); exhaustion is `perr_code=1`, not a tohost value. Tested at commit-group granularity, so a run can end slightly past N — a documented floor, not an exact count |
+| `--inv-test` | pulse `cfg_bht_inv`/`cfg_btb_clr` mid-run, one at a time, spaced far enough apart that the 1024-cycle BHT sweep always completes before the next pulse |
+| `--sink-stall` | FetchSink's pseudo-random `id_stall` mode, exercising the stall/backpressure path independently of the redirect path |
+| `--fencei-patch=<addr>:<word32>[:<commit>]` | the fence.i mechanism (`test/m1/fencei.S`): at commit boundary `<commit>` (default 1000, a count of instructions the checker has already compared, not a cycle), the host writes `<word32>` into the ELF image in `ExtMem` at `<addr>` and pulses `cfg_icache_inv` for one cycle. Both oracles switch images at exactly that boundary — the RTL because the invalidate forces a refill from patched memory, the ISS because it reads the image lazily at the moment each instruction commits. The run FAILS if the patch never fires, so `fencei.S` cannot pass vacuously against an unpatched image |
+| `--iss-selftest` | run the golden ISS's own gate (27 hand-derived entries from `test/m1/iss_selftest.S`'s real disassembly) and exit — no RTL involved |
+| `--no-checker` | sample and compare nothing — a debug escape hatch for telling a raw RTL hang/crash apart from a bug in the checker itself |
+
+These four (`--m1-rung`, `--max-insts`, `--inv-test`, `--sink-stall`) were
+the ones the plan pinned in advance; the other three
+(`--fencei-patch`, `--iss-selftest`, `--no-checker`) were added as the test
+suite needed them during Tasks 5-6, the same precedent rv12's own harness
+set.
+
+### 8.9.3 The RAS-faithful grading path
+
+The real `aq_ifu_ras.v` is 4 flop entries with pointer-only misprediction
+resync — correctness is only guaranteed for ≤4 in-flight unresolved
+call/return predictions (design doc S2.1, `docs/03-bpu.md` §4.3).
+FetchSink's general-purpose correctness oracle is a 16-entry shadow stack,
+deliberately much deeper than the real RAS, because the *checker's* job is
+to know the ground-truth committed stream at every rung, not to reproduce
+the real RAS's shallow-depth behavior.
+
+A **second, diagnostic-only** model, `FetchSink.v`'s SECTION RAS-FAITHFUL
+GRADING MODEL, mirrors `aq_ifu_ras.v`'s algorithm exactly (one one-hot
+4-bit pointer, one physical 4-entry array, no content resync, no
+empty-stack special case) so that a trace can *confirm* `test/m1/callret.S`'s
+past-depth-4 nesting is actually exercising the real limitation, rather than
+merely trusting that it does. It does not gate pass/fail — the online
+checker's committed-stream comparison is already invariant to RAS
+prediction accuracy by construction.
+
+**Documented limitation**: this grading model is driven by FetchSink's own
+*committed* push/pop events, so it structurally cannot see genuine
+speculative/wrong-path RAS activity inside `BPU.v` — a real RAS
+misprediction that gets corrected before anything commits is invisible to
+it. `BPU.v`'s own trace is the only ground truth for that; the grading
+model is a best-effort cross-check on top of the checker, not a replacement
+for reading the real RAS's behavior directly.
+
+### 8.9.4 Unit benches (`test/m1/unit/`, `make -C test/m1/unit run`)
+
+Three standalone benches, each proving one oracle or one RTL module against
+an independently-written model, without the SoC around them:
+
+- **`icache_tb.cpp`** drives `ICache.v`'s fetch port directly against a
+  golden memory array behind a behavioral AXI slave: hit after refill,
+  both-ways fill and FIFO replacement, alias-free indexing, live
+  RVC-boundary detection against a C++ reimplementation, INV_ALL then
+  re-miss, the uncached path, and AXI-error → access-fault reporting.
+- **`fetchsink_tb.cpp`** drives `FetchSink.v`'s single-instruction intake
+  port with hand-built delivery sequences and asserts the contract
+  directly: the squash rule on a mispredict, correct-prediction commits,
+  shadow-stack push/pop including pop-on-empty, the `JR_TARGET` formula, the
+  resolve-signal protocol, and sentinel/tohost reporting. This is also
+  where the `--sink-stall` port-wiring bug (`docs/02-ifu.md` §5.5) was
+  caught, by its own `T14` (`test_sink_stall_mode`).
+- **`iss_tb.cpp`** is the golden ISS's own gate (plan Task 5.3): a plain
+  C++ program with no RTL dependency at all, run *before* `m1_iss.h` is
+  ever trusted to grade FetchSink/IFU/ICache. It is the same check
+  `--iss-selftest` runs inside the full testbench binary, built standalone
+  here so the ISS can be gated in isolation.
+
+Each bench prints one line per check and ends `UNIT-PASS`/`UNIT-FAIL`;
+`make -C test/m1/unit run` builds and runs all three regardless of an
+individual failure (so one broken bench never hides the other two) and
+prints `UNIT-SUITE-PASS`/`UNIT-SUITE-FAIL` at the end.
+
+### 8.9.5 The full regression matrix and its slot-count invariant
+
+`test/m1/run_all.sh` has two modes. The original single-rung mode
+(`test/m1/run_all.sh` or `--m1-rung=N`) is the bring-up loop Tasks 6-9 used
+while landing each rung. `test/m1/run_all.sh --full-matrix` (plan Task 10.1)
+is the milestone's acceptance gate:
+
+```
+11 tests x 4 rungs x --sink-stall {off,on}                        =  88 runs
+11 tests x rung 4 x --sink-stall {off,on} x --inv-test             =  22 runs
+                                                                    -----------
+                                                                      110 runs
+```
+
+The 11 tests are `seq`, `rvc_mix`, `jal_chain`, `callret`, `ind_jr`,
+`dense_br`, `thrash`, `uncached`, `fencei`, `mixed`, `iss_selftest` — the M1
+spec's directed suite (S4.2). (C906's live, non-precomputed RVC-boundary
+detection means the `missigned`-style replay-livelock test rv12 needed for
+C910's precomputed bry0/bry1 phases has no analogous failure mode to
+exercise here — confirmed and *not* built, per the plan's own instruction
+to drop a vacuous test rather than author one for coverage's sake.)
+
+**The invariant the script asserts, not just reports**: design doc S4.1
+states that a predictor changes *when* an instruction is fetched, never
+*which* instructions commit. `run_all.sh --full-matrix` parses each run's
+`[checker] <N> instructions compared ...` line (`RVProcTest.cpp`'s own
+`term()` printf) and requires that count to be **identical across every one
+of a test's ten runs** (four rungs × two stall modes, sharing the rung-4
+`--inv-test` pair's expected count). A differing slot count is a loud,
+nonzero-exit failure even when every individual run reports PASS — this is
+the online checker's own predictor-agnostic design promise, made into an
+automated, per-test assertion rather than left as something a human has to
+notice by eye.
+
+**Result, current tree: 110/110 PASS, slot-count invariant holds for all 11
+tests.** Cycle counts, `--sink-stall` off, by rung (columns `r1`-`r4` are
+the four rungs; `r4i` is rung 4 with `--inv-test`; `slots` is the invariant
+count):
+
+| test | r1 | r2 | r3 | r4 | r4i | slots |
+|---|---|---|---|---|---|---|
+| seq | 452 | 452 | 452 | 452 | 452 | 320 |
+| rvc_mix | 1566 | 1566 | 1566 | 1566 | 1566 | 1208 |
+| jal_chain | 3051 | 3051 | 3051 | 3051 | 3051 | 526 |
+| callret | 275 | 266 | 266 | 266 | 266 | 60 |
+| ind_jr | 300 | 300 | 300 | 300 | 300 | 28 |
+| dense_br | 2801 | 2805 | 2803 | 2837 | 2813 | 809 |
+| thrash | 24374 | 24374 | 24374 | 24374 | 24374 | 15885 |
+| uncached | 185 | 185 | 185 | 185 | 185 | 34 |
+| fencei | 345 | 345 | 345 | 345 | 345 | 30 |
+| mixed | 909 | 909 | 909 | 909 | 909 | 445 |
+| iss_selftest | 175 | 175 | 175 | 175 | 175 | 39 |
+
+Reading it: `callret` is the RAS test and rung 2 is where it pays (RAS
+absorbs mispredicted returns that rung 1 has to resolve through a full
+flush/refetch); `dense_br` moves at every rung as BHT/BTB engage, including
+*upward* at rung 4 — consistent with `docs/03-bpu.md` §4.1's GHR
+read/write-window finding, which predicts a real but harmless
+accuracy/cycle-count cost, never a correctness one; `thrash` and `ind_jr`
+are flat because their control flow's predictable component (capacity
+misses, or an indirect target that is a pure function of PC) does not
+change with the predictor set; every test's `slots` column is identical
+across the whole row, which is the invariant itself, made visible.
+
+## 8.10 What M1 does not cover
+
+M1 has no execute stage, so nothing here validates instruction *semantics*
+— only which instructions are fetched, in what order. There is no register
+file and no ALU, so a delivered instruction's opcode is checked, never its
+operands or its result. Privilege switching does not exist (no CSR file, no
+trap path before M2), and the only self-modifying code exercised is the
+host-driven `fence.i` patch (§8.9.2) — nothing here proves the RTL's own
+fence.i is sufficient once a store unit can trigger it for real. Those
+arrive with M2 and M4; the harness's `term()` checks in `RVProcTest.cpp` are
+written to fail loudly rather than silently pass once those assumptions
+change.

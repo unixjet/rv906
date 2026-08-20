@@ -19,7 +19,7 @@ VERISIM_FLAGS  += --trace-fst
 VERISIM_CFLAGS += -DVERISIM_TRACE
 endif
 
-VERISIM_HDRS = config.h RVProc.h RVProcArch.h C2Rdef.h dut.h \
+VERISIM_HDRS = config.h RVProc.h RVProcArch.h C2Rdef.h dut.h m1_iss.h \
                $(wildcard rtl/*.h) $(wildcard testbench/*.h) \
                $(wildcard io/*.h) $(wildcard device/*.h)
 
@@ -40,3 +40,13 @@ $(VERISIM_TARGET): $(VERISIM_RTL) $(VERISIM_SRCS) $(VERISIM_HDRS) $(TRACE_STAMP)
 		--Mdir $(VERISIM_OBJ_DIR) -o $(CURDIR)/$@ \
 		$(VERISIM_RTL) $(addprefix $(CURDIR)/,$(VERISIM_SRCS))
 	$(MAKE) -C $(VERISIM_OBJ_DIR) -f V$(VERISIM_TOP).mk CXX=clang++ LINK=clang++
+
+# The fetch-ISS's own unit test (plan Task 5.3) runs inside the SAME
+# verisim binary with --iss-selftest, which returns before dut.init() is
+# ever called -- no RTL involved. test/m1/unit's `iss` target is the
+# faster, RTL-free way to run just this gate; this target is the
+# full-binary equivalent (useful as a smoke check that the flag still wires
+# up correctly after a verisim rebuild).
+.PHONY: m1-iss-selftest
+m1-iss-selftest: $(VERISIM_TARGET)
+	$(VERISIM_TARGET) --iss-selftest
