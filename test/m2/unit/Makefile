@@ -8,14 +8,15 @@
 # under obj/unit/, and links a plain C++ main. Nothing here touches the
 # full-stack build in verilator.mk.
 #
-# CSR.v/IU.v are the benches so far (plan Tasks 2.2/3.7); RTU.v joins here
-# (plan Task 4.3). Tasks 5-6 (IDU/LSU+DCache+MMU) each add their own target
+# CSR.v/IU.v/RTU.v are the benches so far (plan Tasks 2.2/3.7/4.3); IDU.v
+# joins here (plan Task 5.6). Task 6 (LSU+DCache+MMU) adds its own targets
 # here the same way, following this exact template -- do not restructure
-# when they land.
+# when it lands.
 #
 #   make -C test/m2/unit csr        # build the CSR bench
 #   make -C test/m2/unit iu         # build the IU bench (plan Task 3.7)
 #   make -C test/m2/unit rtu        # build the RTU bench (plan Task 4.3)
+#   make -C test/m2/unit idu        # build the IDU bench (plan Task 5.6)
 #   make -C test/m2/unit run        # build and run every bench (UNIT-SUITE-PASS/FAIL)
 #   make -C test/m2/unit clean
 
@@ -28,7 +29,7 @@ VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
 BIN_DIR = $(ROOT)/bin/unit
 
 .PHONY: all run clean
-all: csr iu rtu
+all: csr iu rtu idu
 
 #-----------------------------------------------------------------------------
 # CSR (plan task 2.2)
@@ -78,6 +79,22 @@ $(RTU_BIN): $(RTU_RTL) $(CURDIR)/rtu_tb.cpp
 		-o $@ $(RTU_RTL) $(CURDIR)/rtu_tb.cpp
 	$(MAKE) -C $(RTU_OBJ) -f VRTU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
 
+#-----------------------------------------------------------------------------
+# IDU (plan task 5.6)
+#-----------------------------------------------------------------------------
+IDU_OBJ = $(ROOT)/obj/unit/idu
+IDU_BIN = $(BIN_DIR)/idu_tb
+IDU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/IDU.v
+
+.PHONY: idu
+idu: $(IDU_BIN)
+
+$(IDU_BIN): $(IDU_RTL) $(CURDIR)/idu_tb.cpp
+	@mkdir -p $(IDU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module IDU --Mdir $(IDU_OBJ) \
+		-o $@ $(IDU_RTL) $(CURDIR)/idu_tb.cpp
+	$(MAKE) -C $(IDU_OBJ) -f VIDU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
 # Run EVERY bench even when one fails, then report -- a recipe line that
 # exits non-zero would otherwise abort the target and hide the benches
 # behind it, exactly backwards for a regression run (test/m1/unit/Makefile
@@ -87,8 +104,9 @@ run: all
 	$(CSR_BIN) || rc=1; \
 	$(IU_BIN) || rc=1; \
 	$(RTU_BIN) || rc=1; \
+	$(IDU_BIN) || rc=1; \
 	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
 	exit $$rc
 
 clean:
-	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN)
+	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN) $(ROOT)/obj/unit/idu $(IDU_BIN)

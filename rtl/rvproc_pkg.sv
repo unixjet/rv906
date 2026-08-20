@@ -548,4 +548,26 @@ parameter [FUNC_WIDTH-1:0] DIV_FUNC_REMUW  = 20'h00001;  // cfig.h:422
 `define ID_EX1_PC_LO            1
 `define ID_EX1_ILLEGAL          0
 
+//-----------------------------------------------------------------------------
+// M2 Task 5: EU_LSU FUNC one-hot values (aq_idu_cfig.h:503-516, the load/
+// store FUNC table) -- not pinned by Task 2/3 (CSR.v/IU.v never dispatch to
+// EU_LSU), needed now because IDU's real decode (this task) is the first
+// body to actually produce an idu_lsu_ex1_func value. Confirmed bit-exact
+// against aq_idu_cfig.h's own 12-bit literals (zero-extended to
+// FUNC_WIDTH), read directly during Task 5's decode-table extraction, same
+// discipline as Task 3.6a's ALU/BJU/MULT/DIV table: bit0 = FUNC_STORE_SEL
+// (cfig.h:310) -- 1 for every store, 0 for every load, confirmed below.
+//-----------------------------------------------------------------------------
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LB  = 20'h00302;  // cfig.h:503
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LH  = 20'h00306;  // cfig.h:504
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LW  = 20'h0030a;  // cfig.h:505
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LD  = 20'h0030e;  // cfig.h:506
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LBU = 20'h00300;  // cfig.h:507
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LHU = 20'h00304;  // cfig.h:508
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LWU = 20'h00308;  // cfig.h:509
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_SB  = 20'h00301;  // cfig.h:513
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_SH  = 20'h00305;  // cfig.h:514
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_SW  = 20'h00309;  // cfig.h:515
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_SD  = 20'h0030d;  // cfig.h:516
+
 endpackage

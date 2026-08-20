@@ -1,0 +1,681 @@
+//=============================================================================
+// idu_tb.cpp - standalone unit bench for rtl/IDU.v (M2 plan task 5.5)
+//=============================================================================
+// Verilates IDU.v + rvproc_pkg.sv alone (no IU, no LSU, no CSR, no RTU) and
+// drives the frozen ifu_idu_id_*/rtu_idu_*/iu_idu_*/lsu_idu_full ports
+// directly with hand-scripted, per-cycle stimulus standing in for those
+// four real neighbors, the same tick()-based clocking and check()/
+// test_result() bookkeeping pattern as csr_tb.cpp/iu_tb.cpp/rtu_tb.cpp.
+//
+// This is a WHITE-BOX test of IDU.v's OWN documented contract (decode
+// closed illegal-list, WBT except-clause matrix, GPR collision handling,
+// EU dispatch, EX1 issue-gate) run in isolation, driven by a script that
+// stands in for IFU/IU/LSU/CSR/RTU -- it does not exercise a real pipe.
+//
+// Build/run: make -C test/m2/unit idu && bin/unit/idu_tb
+// Prints one line per test and ends with UNIT-PASS or UNIT-FAIL.
+//=============================================================================
+
+#include <verilated.h>
+#include "VIDU.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+
+//-----------------------------------------------------------------------------
+// DUT plumbing
+//-----------------------------------------------------------------------------
+static VIDU *dut = nullptr;
+static uint64_t g_cycles = 0;
+
+static void tie_idle_inputs(void) {
+    dut->ifu_idu_id_inst      = 0;
+    dut->ifu_idu_id_inst_vld  = 0;
+    dut->ifu_idu_id_bht_pred  = 0;
+
+    dut->rtu_idu_fwd0_data = 0; dut->rtu_idu_fwd0_reg = 0; dut->rtu_idu_fwd0_vld = 0;
+    dut->rtu_idu_fwd1_data = 0; dut->rtu_idu_fwd1_reg = 0; dut->rtu_idu_fwd1_vld = 0;
+    dut->rtu_idu_fwd2_data = 0; dut->rtu_idu_fwd2_reg = 0; dut->rtu_idu_fwd2_vld = 0;
+    dut->rtu_idu_wb0_data  = 0; dut->rtu_idu_wb0_reg  = 0; dut->rtu_idu_wb0_vld  = 0;
+    dut->rtu_idu_wb1_data  = 0; dut->rtu_idu_wb1_reg  = 0; dut->rtu_idu_wb1_vld  = 0;
+
+    dut->iu_idu_mult_issue_stall = 0;
+    dut->iu_idu_mult_full        = 0;
+    dut->iu_idu_div_full         = 0;
+    dut->iu_idu_bju_full         = 0;
+    dut->iu_idu_bju_global_full  = 0;
+    dut->lsu_idu_full            = 0;
+
+    dut->rtu_idu_flush_fe        = 0;
+    dut->rtu_idu_flush_stall     = 0;
+    dut->rtu_idu_flush_wbt       = 0;
+    dut->rtu_idu_commit          = 1;
+    dut->rtu_idu_commit_for_bju  = 1;
+    dut->rtu_idu_pipeline_empty  = 1;
+}
+
+static void tick(void) {
+    dut->eval();
+    dut->clk = 1;
+    dut->eval();   // registers commit here
+    dut->clk = 0;
+    dut->eval();
+    g_cycles++;
+}
+
+static void reset_dut(void) {
+    dut->clk   = 0;
+    dut->rst_n = 0;
+    tie_idle_inputs();
+    for (int i = 0; i < 5; i++) tick();
+    dut->rst_n = 1;
+    for (int i = 0; i < 5; i++) tick();
+}
+
+//-----------------------------------------------------------------------------
+// Result bookkeeping (mirrors csr_tb.cpp/iu_tb.cpp/rtu_tb.cpp exactly)
+//-----------------------------------------------------------------------------
+static int g_fail  = 0;
+static int g_local = 0;
+
+static void check(bool cond, const char *what, uint64_t got = 0, uint64_t exp = 0) {
+    if (!cond) {
+        g_local++;
+        if (g_fail < 60)
+            printf("    FAIL %-64s got=0x%llx exp=0x%llx (cycle %llu)\n", what,
+                   (unsigned long long)got, (unsigned long long)exp,
+                   (unsigned long long)g_cycles);
+        g_fail++;
+    }
+}
+
+static void test_result(const char *name) {
+    printf("[idu_tb] %-64s %s\n", name, g_local ? "FAIL" : "PASS");
+    g_local = 0;
+}
+
+//-----------------------------------------------------------------------------
+// Instruction encoders (standard RV64GC bit layouts)
+//-----------------------------------------------------------------------------
+static uint32_t enc_r(uint32_t f7, uint32_t rs2, uint32_t rs1, uint32_t f3, uint32_t rd, uint32_t op) {
+    return (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op;
+}
+static uint32_t enc_i(int32_t imm12, uint32_t rs1, uint32_t f3, uint32_t rd, uint32_t op) {
+    return (((uint32_t)imm12 & 0xFFFu) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op;
+}
+static uint32_t enc_s(int32_t imm12, uint32_t rs2, uint32_t rs1, uint32_t f3, uint32_t op) {
+    uint32_t imm = (uint32_t)imm12 & 0xFFFu;
+    return ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | ((imm & 0x1Fu) << 7) | op;
+}
+static uint32_t enc_b(int32_t imm13, uint32_t rs2, uint32_t rs1, uint32_t f3, uint32_t op) {
+    uint32_t imm = (uint32_t)imm13 & 0x1FFFu;
+    uint32_t b12 = (imm >> 12) & 1, b11 = (imm >> 11) & 1, b10_5 = (imm >> 5) & 0x3F, b4_1 = (imm >> 1) & 0xF;
+    return (b12 << 31) | (b10_5 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (b4_1 << 8) | (b11 << 7) | op;
+}
+static uint32_t enc_u(int32_t imm20, uint32_t rd, uint32_t op) {
+    return (((uint32_t)imm20 & 0xFFFFFu) << 12) | (rd << 7) | op;
+}
+static uint32_t enc_j(int32_t imm21, uint32_t rd, uint32_t op) {
+    uint32_t imm = (uint32_t)imm21 & 0x1FFFFFu;
+    uint32_t b20 = (imm >> 20) & 1, b19_12 = (imm >> 12) & 0xFF, b11 = (imm >> 11) & 1, b10_1 = (imm >> 1) & 0x3FF;
+    return (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | (rd << 7) | op;
+}
+// RVC encoders
+static uint32_t enc_ci(uint32_t f3, uint32_t imm6, uint32_t rd_rs1, uint32_t op) {
+    uint32_t bit12 = (imm6 >> 5) & 1, bits6_2 = imm6 & 0x1F;
+    return (f3 << 13) | (bit12 << 12) | (rd_rs1 << 7) | (bits6_2 << 2) | op;
+}
+static uint32_t enc_c_shift_andi(uint32_t subop2, uint32_t rd_rs1_3, uint32_t imm6) {
+    uint32_t bit12 = (imm6 >> 5) & 1, bits6_2 = imm6 & 0x1F;
+    return (0x4u << 13) | (bit12 << 12) | (subop2 << 10) | (rd_rs1_3 << 7) | (bits6_2 << 2) | 0x1u;
+}
+static uint32_t enc_c_alu_reg(uint32_t funct2, uint32_t rd_rs1_3, uint32_t rs2_3) {
+    return (0x23u << 10) | (rd_rs1_3 << 7) | (funct2 << 5) | (rs2_3 << 2) | 0x1u;
+}
+static uint32_t enc_cr(uint32_t funct4, uint32_t rd_rs1, uint32_t rs2) {
+    return (funct4 << 12) | (rd_rs1 << 7) | (rs2 << 2) | 0x2u;
+}
+
+// Opcodes
+static const uint32_t OP_LOAD  = 0x03, OP_STORE = 0x23, OP_OPIMM = 0x13, OP_OP = 0x33;
+static const uint32_t OP_LUI = 0x37, OP_AUIPC = 0x17, OP_JAL = 0x6F, OP_JALR = 0x67;
+static const uint32_t OP_BRANCH = 0x63, OP_SYSTEM = 0x73, OP_OPIMM32 = 0x1B, OP_OP32 = 0x3B;
+static const uint32_t OP_MISCMEM = 0x0F;
+static const uint32_t OP_FP = 0x53, OP_AMO = 0x2F, OP_VEC = 0x57, OP_CUSTOM0 = 0x0B;
+
+static uint32_t addi(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x0, rd, OP_OPIMM); }
+static uint32_t add_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x00, rs2, rs1, 0x0, rd, OP_OP); }
+static uint32_t sub_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x20, rs2, rs1, 0x0, rd, OP_OP); }
+static uint32_t lw   (uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x2, rd, OP_LOAD); }
+static uint32_t sw   (uint32_t rs2, uint32_t rs1, int32_t imm) { return enc_s(imm, rs2, rs1, 0x2, OP_STORE); }
+static uint32_t mul_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x01, rs2, rs1, 0x0, rd, OP_OP); }
+static uint32_t div_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x01, rs2, rs1, 0x4, rd, OP_OP); }
+static uint32_t beq_ (uint32_t rs1, uint32_t rs2, int32_t imm) { return enc_b(imm, rs2, rs1, 0x0, OP_BRANCH); }
+static uint32_t jal_ (uint32_t rd, int32_t imm) { return enc_j(imm, rd, OP_JAL); }
+static uint32_t jalr_(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x0, rd, OP_JALR); }
+static uint32_t lui_ (uint32_t rd, int32_t imm20) { return enc_u(imm20, rd, OP_LUI); }
+static uint32_t auipc_(uint32_t rd, int32_t imm20) { return enc_u(imm20, rd, OP_AUIPC); }
+static uint32_t csrrw_(uint32_t rd, uint32_t rs1, uint32_t csr) { return enc_i(csr, rs1, 0x1, rd, OP_SYSTEM); }
+static uint32_t fence_(void) { return enc_i(0, 0, 0x0, 0, OP_MISCMEM); }
+static uint32_t fencei_(void) { return enc_i(0, 0, 0x1, 0, OP_MISCMEM); }
+static uint32_t ecall_(void) { return enc_i(0x000, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t ebreak_(void) { return enc_i(0x001, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t mret_(void) { return enc_i(0x302, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t sret_(void) { return enc_i(0x102, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t wfi_(void) { return enc_i(0x105, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t dret_(void) { return enc_i(0x7b2, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t sfence_vma_(void) { return enc_r(0x09, 0, 0, 0x0, 0, OP_SYSTEM); }
+static uint32_t famo_add_w(void) { return enc_r(0x00, 6, 1, 0x2, 5, OP_AMO); } // amoadd.w x5,x6,(x1)
+static uint32_t fp_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_FP); }
+static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
+static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
+
+// RVC
+static uint32_t c_nop(void)  { return enc_ci(0x0, 0, 0, 0x1); }
+static uint32_t c_addi(uint32_t rd_rs1, uint32_t imm6) { return enc_ci(0x0, imm6, rd_rs1, 0x1); }
+static uint32_t c_li(uint32_t rd, uint32_t imm6) { return enc_ci(0x2, imm6, rd, 0x1); }
+static uint32_t c_lui(uint32_t rd, uint32_t imm6) { return enc_ci(0x3, imm6, rd, 0x1); }
+static uint32_t c_andi(uint32_t rd_rs1_3, uint32_t imm6) { return enc_c_shift_andi(0x2, rd_rs1_3, imm6); }
+static uint32_t c_sub(uint32_t rd_rs1_3, uint32_t rs2_3) { return enc_c_alu_reg(0x0, rd_rs1_3, rs2_3); }
+static uint32_t c_mv(uint32_t rd, uint32_t rs2) { return enc_cr(0x8, rd, rs2); }
+static uint32_t c_add(uint32_t rd_rs1, uint32_t rs2) { return enc_cr(0x9, rd_rs1, rs2); }
+static uint32_t c_addi4spn_bad(void) { return 0x0000; } // nzuimm=0, reserved
+static uint32_t c_fld(void) { return (0x1u << 13) | 0x0u; } // quadrant00, funct3=001 -> c.fld
+
+//-----------------------------------------------------------------------------
+// Helpers built on the DUT
+//-----------------------------------------------------------------------------
+static void write_gpr(uint32_t reg, uint64_t data) {
+    dut->rtu_idu_wb0_reg  = reg;
+    dut->rtu_idu_wb0_data = data;
+    dut->rtu_idu_wb0_vld  = 1;
+    tick();
+    dut->rtu_idu_wb0_vld  = 0;
+    dut->rtu_idu_wb0_reg  = 0;
+    dut->rtu_idu_wb0_data = 0;
+}
+
+static void present(uint32_t inst, bool vld = true) {
+    dut->ifu_idu_id_inst     = inst;
+    dut->ifu_idu_id_inst_vld = vld;
+}
+
+//=============================================================================
+// Tests
+//=============================================================================
+
+static void test_reset_state(void) {
+    check(dut->idu_iu_ex1_inst_vld == 0, "reset: EX1 not valid");
+    check(dut->idu_iu_ex1_alu_sel == 0, "reset: no alu_sel");
+    check(dut->idu_cp0_ex1_sel == 0, "reset: no cp0_sel");
+    check(dut->idu_lsu_ex1_sel == 0, "reset: no lsu_sel");
+    test_result("T1 reset state: EX1 empty, nothing dispatched");
+}
+
+// ---- 5.1: 32-bit decode across every rv64im class ----
+static void test_decode_32bit_alu(void) {
+    reset_dut();
+    write_gpr(1, 0x10);
+    write_gpr(2, 0x03);
+    present(add_(3, 1, 2)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "add: alu_sel fires");
+    check(dut->idu_iu_ex1_src0_data == 0x10, "add: src0=x1", dut->idu_iu_ex1_src0_data, 0x10);
+    check(dut->idu_iu_ex1_src1_data == 0x03, "add: src1=x2", dut->idu_iu_ex1_src1_data, 0x03);
+    check(dut->idu_iu_ex1_dst0_reg == 3, "add: dst0=x3", dut->idu_iu_ex1_dst0_reg, 3);
+    test_result("T2 32-bit ALU decode (add): correct src/dst + alu_sel");
+}
+
+static void test_decode_32bit_addi(void) {
+    reset_dut();
+    write_gpr(1, 5);
+    present(addi(2, 1, 7)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "addi: alu_sel fires");
+    check(dut->idu_iu_ex1_src1_data == 7, "addi: src1=imm=7", dut->idu_iu_ex1_src1_data, 7);
+    check(dut->idu_iu_ex1_src0_data == 5, "addi: src0=x1=5", dut->idu_iu_ex1_src0_data, 5);
+    test_result("T3 32-bit ALU-imm decode (addi): immediate lands in src1_data");
+}
+
+static void test_decode_32bit_lsu(void) {
+    reset_dut();
+    write_gpr(1, 0x1000);
+    present(lw(2, 1, 8)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_sel == 1, "lw: lsu_sel fires");
+    check(dut->idu_lsu_ex1_src0_data == 0x1000, "lw: src0=x1(base)");
+    check(dut->idu_lsu_ex1_src1_data == 8, "lw: src1=imm(offset)=8");
+    check(dut->idu_lsu_ex1_dst0_reg == 2, "lw: dst0=x2");
+
+    write_gpr(3, 0xAB);
+    present(sw(3, 1, 4)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_sel == 1, "sw: lsu_sel fires");
+    check(dut->idu_lsu_ex1_src2_data == 0xAB, "sw: src2=x3(store data)");
+    test_result("T4 32-bit LSU decode (lw/sw): base+offset+store-data slots");
+}
+
+static void test_decode_32bit_bju(void) {
+    reset_dut();
+    write_gpr(1, 5); write_gpr(2, 5);
+    present(beq_(1, 2, 16)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_bju_sel == 1, "beq: bju_sel fires");
+    check(dut->idu_iu_ex1_src0_data == 5, "beq: src0=x1");
+    check(dut->idu_iu_ex1_src1_data == 5, "beq: src1=x2");
+
+    present(jal_(1, 0x100)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_bju_sel == 1, "jal: bju_sel fires");
+    check(dut->idu_iu_ex1_dst0_reg == 1, "jal: dst0=x1(link)");
+
+    present(jalr_(1, 2, 4)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_bju_sel == 1, "jalr: bju_sel fires");
+    check(dut->idu_iu_ex1_src0_data == 5, "jalr: src0=x2(target base)");
+    test_result("T5 32-bit BJU decode (beq/jal/jalr)");
+}
+
+static void test_decode_32bit_mult_div(void) {
+    reset_dut();
+    write_gpr(1, 6); write_gpr(2, 7);
+    present(mul_(3, 1, 2)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_mult_sel == 1, "mul: mult_sel fires");
+    present(div_(4, 1, 2)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_div_sel == 1, "div: div_sel fires");
+    test_result("T6 32-bit MULT/DIV decode (mul/div): correct one-hot EU");
+}
+
+static void test_decode_32bit_lui_auipc(void) {
+    reset_dut();
+    present(lui_(5, 0x12345)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "lui: alu_sel fires");
+    check(dut->idu_iu_ex1_src1_data == (uint64_t)0x12345000, "lui: src1=imm<<12",
+          dut->idu_iu_ex1_src1_data, 0x12345000);
+
+    present(auipc_(6, 0x1)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_bju_sel == 1, "auipc: bju_sel fires (BJU_FUNC_AUIPC)");
+    check(dut->idu_iu_ex1_src2_data == 0x1000, "auipc: src2=imm<<12", dut->idu_iu_ex1_src2_data, 0x1000);
+    test_result("T7 32-bit LUI/AUIPC decode: U-type immediate shift correct");
+}
+
+static void test_decode_32bit_csr(void) {
+    reset_dut();
+    write_gpr(1, 0xDEAD);
+    present(csrrw_(2, 1, 0x340 /* mscratch */)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "csrrw: cp0_sel fires");
+    check(dut->idu_cp0_ex1_src0_data == 0xDEAD, "csrrw: src0=rs1 value");
+    check((dut->idu_cp0_ex1_src1_data & 0xFFF) == 0x340, "csrrw: src1=csr addr");
+    check(dut->idu_cp0_ex1_illegal == 0, "csrrw: legal");
+    test_result("T8 32-bit CSR decode (csrrw): rs1 value + csr address slots");
+}
+
+static void test_decode_32bit_fence_ecall(void) {
+    reset_dut();
+    present(fence_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "fence: cp0_sel fires");
+    check(dut->idu_cp0_ex1_illegal == 0, "fence: legal");
+
+    present(fencei_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "fence.i: cp0_sel fires");
+    check(dut->idu_cp0_ex1_illegal == 0, "fence.i: legal");
+
+    present(ecall_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "ecall: cp0_sel fires");
+    check(dut->idu_cp0_ex1_illegal == 0, "ecall: legal");
+
+    present(ebreak_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0, "ebreak: legal");
+
+    present(mret_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0, "mret: legal");
+    test_result("T9 32-bit FENCE/FENCE.I/ECALL/EBREAK/MRET: legal single-beat CP0 ops");
+}
+
+// ---- 5.1: closed illegal-decode list ----
+static void test_illegal_closed_list(void) {
+    reset_dut();
+    present(fp_add()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1, "FP op-fp: illegal");
+
+    present(vec_add()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "vector op: illegal");
+
+    present(custom0()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "custom-0 (cache/perf): illegal");
+
+    present(famo_add_w()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "amoadd.w: illegal (AMO out of M2 scope)");
+
+    present(sfence_vma_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "sfence.vma: illegal (needs real MMU, M4)");
+
+    present(sret_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "sret: illegal (no S-mode in M2)");
+
+    present(wfi_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "wfi: illegal (not modeled in M2)");
+
+    present(dret_()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "dret: illegal (no debug unit in M2)");
+
+    // reserved-encoding malformed ecall (rs1 != 0)
+    present(enc_i(0, 5, 0x0, 0, OP_SYSTEM)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "ecall with rs1!=0: illegal (malformed)");
+    test_result("T10 illegal decode closed list: FP/vector/custom/AMO/sfence.vma/sret/wfi/dret all trap");
+}
+
+// ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
+static void test_rvc_pairs(void) {
+    reset_dut();
+    // c.addi and addi must dispatch identically (same alu_sel path, same
+    // final src1_data given the same effective immediate).
+    write_gpr(5, 10);
+    present(c_addi(5, 3)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.addi: alu_sel fires (same EU as addi)");
+    check(dut->idu_iu_ex1_src0_data == 10, "c.addi: src0=x5=10");
+    check(dut->idu_iu_ex1_src1_data == 3, "c.addi: src1=imm=3");
+    check(dut->idu_iu_ex1_dst0_reg == 5, "c.addi: dst0=x5");
+
+    present(c_li(6, 5)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.li: alu_sel fires (reuses ALU_FUNC_ADD)");
+    check(dut->idu_iu_ex1_src1_data == 5, "c.li: src1=imm=5");
+    check(dut->idu_iu_ex1_dst0_reg == 6, "c.li: dst0=x6");
+
+    present(c_lui(7, 3)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.lui: alu_sel fires (reuses ALU_FUNC_LUI)");
+    check(dut->idu_iu_ex1_src1_data == (uint64_t)(3ULL << 12), "c.lui: src1=imm<<12",
+          dut->idu_iu_ex1_src1_data, 3ULL << 12);
+
+    write_gpr(9 /*x9=x8+1*/, 0x77);
+    present(c_andi(1 /*x9*/, 0x3F)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.andi: alu_sel fires (reuses ALU_FUNC_AND)");
+    check(dut->idu_iu_ex1_src0_data == 0x77, "c.andi: src0=x9(rs1')");
+
+    write_gpr(8, 0x100); write_gpr(9, 0x0F);
+    present(c_sub(0 /*x8*/, 1 /*x9*/)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.sub: alu_sel fires (reuses ALU_FUNC_SUB)");
+    check(dut->idu_iu_ex1_src0_data == 0x100, "c.sub: src0=x8(rd')");
+    check(dut->idu_iu_ex1_src1_data == 0x0F, "c.sub: src1=x9(rs2')");
+
+    write_gpr(11, 0x55);
+    present(c_mv(10, 11)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.mv: alu_sel fires (reuses ALU_FUNC_ADD)");
+    check(dut->idu_iu_ex1_src0_data == 0x55, "c.mv: src0=x11(value moved)");
+    check(dut->idu_iu_ex1_dst0_reg == 10, "c.mv: dst0=x10");
+
+    write_gpr(12, 3); write_gpr(13, 4);
+    present(c_add(12, 13)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_alu_sel == 1, "c.add: alu_sel fires (reuses ALU_FUNC_ADD)");
+    check(dut->idu_iu_ex1_src0_data == 3 && dut->idu_iu_ex1_src1_data == 4, "c.add: src0=x12,src1=x13");
+    test_result("T11 RVC pairs decode to same EU/FUNC as 32-bit twin (contract 14)");
+}
+
+static void test_rvc_illegal(void) {
+    reset_dut();
+    present(c_fld()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "c.fld: illegal (no FP in M2)");
+
+    present(c_addi4spn_bad()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "c.addi4spn nzuimm=0: illegal (reserved encoding)");
+    test_result("T12 RVC illegal cases: c.fld (no FP) + reserved-zero encodings");
+}
+
+// ---- 5.5: WBT RAW/WAW except-clause matrix (each of the 5, individually
+// and defeated) ----
+static void test_wbt_except1_alu_bju_never_stall(void) {
+    reset_dut();
+    present(add_(3, 1, 2)); tick();      // creates WBT busy(x3, type=ALU)
+    present(add_(4, 3, 0));               // consumer of x3, same-cycle-busy producer
+    tick();
+    check(dut->idu_ifu_id_stall == 0, "except1: ALU producer never stalls dependent consumer");
+    present(0, false);
+    test_result("T13 WBT except 1: ALU/BJU single-cycle producer exempts consumer");
+}
+
+static void test_wbt_except1_defeated_by_div(void) {
+    reset_dut();
+    present(div_(3, 1, 2)); tick();      // creates WBT busy(x3, type=OTHER/DIV -- no fast path)
+    present(add_(4, 3, 0));
+    tick();
+    check(dut->idu_ifu_id_stall == 1, "except1 defeated: DIV producer (type OTHER) has no fast path");
+    present(0, false);
+    test_result("T14 WBT except 1 defeated: DIV producer gets no ALU/BJU fast-path exemption");
+}
+
+static void test_wbt_except2_lsu_to_condbr(void) {
+    reset_dut();
+    present(lw(3, 1, 0)); tick();         // creates WBT busy(x3, type=LSU, cnt=0)
+    present(beq_(3, 0, 8));                // conditional-branch consumer of x3
+    tick();
+    check(dut->idu_ifu_id_stall == 0, "except2: LSU->cond-branch allowed through");
+    present(0, false);
+    test_result("T15 WBT except 2: LSU producer + BJU conditional-branch consumer exempted");
+}
+
+static void test_wbt_except2_defeated_non_condbr(void) {
+    reset_dut();
+    present(lw(3, 1, 0)); tick();
+    present(add_(4, 3, 0));                // non-branch consumer of x3
+    tick();
+    check(dut->idu_ifu_id_stall == 1, "except2 defeated: LSU->ALU consumer must genuinely wait");
+    present(0, false);
+    test_result("T16 WBT except 2 defeated: non-branch consumer of an LSU producer really stalls");
+}
+
+static void test_wbt_except3_fwd_hit(void) {
+    reset_dut();
+    present(mul_(3, 1, 2)); tick();        // creates WBT busy(x3, type=MULT, cnt=0)
+    present(0, false); tick();
+    // force an RTU forward hit on x3 this cycle while WBT still shows busy
+    dut->rtu_idu_fwd1_vld = 1; dut->rtu_idu_fwd1_reg = 3; dut->rtu_idu_fwd1_data = 0x99;
+    present(add_(4, 3, 0));
+    tick();
+    check(dut->idu_ifu_id_stall == 0, "except3: same-cycle RTU forward satisfies readiness");
+    dut->rtu_idu_fwd1_vld = 0;
+    present(0, false);
+    test_result("T17 WBT except 3: an RTU forward-bus hit this cycle exempts the consumer");
+}
+
+static void test_wbt_except3_defeated_2outstanding(void) {
+    reset_dut();
+    // 3 overlapping MULT creates to x3 (WAW except1 lets same-type MULT
+    // producers pipeline without stalling dispatch) drive cnt to 2.
+    present(mul_(3, 1, 2)); tick();
+    present(mul_(3, 1, 2)); tick();
+    present(mul_(3, 1, 2)); tick();
+    present(0, false);
+    // force fwd hit on x3 while cnt==2 -- except3's own negation term
+    // (LSU/MULT producer with cnt==2) must NOT exempt this consumer.
+    dut->rtu_idu_fwd1_vld = 1; dut->rtu_idu_fwd1_reg = 3; dut->rtu_idu_fwd1_data = 0x99;
+    present(add_(4, 3, 0));
+    tick();
+    check(dut->idu_ifu_id_stall == 1, "except3 defeated: 2-outstanding MULT producer + fwd hit still stalls");
+    dut->rtu_idu_fwd1_vld = 0;
+    present(0, false);
+    test_result("T18 WBT except 3 defeated: the 2-outstanding-producer corner case");
+}
+
+static void test_wbt_except4_store_data_from_load(void) {
+    reset_dut();
+    present(lw(3, 1, 0)); tick();          // creates WBT busy(x3, type=LSU, cnt=0)
+    present(sw(3, 1, 0));                   // x3 used as STORE DATA (src2)
+    tick();
+    check(dut->idu_ifu_id_stall == 0, "except4: store-data-from-load forwarding allowed through");
+    present(0, false);
+    test_result("T19 WBT except 4: LSU producer + store consumer's src2 (store data) exempted");
+}
+
+static void test_wbt_except4_defeated_base_reg(void) {
+    reset_dut();
+    present(lw(3, 1, 0)); tick();
+    present(sw(1, 3, 0));                   // x3 used as BASE (src0), not store-data
+    tick();
+    check(dut->idu_ifu_id_stall == 1, "except4 defeated: LSU producer used as store BASE really stalls");
+    present(0, false);
+    test_result("T20 WBT except 4 defeated: src0 (base) is not covered by the src2-only exception");
+}
+
+static void test_waw_except_same_latency_class(void) {
+    reset_dut();
+    present(mul_(3, 1, 2)); tick();          // 1st MULT producer of x3
+    present(mul_(3, 1, 2));                   // 2nd MULT producer of x3 (WAW)
+    dut->eval();   // check THIS cycle's combinational decision, before a
+                    // further tick lets the (still-presented) instruction
+                    // be re-evaluated a 3rd time against the now-higher cnt
+    check(dut->idu_ifu_id_stall == 0, "WAW except: same-latency-class (MULT/MULT) producers don't serialize");
+    tick();
+    present(0, false);
+    test_result("T21 WAW except: same-latency-class WAW producers don't serialize dispatch");
+}
+
+static void test_waw_except_defeated(void) {
+    reset_dut();
+    present(lw(3, 1, 0)); tick();             // LSU producer of x3
+    present(add_(3, 1, 2));                    // ALU producer, SAME dst -- different type, real WAW
+    tick();
+    check(dut->idu_ifu_id_stall == 1, "WAW defeated: LSU-then-ALU to the same dst really WAW-stalls");
+    present(0, false);
+    test_result("T22 WAW except defeated: different-class producers to the same register do serialize");
+}
+
+// ---- 5.5: GPR read/write, x0-hardwire, wb0==wb1 collision ----
+static void test_gpr_basic_rw(void) {
+    reset_dut();
+    write_gpr(5, 0x1234);
+    present(add_(6, 5, 0)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_src0_data == 0x1234, "gpr: read-back matches prior write", dut->idu_iu_ex1_src0_data, 0x1234);
+    test_result("T23 GPR basic write-then-read");
+}
+
+static void test_gpr_x0_hardwire(void) {
+    reset_dut();
+    // attempt to write x0 -- must never actually change (it's always 0)
+    dut->rtu_idu_wb0_reg = 0; dut->rtu_idu_wb0_data = 0xDEADBEEF; dut->rtu_idu_wb0_vld = 1;
+    tick();
+    dut->rtu_idu_wb0_vld = 0;
+    present(add_(6, 0, 0)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_src0_data == 0, "gpr: x0 stays 0 even after an attempted write",
+          dut->idu_iu_ex1_src0_data, 0);
+    test_result("T24 GPR x0 hardwire: writes to x0 are always discarded");
+}
+
+static void test_gpr_wb0_eq_wb1_collision(void) {
+    reset_dut();
+    write_gpr(7, 0x11);   // baseline value
+    // same-cycle wb0==wb1 on register 7 -- per gated_reg.v's own collision
+    // case (no 2'b11 arm), the write must be DROPPED, not merged/prioritized.
+    dut->rtu_idu_wb0_reg = 7; dut->rtu_idu_wb0_data = 0xAAAA; dut->rtu_idu_wb0_vld = 1;
+    dut->rtu_idu_wb1_reg = 7; dut->rtu_idu_wb1_data = 0xBBBB; dut->rtu_idu_wb1_vld = 1;
+    tick();
+    dut->rtu_idu_wb0_vld = 0; dut->rtu_idu_wb1_vld = 0;
+    present(add_(8, 7, 0)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_src0_data == 0x11, "gpr: wb0==wb1 collision drops the write, old value holds",
+          dut->idu_iu_ex1_src0_data, 0x11);
+    test_result("T25 GPR wb0==wb1 collision on one register: write silently dropped (matches donor)");
+}
+
+static void test_gpr_wb0_wb1_no_collision(void) {
+    // sanity: wb0/wb1 to DIFFERENT registers both land correctly (this
+    // never actually races in the real pipe -- RTU's one-hot completion
+    // guarantee, Task 4.2 -- confirmed here as a non-collision baseline).
+    reset_dut();
+    dut->rtu_idu_wb0_reg = 9;  dut->rtu_idu_wb0_data = 0x9999; dut->rtu_idu_wb0_vld = 1;
+    dut->rtu_idu_wb1_reg = 10; dut->rtu_idu_wb1_data = 0xAAAA; dut->rtu_idu_wb1_vld = 1;
+    tick();
+    dut->rtu_idu_wb0_vld = 0; dut->rtu_idu_wb1_vld = 0;
+    present(add_(1, 9, 10)); tick(); present(0, false);
+    check(dut->idu_iu_ex1_src0_data == 0x9999, "gpr: wb0->x9 landed");
+    check(dut->idu_iu_ex1_src1_data == 0xAAAA, "gpr: wb1->x10 landed");
+    test_result("T26 GPR wb0/wb1 to different registers: no collision, both land (never races in practice)");
+}
+
+// ---- 5.5: EU one-hot dispatch ----
+static void test_eu_onehot_dispatch(void) {
+    reset_dut();
+    present(add_(3, 1, 2)); tick();
+    check(dut->idu_iu_ex1_alu_sel == 1 && dut->idu_iu_ex1_bju_sel == 0
+          && dut->idu_iu_ex1_mult_sel == 0 && dut->idu_iu_ex1_div_sel == 0
+          && dut->idu_cp0_ex1_sel == 0 && dut->idu_lsu_ex1_sel == 0,
+          "onehot: exactly ALU fires for an add");
+    present(0, false);
+    test_result("T27 EU one-hot dispatch: exactly one target selected per instruction");
+}
+
+// ---- 5.5: EX1 issue-gate hold-and-drain ----
+static void test_ex1_issue_gate_commit0(void) {
+    reset_dut();
+    present(add_(3, 1, 2)); tick();      // latches into EX1
+    present(0, false);
+    dut->rtu_idu_commit = 0;
+    dut->eval();
+    check(dut->idu_iu_ex1_inst_vld == 1, "issue-gate: EX1 register still VALID with commit=0");
+    check(dut->idu_iu_ex1_alu_sel == 0, "issue-gate: but NOT issuing (alu_sel=0) with commit=0");
+    dut->rtu_idu_commit = 1;
+    test_result("T28 EX1 issue-gate: commit=0 -> valid-but-not-issuing (not the same as invalid)");
+}
+
+static void test_ex1_issue_gate_full_holds_and_backpressures(void) {
+    reset_dut();
+    present(mul_(3, 1, 2)); tick();      // latches a MULT op into EX1
+    present(0, false);
+    dut->iu_idu_mult_full = 1;
+    dut->eval();
+    check(dut->idu_iu_ex1_mult_sel == 0, "full: mult_sel withheld while iu_idu_mult_full=1");
+    check(dut->idu_ifu_id_stall == 1, "full: a stuck EX1 backpressures idu_ifu_id_stall");
+    // present a DIFFERENT would-be instruction -- EX1 must NOT be replaced
+    present(add_(9, 1, 2), true);
+    tick();
+    check(dut->idu_iu_ex1_mult_sel == 0 || dut->idu_iu_ex1_dst0_reg != 9,
+          "full: EX1 did not silently replace the held MULT with the new dispatch");
+    dut->iu_idu_mult_full = 0;
+    present(0, false);
+    dut->eval();   // check the SAME cycle mult_full clears -- the issue
+                    // pulse is combinational; a further tick would already
+                    // have advanced EX1 past it (nothing left to observe)
+    check(dut->idu_iu_ex1_mult_sel == 1, "full: releasing iu_idu_mult_full lets the held op finally issue");
+    tick();
+    present(0, false);
+    test_result("T29 EX1 issue-gate: <EU>_idu_full holds the instruction and backpressures the front end");
+}
+
+//=============================================================================
+// Main
+//=============================================================================
+int main(int argc, char **argv) {
+    Verilated::commandArgs(argc, argv);
+    dut = new VIDU;
+
+    reset_dut();
+    test_reset_state();
+
+    test_decode_32bit_alu();
+    test_decode_32bit_addi();
+    test_decode_32bit_lsu();
+    test_decode_32bit_bju();
+    test_decode_32bit_mult_div();
+    test_decode_32bit_lui_auipc();
+    test_decode_32bit_csr();
+    test_decode_32bit_fence_ecall();
+    test_illegal_closed_list();
+    test_rvc_pairs();
+    test_rvc_illegal();
+
+    test_wbt_except1_alu_bju_never_stall();
+    test_wbt_except1_defeated_by_div();
+    test_wbt_except2_lsu_to_condbr();
+    test_wbt_except2_defeated_non_condbr();
+    test_wbt_except3_fwd_hit();
+    test_wbt_except3_defeated_2outstanding();
+    test_wbt_except4_store_data_from_load();
+    test_wbt_except4_defeated_base_reg();
+    test_waw_except_same_latency_class();
+    test_waw_except_defeated();
+
+    test_gpr_basic_rw();
+    test_gpr_x0_hardwire();
+    test_gpr_wb0_eq_wb1_collision();
+    test_gpr_wb0_wb1_no_collision();
+
+    test_eu_onehot_dispatch();
+    test_ex1_issue_gate_commit0();
+    test_ex1_issue_gate_full_holds_and_backpressures();
+
+    printf("%s\n", g_fail ? "UNIT-FAIL" : "UNIT-PASS");
+    delete dut;
+    return g_fail ? 1 : 0;
+}
