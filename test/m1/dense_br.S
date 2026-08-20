@@ -261,6 +261,92 @@
     .option pop
 
     PAD_AT(0xD40, g6_escape)
+    .option push
+    .option norvc
+    jal   x0, bht_call_taken
+    .option pop
+
+    /*---------------------------------------------------------------------
+     * Region G (0xD80+): shared-subroutine BHT training (plan Task 9.3).
+     *
+     * Regions A-F above each visit a distinct branch PC exactly ONCE --
+     * every one of THEIR conditional branches is a cold, first-touch
+     * lookup: the counter it hits starts at reset state, gets read once,
+     * updated once, and is never read again by this test. Since
+     * `taken = ^pc[7:4]` makes the correct answer a pure function of PC
+     * (M1 spec's global contracts), no branch in a straight-line test can
+     * ever be executed twice without an explicit shared-subroutine
+     * construct -- the exact coverage gap rv12 found and fixed for C910's
+     * BHT, re-checked explicitly here rather than assumed away (Task 9.3).
+     * This region closes it.
+     *
+     * Two tiny subroutines, each with ONE conditional branch whose
+     * direction is fixed by its own address's parity, are each called
+     * back-to-back 24 times from a straight chain of `jal x1, sub` sites
+     * (call, resolve the branch, `ret` straight back to the NEXT call
+     * site -- RAS depth never exceeds 1, independent of callret.S's own
+     * depth testing). BHT indexing is PURE GHR, no PC term at all
+     * (extraction note S1.4) -- so repeating the SAME outcome every visit
+     * shifts the SAME bit into the GHR every time. The read window that
+     * matters is a contiguous 12 bits (`bht_vghr[11:0]`, rtl/BPU.v SECTION
+     * BHT part (f)); after at most 12 identical shifts those 12 bits
+     * converge to a fixed pattern and hold it, so every call from the
+     * 13th onward reads+writes the EXACT SAME physical SRAM row/lane --
+     * genuine training (0->1->2->3-saturate for the always-taken sub,
+     * 3->2->1->0-saturate for the always-not-taken sub, each followed by
+     * several steady-state re-reads confirming the saturated value holds).
+     * 24 calls per sub leaves a comfortable margin over the 12-call
+     * worst-case convergence bound. The two bursts run back-to-back on
+     * purpose (GHR is one global register, not reset between them): the
+     * not-taken burst starts from the taken burst's converged all-1s
+     * state and has to re-converge to all-0s, exercising the counter
+     * recovering from an opposite-trained state too.
+     *--------------------------------------------------------------------*/
+    PAD_AT(0xD80, bht_call_taken)
+    .option push
+    .option norvc
+    .rept 24
+    jal   x1, bht_sub_taken
+    .endr
+    jal   x0, bht_call_nottaken
+    .option pop
+
+    /* bht_sub_taken: branch at 0xE10 -> pc[7:4]=0x1=0b0001, parity 1 ->
+     * TAKEN. The interposed `jal` after the branch is dead code on this
+     * (fixed, always-taken) address but keeps the pattern reusable as-is
+     * for bht_sub_nottaken below regardless of which parity that address
+     * happens to have. */
+    PAD_AT(0xE10, bht_sub_taken)
+    .option push
+    .option norvc
+    beq   x0, x0, bht_sub_taken_ret
+    jal   x0, bht_sub_taken_ret
+bht_sub_taken_ret:
+    jalr  x0, 0(x1)
+    .option pop
+
+    /* bht_sub_nottaken: branch at 0xE30 -> pc[7:4]=0x3=0b0011, parity 0 ->
+     * NOT TAKEN; falls through into the `jal` below, which still lands on
+     * the same ret label. */
+    PAD_AT(0xE30, bht_sub_nottaken)
+    .option push
+    .option norvc
+    beq   x0, x0, bht_sub_nottaken_ret
+    jal   x0, bht_sub_nottaken_ret
+bht_sub_nottaken_ret:
+    jalr  x0, 0(x1)
+    .option pop
+
+    PAD_AT(0xE50, bht_call_nottaken)
+    .option push
+    .option norvc
+    .rept 24
+    jal   x1, bht_sub_nottaken
+    .endr
+    jal   x0, bht_train_done
+    .option pop
+
+    PAD_AT(0xEC0, bht_train_done)
 
     SENTINEL
 

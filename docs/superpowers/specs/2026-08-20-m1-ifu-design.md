@@ -128,17 +128,57 @@ habit — every number below is cited from the C906 extraction notes.
    simplification, then recorded the refined, more faithful resolution once
    implemented — do the same here rather than leaving the simplification as
    final).
-2. **BHT read/write GHR-window question**: the BPU extraction note flags an
-   unresolved item — a possible read/write bit-shift discrepancy in the GHR
-   window, needing pipeline-depth context from `pcgen.v` (out of the BPU
-   researcher's scope). This must be resolved during implementation by
-   reading the cited spans together, exactly as rv12 resolved an analogous
-   C910 BHT hash question (design doc's own precedent: "read together with
-   the output pipe register... the two windows are the SAME hash written at
-   two points of a two-stage prefetch" — check whether the same resolution
-   applies here, or whether C906's simpler pure-GHR indexing makes this a
-   non-issue). Record whichever resolution is found in code and in
-   `docs/03-bpu.md`.
+2. **BHT read/write GHR-window question -- RESOLVED during Task 9
+   implementation** by reading `aq_ifu_bht.v` directly (not the extraction
+   note's restatement) together with `aq_ifu_pcgen.v`'s pipeline context:
+   **this is a real, as-shipped indexing discrepancy, NOT "the same hash
+   viewed at two pipeline stages" the way rv12 resolved the analogous C910
+   question.** C910's resolution does not transfer -- re-derived from this
+   RTL specifically, per the plan's own instruction.
+
+   The normal-prediction READ index is `bht_vghr[11:2]` (row) with lane
+   `bht_vghr[2:0]` (`aq_ifu_bht.v:257,305`) -- a contiguous 12-bit window,
+   bits `[11:0]` of the 14-bit SPECULATIVE GHR, i.e. the 12 freshest history
+   bits. The counter-UPDATE index is `bht_ref_vghr[13:4]` (row) with lane
+   `bht_ref_vghr[2:0]` (`aq_ifu_bht.v:257,455`) -- bits `{0,1,2}` union
+   `{4..13}`, skipping bit 3 entirely and reaching 2 bits further back
+   (ages 12-13) than the read window ever touches. `bht_ref_vghr` is
+   captured (`aq_ifu_bht.v:520-524`) from the ARCHITECTURAL `bht_ghr`
+   at the exact moment a branch resolves (`iu_ifu_br_vld`), using a
+   non-blocking read that captures `bht_ghr`'s value from BEFORE this
+   branch's own outcome shifts into it that same edge.
+
+   Because this front end resolves branches strictly in program order,
+   single-issue (design doc S2.1), by the time any branch resolves every
+   OLDER branch has both been predicted AND resolved -- so, on the happy
+   path (no older branch mispredicted), `bht_ghr` at a branch's own resolve
+   holds the IDENTICAL 14-bit value that `bht_vghr` held when that SAME
+   branch was predicted. That equality holds for ANY constant number of
+   pipeline stages between prediction and resolve (the stage count cancels
+   out of the argument entirely), so a fixed pipeline latency cannot be
+   the source of a systematic 2-bit-shifted, bit-3-skipping RE-SLICE of one
+   identical register -- if this were "the same hash at two pipeline
+   stages," read and write would slice the SAME bit positions of that
+   value, and they provably do not. `aq_ifu_pcgen.v` was read directly to
+   check for a reconciling mechanism there (as the plan directed) and
+   contains no BHT-adjacent logic at all -- grepped case-insensitively for
+   "bht"/"ghr", zero matches in the whole file -- confirming there is no
+   PCGEN-side pipeline-depth term that resolves this the way one existed
+   for C910.
+
+   **This is architecturally harmless, by the same structural argument as
+   the BTB aliasing finding below**: C906's front end treats every
+   predictor output as provisional, always re-validated before it can
+   affect which instructions commit (S4.1's "predictors change WHEN, never
+   WHICH"). The discrepancy can only misdirect a branch's own counter
+   update to a different physical row/lane than the one that predicted it
+   -- extra destructive aliasing on top of what pure-GHR indexing (zero PC
+   disambiguation) already accepts by design -- degrading prediction
+   ACCURACY/cycle count only (M8 territory), never the committed
+   instruction stream. rv906 clones the discrepancy exactly as shipped
+   (`rtl/BPU.v`'s SECTION BHT, part (e)'s own header comment carries this
+   same finding at the code site) rather than "fixing" the two windows to
+   agree.
 3. **BTB PC[15:0] aliasing**: real 64KiB aliasing period, clone as-is (it is
    the shipped behavior). **RESOLVED during Task 8 implementation** by
    reading `aq_ifu_btb_entry.v`/`aq_ifu_btb.v`/`aq_ifu_pred.v` directly
@@ -336,10 +376,13 @@ exercises through FetchSink's tohost reporting).
 
 ## 6. Risks / open points
 
-- **BHT GHR-window question** (§2.3.2): must be resolved by the plan's BHT
-  task before the BHT is trusted; a wrong resolution degrades prediction
-  silently (caught only by cycle-count comparison at M8, not by correctness
-  tests, since FetchSink's oracle is predictor-agnostic by design).
+- **BHT GHR-window question** (§2.3.2): **RESOLVED during Task 9** -- a
+  real, as-shipped read/write index discrepancy (not a pipeline-depth
+  artifact), architecturally harmless for the same reason the BTB aliasing
+  finding is (every predictor output is re-validated before commit). It
+  degrades prediction accuracy/cycle count only, invisible to this
+  milestone's correctness tests by design -- confirmed via cycle-count-only
+  impact, not caught by (nor breaking) the directed suite.
 - **`cp0_ifu_iwpe`-equivalent semantics** (§2.2): the IFU extraction note
   flags this as possibly a low-power tag-hit-buffer bypass rather than
   classic way-prediction — the M1 plan's ICache task must resolve this

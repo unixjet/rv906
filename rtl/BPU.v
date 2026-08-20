@@ -1,6 +1,6 @@
 //=============================================================================
 // BPU.v - branch prediction unit: BHT + BTB + RAS + arbitration
-//                                (M1: RAS+BTB real, BHT skeleton; ports frozen)
+//                                (M1: BHT + RAS + BTB all real; ports frozen)
 //=============================================================================
 // C906 files covered:
 //   gen_rtl/ifu/rtl/aq_ifu_bht.v + aq_ifu_bht_array.v   (1x aq_spsram_1024x16)
@@ -12,10 +12,9 @@
 //                                                          aq_ifu_pre_decd.v)
 // References: BPU extraction notes S0 (inventory), S1 (BHT+GHR), S2 (BTB),
 // S3 (RAS), S4 (arbitration), S6 ("16Kb" resolution), S8 (chicken bits).
-// RAS landed in plan Task 7, BTB in Task 8 (both real below); BHT's body
-// (Task 9) is still the frozen Task-1 skeleton -- only its chicken
-// bits/ports are tied inactive, nothing else in this file depends on it
-// existing yet.
+// RAS landed in plan Task 7, BTB in Task 8, BHT in Task 9 -- all three
+// predictor structures and the full arbitration/delay-replay logic are real
+// as of this file.
 //
 // SEAM NOTES (rv906 decomposition):
 //  * C906's predictor is three SMALL, INDEPENDENT, differently-sized
@@ -164,49 +163,22 @@ module BPU (
 );
 
     //=========================================================================
-    // PLACEHOLDER (best-effort, flag before Task 9 depends on it): the BPU
-    // extraction note never quotes an explicit "done" port name for the BHT
-    // invalidate sweep FSM (aq_ifu_bht.v:319-382 confirms the FSM exists,
-    // not its exact output port name) -- `bht_cp0_inv_done` is named by
-    // analogy with ICache.v's confirmed `ifu_cp0_icache_inv_done`. Confirm
-    // the real name against aq_ifu_bht.v's port list directly in Task 9.1.
+    // TASK 9: BHT is now real (SECTION BHT below, near the end of this
+    // file). `bht_cp0_inv_done` is driven from the invalidate FSM's own
+    // `bht_inv_done` there -- the real RTL's matching output is
+    // `ifu_cp0_bht_inv_done` (aq_ifu_bht.v:543), confirmed by reading the
+    // module's own port list directly (Task 9.1); no rename needed since
+    // this is an internal rv906 port name, not one exposed to C906 itself.
+    // `pred_ipack_delay_stall`/`pred_ipack_mask`/`pred_ibuf_br_taken0/1` are
+    // likewise driven for real at the bottom of this file now, from SECTION
+    // BHT's `pred_delay_br_raw`/`bht_pred_rslt`.
+    //
+    // `pcgen_btb_ifpc` (BTB's real PCGEN-stage read address) remains
+    // deliberately unused -- see SECTION BTB's own header note for why
+    // rv906 collapses the real RTL's 2-stage CAM pipeline into a single
+    // ID-stage-time lookup keyed off `pred_cur_pc` instead.
     //=========================================================================
-    assign bht_cp0_inv_done = 1'b0;
-
-    //=========================================================================
-    // TASK 9 STILL SKELETON: the BHT direction table itself does not exist
-    // yet -- every CONDITIONAL-branch redirect still comes from FetchSink's
-    // fake BJU, exactly as at rungs 1-2 (BTB, landed this task -- SECTION
-    // BTB below -- only ever gets populated/validated by unconditional
-    // jal/c.j at this rung, since nothing here can compute a conditional
-    // branch's "taken" direction without BHT; see that section's
-    // classification comments). Also unimplemented: the BHT-side ID-stage
-    // delay/replay mechanism (`delay_chgflw`, BPU notes S4.2) and IPACK's
-    // `pred_ipack_delay_stall`/`pred_ipack_mask` gates it drives -- both
-    // read as constant-false terms below, matching their real-RTL role
-    // exactly when no BHT exists (a reduced form of aq_ifu_pred.v's
-    // formulas, not a guess -- Task 9 is where each dropped term gets
-    // reinstated). `pred_ibuf_br_taken0/1` likewise stay 0: their real
-    // formula ANDs a con_br-valid gate with `bht_pred_rslt[1:0]` (the
-    // captured 2-bit counter state), which does not exist until Task 9.
-    //=========================================================================
-    assign pred_ipack_delay_stall = 1'b0;
-    assign pred_ipack_mask        = 1'b0;
-    assign pred_ibuf_br_taken0    = 2'd0;
-    assign pred_ibuf_br_taken1    = 2'd0;
-
-    // Ports with no consumer yet (the BHT chicken bits/invalidate, IU's
-    // confirmed-branch/BHT-update bus, BPU notes S1.6/S4.4) -- genuinely
-    // unused until Task 9, not an oversight. `pcgen_btb_ifpc` (BTB's real
-    // PCGEN-stage read address) is ALSO deliberately left unused here even
-    // though BTB is now real (SECTION BTB below) -- see that section's own
-    // header note for why rv906 collapses the real RTL's 2-stage
-    // (PCGEN-time speculative read, ID-time validate/write) CAM pipeline
-    // into a single ID-stage-time lookup keyed off `pred_cur_pc` instead,
-    // never consuming this port.
-    wire _t9_unused_ok = &{1'b0, pcgen_btb_ifpc, cp0_ifu_bht_en,
-                            cp0_ifu_bht_inv, iu_ifu_br_vld,
-                            iu_ifu_bht_taken, iu_ifu_bht_pred};
+    wire _t9_unused_ok = &{1'b0, pcgen_btb_ifpc};
 
     //=========================================================================
     // SECTION: RAS (plan Task 7.1) -- aq_ifu_ras.v + aq_ifu_ras_entry.v +
@@ -355,45 +327,47 @@ module BPU (
     wire [PC_WIDTH-1:0] pred_imm0 = btb_imm(ipack_pred_inst0);
     wire [PC_WIDTH-1:0] pred_imm1 = btb_imm({16'b0, ipack_pred_inst1});
 
-    // Branch-taken result (aq_ifu_pred.v:585-598) -- BHT-DEPENDENT TERMS
-    // DROPPED (Task 9 territory, no BHT structure exists yet): real
-    // `pred_inst0_taken = pred_br_vld0 && bht_pred_rslt[1] || pred_jmp_vld0`
-    // reduces to `pred_jmp_vld0` alone (the SAME reduction Task 7's RAS
-    // section already used for its own need of this quantity, reproduced
-    // here for BTB's independent use of it) -- meaning a REAL conditional
-    // branch can never register as "taken" by BPU's own decode until
-    // Task 9 lands BHT; only unconditional jal/c.j can. This is a real,
-    // well-defined rung-3 behavior, not a guess: every conditional-branch
-    // redirect at this rung continues to come from FetchSink's fake BJU
-    // exactly as it did at rungs 1-2, and BTB itself is only ever
-    // populated/validated by jal/c.j at this rung (SECTION BTB below) --
-    // Task 9 ORs `bht_pred_rslt[1] && pred_br_vld{0,1}` back into both
-    // lines below and nothing else in this file needs to change.
-    // (real's `pred_inst0_bjtype = pred_br_vld0 || pred_jmp_vld0` gates the
-    // dropped BHT-only term below and nothing else at this rung, so it is
-    // genuinely not instantiated here -- Task 9 will need it again.)
-    wire pred_inst0_taken  = /* pred_br_vld0 && bht_pred_rslt[1] || */ pred_jmp_vld0;
-    wire pred_inst1_taken  = /* !pred_inst0_bjtype && pred_br_vld1 && bht_pred_rslt[1] || */
-                              !pred_inst0_taken && pred_jmp_vld1;
-
-    // pred_br_vld0/1 (con_br classification, above) are genuinely unused
-    // until Task 9 -- built now so Task 9 only has to OR `bht_pred_rslt[1]`
-    // into `pred_inst0/1_taken` above, nothing else here changes. Kept
-    // alive via this bucket rather than deleted, matching this file's own
-    // "genuinely unused, not an oversight" convention used elsewhere.
-    wire _t9_con_br_unused_ok = &{1'b0, pred_br_vld0, pred_br_vld1};
+    // Branch-taken result (aq_ifu_pred.v:585-591, real formula, BHT now
+    // real -- SECTION BHT below supplies `bht_pred_rslt`/`pred_inst0_bjtype`):
+    //   pred_inst0_taken = pred_br_vld0 && bht_pred_rslt[1] || pred_jmp_vld0
+    //   pred_inst1_taken = !pred_inst0_bjtype && pred_br_vld1
+    //                      && bht_pred_rslt[1]
+    //                      || !pred_inst0_taken && pred_jmp_vld1
+    // `bht_pred_rslt`/`pred_inst0_bjtype` are combinational wires defined in
+    // SECTION BHT further down this file -- Verilog wire semantics make the
+    // forward reference here harmless (no combinational loop: bht_pred_rslt
+    // depends only on the REGISTERED bht_dout_ff/bht_vghr, never on
+    // pred_inst0/1_taken or anything downstream of them).
+    wire pred_inst0_taken  = pred_br_vld0 && bht_pred_rslt[1] || pred_jmp_vld0;
+    wire pred_inst1_taken  = !pred_inst0_bjtype && pred_br_vld1 && bht_pred_rslt[1]
+                              || !pred_inst0_taken && pred_jmp_vld1;
+    wire pred_inst0_bjtype = pred_br_vld0 || pred_jmp_vld0;   // aq_ifu_pred.v:585
 
     // a. RAS access signals (aq_ifu_pred.v:610-628). `pred_inst0_taken`
     // (defined just above, SECTION BTB classification) already reduces to
     // `pred_jmp_vld0` with no BHT built yet; `delay_chgflw` (S4.2,
     // BHT-only) is likewise structurally 0 (Task 9).
+    // TASK 9 UPDATE: real aq_ifu_pred.v:612 guards slot-1's link/ret validity
+    // with `!pred_inst0_taken` (aq_ifu_pred.v:612,618), not `!pred_jmp_vld0`
+    // -- through Task 8 these were equivalent (pred_inst0_taken reduced to
+    // exactly pred_jmp_vld0 with no BHT built), but now that pred_inst0_taken
+    // also ORs in a real taken CONDITIONAL branch (SECTION BTB classification
+    // above), a slot-1 call/return must ALSO be suppressed when slot 0 is a
+    // taken branch (not just a taken jump) -- the general "slot 0 already
+    // redirects, slot 1 is wrong-path" rule the real RTL always applied.
     wire pred_ras_link_vld0 = pred_link_vld0;
-    wire pred_ras_link_vld1 = pred_link_vld1 && !pred_jmp_vld0;
+    wire pred_ras_link_vld1 = pred_link_vld1 && !pred_inst0_taken;
     wire pred_ras_link_vld  = (pred_ras_link_vld0 || pred_ras_link_vld1)
                              && cp0_ifu_ras_en && !ibuf_ipack_stall;
 
-    wire pred_ras_ret_vld0   = pred_ret_vld0;                    // (real: && !delay_chgflw, ==1 here)
-    wire pred_ras_ret_vld1   = pred_ret_vld1 && !pred_jmp_vld0;
+    // pred_ras_ret_vld0 (aq_ifu_pred.v:617): TASK 9 FIX -- the real formula's
+    // `&& !delay_chgflw` term (flagged as a no-op placeholder by Task 7's own
+    // comment, since delay_chgflw could not exist before BHT) is now real:
+    // a predicted return in slot 0 must be suppressed while a PRIOR cycle's
+    // delayed BHT redirect (SECTION BHT below) is still pending replay,
+    // exactly as it suppresses an ordinary taken branch/jump redirect.
+    wire pred_ras_ret_vld0   = pred_ret_vld0 && !delay_chgflw;
+    wire pred_ras_ret_vld1   = pred_ret_vld1 && !pred_inst0_taken;
     wire pred_ras_ret_chgflw = pred_ras_ret_vld0 || pred_ras_ret_vld1;
     // DELIBERATE rv906 DIVERGENCE (documented, not a silent guess): the real
     // RTL's `pred_ras_ret_vld`/`pred_curflw` have NO `cp0_ifu_ras_en` term
@@ -441,14 +415,30 @@ module BPU (
     // BTB classification above) is the reduced-but-forward-compatible stand-
     // in for `pred_br_taken1` here, same reduction discipline as elsewhere
     // in this file.
+    // TASK 9 FIX (found while wiring BHT, not present when Task 7/8 wrote
+    // this line): the real mux's first-branch condition is `pred_br_taken0`
+    // (aq_ifu_pred.v:475), i.e. "slot 0 is THE ONE redirecting" -- which
+    // through Task 8 happened to coincide with `c0_jmp` (jal/c.j) only,
+    // since no conditional branch could ever be "taken" without BHT. Now
+    // that `pred_br_taken0` also covers a real taken conditional branch
+    // (SECTION BTB above) AND is gated by `!delay_chgflw` (SECTION BHT
+    // below), `c0_jmp` is no longer an equivalent stand-in -- switched to
+    // the real signal. The second condition also gains `pred_delay_br_raw`
+    // (aq_ifu_pred.v:480): when slot 0 is a branch predicted NOT-taken and
+    // slot 1 is ALSO a branch (the same-row-second-lookup delay case,
+    // SECTION BHT below), slot 1's own PC is needed here even though
+    // `pred_inst1_taken` is structurally 0 in that exact case (BHT's
+    // direction mux is occupied by slot 0 this cycle) -- without this term
+    // `pred_br_tar`/BTB's tag-compare would incorrectly key off slot 0's PC
+    // for what is actually slot 1's branch.
     reg [PC_WIDTH-1:0] pred_h0_pc;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) pred_h0_pc <= {PC_WIDTH{1'b0}};
         else if (ipack_pred_h0_create) pred_h0_pc <= {pred_idpc[PC_WIDTH-1:2], 2'b10};
     end
 
-    wire [PC_WIDTH-1:0] pred_cur_pc = c0_jmp ? (ipack_pred_h0_vld ? pred_h0_pc : pred_idpc)
-                                    : (pred_ras_link_vld1 || pred_inst1_taken) ? {pred_idpc[PC_WIDTH-1:2], 2'b10}
+    wire [PC_WIDTH-1:0] pred_cur_pc = pred_br_taken0 ? (ipack_pred_h0_vld ? pred_h0_pc : pred_idpc)
+                                    : (pred_ras_link_vld1 || pred_inst1_taken || pred_delay_br_raw) ? {pred_idpc[PC_WIDTH-1:2], 2'b10}
                                     : pred_idpc;
 
     // Push value: low RAS_PC_WIDTH bits of (call PC + inst length). Real RTL
@@ -676,12 +666,15 @@ module BPU (
     // constrained to the same 64KiB-aligned region as the branch's own PC
     // (design doc S2.1/S2.3.3).
     //=========================================================================
-    wire [PC_WIDTH-1:0] pred_nxt_offset = ipack_pred_unalign
+    wire [PC_WIDTH-1:0] pred_nxt_offset = (ipack_pred_unalign || pred_delay_br_raw)
                                          ? {{(PC_WIDTH-3){1'b0}}, 3'd2}
-                                         : {{(PC_WIDTH-3){1'b0}}, 3'd4};   // real also ORs pred_delay_br_raw (Task 9, structurally 0)
+                                         : {{(PC_WIDTH-3){1'b0}}, 3'd4};   // aq_ifu_pred.v:487, TASK 9: delay term now real
     wire [PC_WIDTH-1:0] pred_nxt_pc     = pred_cur_pc + pred_nxt_offset;
 
-    wire pred_br_taken0 = pred_inst0_taken;    // real also ANDs !delay_chgflw (Task 9, structurally 0)
+    // pred_br_taken0 (aq_ifu_pred.v:592): TASK 9 -- the real `&& !delay_chgflw`
+    // gate is now real (SECTION BHT below); through Task 8 this was a no-op
+    // (delay_chgflw could not exist without BHT).
+    wire pred_br_taken0 = pred_inst0_taken && !delay_chgflw;
     wire pred_br_taken1 = pred_inst1_taken;
     wire pred_br_taken  = pred_br_taken0 || pred_br_taken1;
     wire [PC_WIDTH-1:0] pred_br_imm = pred_inst0_taken ? pred_imm0 : pred_imm1;
@@ -707,13 +700,16 @@ module BPU (
     // valid prediction and it was right, no redirect (fetch is already
     // following it); if BTB had no entry, ID-stage's own jmp-taken +
     // immediate-computed target drives the redirect directly.
-    // `pred_delay_br_raw` (real's 2nd AND term) is Task-9/BHT-only,
-    // structurally 0 here.
-    wire pred_chgflw     = btb_pred_tar_vld ? btb_mis_pred : pred_br_taken;
+    // `pred_delay_br_raw` (real's 2nd AND term, TASK 9: now real, SECTION
+    // BHT below) suppresses this cycle's BTB-mispredict correction while a
+    // same-row-second-lookup delay/replay is in flight for slot 1 instead.
+    wire pred_chgflw     = btb_pred_tar_vld ? (btb_mis_pred && !pred_delay_br_raw) : pred_br_taken;
     wire [PC_WIDTH-1:0] pred_tar = pred_br_taken ? pred_br_tar : pred_nxt_pc;
     // pred_curflw (RAS's own channel, S4.1 "RAS bypasses BTB entirely"):
-    // delay_chgflw OR term is Task-9/BHT-only, structurally 0 here.
-    wire pred_curflw     = pred_ras_ret_chgflw;
+    // TASK 9 -- the real `|| delay_chgflw` OR term is now real (SECTION BHT
+    // below): a pending delayed BHT redirect is also a same-cycle "current
+    // flow" correction, exactly like a RAS return.
+    wire pred_curflw     = pred_ras_ret_chgflw || delay_chgflw;
     // LIVELOCK GATE (same class of risk Task 7's header/IFU.v's PCGEN
     // section already analyzed and fixed for `pred_pcgen_curflw_vld`, via
     // the SAME `!ibuf_ipack_stall` term): `ipack_pred_inst0/1_vld` and
@@ -816,21 +812,349 @@ module BPU (
     end
 
     //=========================================================================
-    // Output to PCGEN (BPU notes S4.3's "curflw" channel -- RAS bypasses
-    // BTB/chgflw entirely). `pred_curflw` in the real RTL is
-    // `pred_ras_ret_chgflw || delay_chgflw`; the OR'd BHT-delay term is
-    // Task 9 territory (structurally 0 here). Consolidated to exactly
-    // `pred_ras_ret_vld` (see the divergence note above) rather than the
-    // real RTL's un-gated-by-stall `pred_ras_ret_chgflw` -- this also means
-    // the SAME signal drives both the RAS pointer's pop-rotate and the
-    // redirect pulse, so a curflw pulse and a RAS pop always happen in
-    // lockstep (no orphaned redirect with no matching pointer move, or vice
-    // versa).
+    // SECTION: BHT (plan Task 9.1/9.2) -- aq_ifu_bht.v (549 lines) +
+    // aq_ifu_bht_array.v (123 lines) + the BHT-relevant slice of
+    // aq_ifu_pred.v (S1.4's "pure GHR, no PC" finding, S1.6's same-row
+    // second-lookup trick, S4.2's delay/replay mechanism), all confirmed by
+    // reading the real files directly. Single 1024x16 SRAM
+    // (`aq_spsram_1024x16`, aq_ifu_bht_array.v:102), indexed PURELY by GHR
+    // -- `pred_bht_pc`/`iu_ifu_bht_cur_pc` are confirmed dead ports in the
+    // real RTL (grepped with zero hits outside the port list, BPU notes
+    // S1.4) and are NOT cloned here (this module's frozen ports don't even
+    // carry a signal shaped like `pred_bht_pc` for that reason).
+    //
+    // TWO GHRs, not one, not three (Task 9.2 -- confirmed from
+    // aq_ifu_bht.v:66,76 declarations and :196-220 update logic; matches the
+    // BPU extraction note's own S1.3 finding, no C910-style spec/arch/
+    // checkpoint-FIFO triple): `bht_ghr` (ARCHITECTURAL) shifts in the
+    // ACTUAL resolved outcome on every `iu_ifu_br_vld`; `bht_vghr`
+    // (SPECULATIVE) normally shifts in the PREDICTED outcome on every
+    // `pred_bht_br_vld` (a branch reaching this cycle's ID-stage bundle),
+    // but on `iu_ifu_bht_mispred` it instead RELOADS from
+    // `{bht_ghr[HIS_WIDTH-2:0], iu_ifu_bht_taken}` -- i.e. resyncs from the
+    // architectural register plus the just-resolved outcome, not from
+    // vghr's own (wrong) history.
     //=========================================================================
-    assign pred_pcgen_curflw_vld = pred_ras_ret_vld;
-    assign pred_pcgen_curflw_pc  = pred_ras_tar;
-    assign pred_ctrl_stall       = pred_ret_stall;   // real: also ORs BHT-delay terms (Task 9); no consumer exists yet either way (IFU.v header note)
+    localparam BHT_HIS_W = BHT_GHR_WIDTH;   // aq_ifu_bht.v:131, HIS_WIDTH = IDX_WIDTH+4 = 14
+
+    reg [BHT_HIS_W-1:0] bht_ghr;    // aq_ifu_bht.v:196-206
+    reg [BHT_HIS_W-1:0] bht_vghr;   // aq_ifu_bht.v:208-220
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                  bht_ghr <= {BHT_HIS_W{1'b0}};
+        else if (cp0_ifu_bht_inv)    bht_ghr <= {BHT_HIS_W{1'b0}};
+        else if (iu_ifu_br_vld)      bht_ghr <= {bht_ghr[BHT_HIS_W-2:0], iu_ifu_bht_taken};
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                    bht_vghr <= {BHT_HIS_W{1'b0}};
+        else if (cp0_ifu_bht_inv)      bht_vghr <= {BHT_HIS_W{1'b0}};
+        else if (iu_ifu_bht_mispred)   bht_vghr <= {bht_ghr[BHT_HIS_W-2:0], iu_ifu_bht_taken};
+        else if (pred_bht_br_vld)      bht_vghr <= {bht_vghr[BHT_HIS_W-2:0], bht_pred_taken};
+    end
+
+    // a. BHT access signal (aq_ifu_pred.v:497-498): fires whenever THIS
+    // cycle's ID-stage bundle has a conditional branch in either slot.
+    wire pred_bht_br_vld = (pred_br_vld0 || pred_br_vld1) && !ibuf_ipack_stall;
+
+    // b. BHT invalidate sweep FSM (aq_ifu_bht.v:319-382): 3-state
+    // IDLE/WRTE/READ, sweeps all BHT_ROWS=1024 rows over 1024 cycles
+    // (BHT_INV_CYCLES, rvproc_pkg.sv). No separate ICG clock split here (no
+    // clock gating cells in rv906, umbrella spec S6.3) -- one FSM, one
+    // clock, unlike the real RTL's bht_clk/bht_inv_clk pair.
+    localparam [1:0] BHT_INV_IDLE = 2'b00, BHT_INV_WRTE = 2'b10, BHT_INV_READ = 2'b11;
+    reg [1:0] bht_inv_cur_st;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) bht_inv_cur_st <= BHT_INV_IDLE;
+        else case (bht_inv_cur_st)
+            BHT_INV_IDLE: bht_inv_cur_st <= cp0_ifu_bht_inv ? BHT_INV_WRTE : BHT_INV_IDLE;
+            BHT_INV_WRTE: bht_inv_cur_st <= bht_inv_done    ? BHT_INV_READ : BHT_INV_WRTE;
+            BHT_INV_READ: bht_inv_cur_st <= BHT_INV_IDLE;
+            default:      bht_inv_cur_st <= BHT_INV_IDLE;
+        endcase
+    end
+    wire bht_inv_wr   = (bht_inv_cur_st == BHT_INV_WRTE);
+    wire bht_inv_rd   = (bht_inv_cur_st == BHT_INV_READ);
+    wire bht_inv_req  = bht_inv_wr || bht_inv_rd;
+
+    reg [BHT_IDX_W-1:0] bht_inv_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)          bht_inv_cnt <= {BHT_IDX_W{1'b0}};
+        else if (bht_inv_wr) bht_inv_cnt <= bht_inv_cnt + 1'b1;
+    end
+    wire bht_inv_done = (bht_inv_cnt == {BHT_IDX_W{1'b1}});
+
+    // c. Refill/update FSM (aq_ifu_bht.v:389-455): IDLE ->(mispred)-> READ1
+    // -> READ2 -> WRTE -> IDLE, or IDLE ->(ordinary resolve, update-enabled)->
+    // UPD -> IDLE. READ1/READ2 exist to re-derive the row/lane the NEXT
+    // prediction needs (re-priming `bht_dout_ff`, see (e) below) after a
+    // mispredict flushes the pipeline; WRTE/UPD both perform the actual
+    // counter write via `bht_upd_vld`/`bht_miss_write` below.
+    localparam [2:0] BHT_REF_IDLE  = 3'b000, BHT_REF_READ1 = 3'b001,
+                     BHT_REF_READ2 = 3'b010, BHT_REF_WRTE  = 3'b110,
+                     BHT_REF_UPD   = 3'b111;
+    reg [2:0] bht_ref_cur_st;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) bht_ref_cur_st <= BHT_REF_IDLE;
+        else case (bht_ref_cur_st)
+            BHT_REF_IDLE:  bht_ref_cur_st <= iu_ifu_bht_mispred ? BHT_REF_READ1
+                                            : (iu_ifu_br_vld && bht_upd_en) ? BHT_REF_UPD
+                                            : BHT_REF_IDLE;
+            BHT_REF_READ1: bht_ref_cur_st <= BHT_REF_READ2;
+            BHT_REF_READ2: bht_ref_cur_st <= BHT_REF_WRTE;
+            BHT_REF_WRTE:  bht_ref_cur_st <= pred_bht_br_vld ? BHT_REF_WRTE : BHT_REF_IDLE;
+            BHT_REF_UPD:   bht_ref_cur_st <= pred_bht_br_vld ? BHT_REF_UPD  : BHT_REF_IDLE;
+            default:       bht_ref_cur_st <= BHT_REF_IDLE;
+        endcase
+    end
+    wire bht_miss_read1 = (bht_ref_cur_st == BHT_REF_READ1);
+    wire bht_miss_read2 = (bht_ref_cur_st == BHT_REF_READ2);
+    wire bht_miss_write = (bht_ref_cur_st == BHT_REF_WRTE) && !pred_bht_br_vld;
+    wire bht_upd_vld    = (bht_ref_cur_st == BHT_REF_UPD)  && !pred_bht_br_vld;
+
+    // d. 2-bit saturating-counter update case table (aq_ifu_bht.v:457-509,
+    // re-derived by hand from the case table, BPU notes S1.5): {A,B} planes
+    // treated as a 2-bit number, increment on taken / decrement on
+    // not-taken / saturate at 0 and 3 (no-op, `bht_upd_en=0`).
+    reg       bht_upd_en;
+    reg [1:0] bht_upd_val;
+    always @* begin
+        case ({iu_ifu_bht_pred, iu_ifu_bht_taken})
+            3'b000: begin bht_upd_en = 1'b0; bht_upd_val = 2'b00; end
+            3'b001: begin bht_upd_en = 1'b1; bht_upd_val = 2'b01; end
+            3'b010: begin bht_upd_en = 1'b1; bht_upd_val = 2'b00; end
+            3'b011: begin bht_upd_en = 1'b1; bht_upd_val = 2'b10; end
+            3'b100: begin bht_upd_en = 1'b1; bht_upd_val = 2'b01; end
+            3'b101: begin bht_upd_en = 1'b1; bht_upd_val = 2'b11; end
+            3'b110: begin bht_upd_en = 1'b1; bht_upd_val = 2'b10; end
+            3'b111: begin bht_upd_en = 1'b0; bht_upd_val = 2'b11; end
+            default: begin bht_upd_en = 1'b0; bht_upd_val = 2'b00; end  // X-free deviation, same precedent as RAS/BTB's own default muxes
+        endcase
+    end
+
+    // e. Reference-GHR capture (aq_ifu_bht.v:511-530) -- TASK 9.1 GHR
+    // READ/WRITE-WINDOW FINDING (M1 spec S2.3.2, re-derived from THIS RTL,
+    // not assumed to carry over from rv12's C910 resolution): captured on
+    // EITHER a mispredict OR an ordinary update-enabled resolve, from the
+    // ARCHITECTURAL `bht_ghr` (non-blocking read: this is `bht_ghr`'s value
+    // from BEFORE this branch's own outcome shifts in this same edge, i.e.
+    // the history this branch was actually predicted with on the happy
+    // path, since resolution is in-order and single-issue here -- every
+    // branch strictly older than this one has already both PREDICTED and
+    // RESOLVED by the time this one resolves, so `bht_ghr` and the
+    // `bht_vghr` this branch was predicted with hold the IDENTICAL 14-bit
+    // value whenever none of those older branches mispredicted).
+    //
+    // Given that, the WRITE index (`bht_ref_vghr[13:4]` + lane `[2:0]`,
+    // below) and the READ index used to make THIS branch's own prediction
+    // (`bht_vghr[11:2]` + lane `[2:0]`, in (f) below) are two DIFFERENT
+    // bit-slices of that SAME 14-bit value -- read covers bits [0:11]
+    // (ages 0-11, the 12 freshest history bits); write covers bits
+    // {0,1,2}u{4..13} (skips age 3 entirely, reaches back to ages 12-13
+    // that read never touches). This is NOT explained away by pipeline
+    // depth: `aq_ifu_pcgen.v` was read directly for this task (grepped
+    // case-insensitively for "bht"/"ghr" -- zero matches anywhere in that
+    // file) and contains no BHT-adjacent logic at all, so there is no
+    // PCGEN-side mechanism reconciling the two windows the way rv12 found
+    // one for C910's analogous BHT question. And the pipeline-depth
+    // argument itself doesn't need PCGEN to fail here regardless: the
+    // "happy path" value-equality above holds for ANY constant number of
+    // pipeline stages between prediction and resolve, so a fixed latency
+    // cannot be the source of a systematic 2-bit/skip-bit-3 RE-SLICING of
+    // the identical register -- if it were "the same hash viewed at two
+    // pipeline stages" (rv12's C910 finding), read and write would slice
+    // the SAME bit positions, and they provably do not here.
+    //
+    // CONCLUSION: this is a REAL, as-shipped indexing discrepancy between
+    // the row/lane a branch's prediction reads and the row/lane its own
+    // resolve later updates -- re-derived independently from C906's own
+    // RTL, the C910 resolution does NOT transfer. It is, however,
+    // CORRECTNESS-HARMLESS by the same structural argument as the BTB
+    // PC[15:0] aliasing finding (design doc S2.3.3): C906's front end
+    // treats every predictor output as provisional, always re-validated
+    // before it can affect which instructions commit (design doc S4.1) --
+    // this discrepancy can only misdirect a branch's OWN counter update to
+    // a different physical row/lane than the one that predicted it,
+    // injecting extra destructive aliasing into the predictor's training
+    // beyond what pure-GHR indexing (zero PC disambiguation) already
+    // accepts by design. It degrades prediction ACCURACY/cycle count only
+    // (M8 territory), never the committed instruction stream. rv906 clones
+    // the discrepancy exactly as shipped -- read `bht_vghr[11:2]`/lane
+    // `bht_vghr[2:0]`, write `bht_ref_vghr[13:4]`/lane `bht_ref_vghr[2:0]`
+    // -- rather than "fixing" the two windows to agree.
+    wire bht_upd_write = (bht_ref_cur_st == BHT_REF_IDLE) && iu_ifu_br_vld
+                       && !iu_ifu_bht_mispred && bht_upd_en;
+
+    reg [BHT_HIS_W-1:0] bht_ref_vghr;
+    reg [1:0]           bht_ref_val;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bht_ref_vghr <= {BHT_HIS_W{1'b0}};
+            bht_ref_val  <= 2'b0;
+        end
+        else if (iu_ifu_bht_mispred || bht_upd_write) begin
+            bht_ref_vghr <= bht_ghr;
+            bht_ref_val  <= bht_upd_val;
+        end
+    end
+    wire [2:0]  bht_upd_idx = bht_ref_vghr[2:0];
+    wire [15:0] bht_wr_val  = {{8{bht_ref_val[1]}}, {8{bht_ref_val[0]}}};
+
+    // f. Index/lane derivation (aq_ifu_bht.v:246-316) -- pure GHR, no PC
+    // contribution anywhere (Task 9.1, confirmed dead `pred_bht_pc`/
+    // `iu_ifu_bht_cur_pc` ports, not cloned onto this module's port list at
+    // all). Row index has 5 cases: invalidate sweep, mispred refill read1/
+    // read2 (from the ARCHITECTURAL `bht_ghr` directly, one bit lower each,
+    // re-priming (e)'s bypass registers -- not the same-branch update path),
+    // mispred refill write / ordinary update (from `bht_ref_vghr`, see the
+    // finding above), and the default normal-prediction read (from the
+    // SPECULATIVE `bht_vghr`).
+    wire [BHT_IDX_W-1:0] bht_idx =
+          bht_inv_req      ? ({BHT_IDX_W{bht_inv_wr}} & bht_inv_cnt)
+        : bht_miss_read1   ? bht_ghr[BHT_HIS_W-1:4]
+        : bht_miss_read2   ? bht_ghr[BHT_HIS_W-2:3]
+        : (bht_miss_write || bht_upd_vld) ? bht_ref_vghr[BHT_HIS_W-1:4]
+        :                    bht_vghr[BHT_HIS_W-3:2];
+
+    // g. SRAM request assembly (aq_ifu_bht.v:231-257) and instance (BHT is
+    // the ONLY SRAM-backed predictor structure, BPU notes S0/S5 -- BTB/RAS
+    // above are pure flop arrays).
+    wire [BHT_LANES-1:0] bht_mis_wen = 8'b1 << bht_upd_idx;
+    wire [15:0] bht_wen = bht_inv_wr ? 16'hffff
+                        : (bht_miss_write || bht_upd_vld) ? {2{bht_mis_wen}}
+                        : 16'b0;
+    wire [15:0] bht_din = {16{!bht_inv_req}} & bht_wr_val;
+    wire bht_cen = bht_inv_req
+                || ((pred_bht_br_vld || bht_miss_read1 || bht_miss_read2
+                     || bht_miss_write || bht_upd_vld) && cp0_ifu_bht_en);
+
+    wire [15:0] bht_dout;
+    SRAM #(
+        .WIDTH (BHT_WIDTH),
+        .DEPTH (BHT_ROWS)
+    ) u_bht_array (
+        .clk    (clk),
+        .cen_n  (!bht_cen),
+        .gwen_n (!(|bht_wen)),
+        .wen_n  (~bht_wen),
+        .addr   (bht_idx),
+        .d      (bht_din),
+        .q      (bht_dout)
+    );
+
+    // h. Bypass mux + row-holding register (aq_ifu_bht.v:275-316): the
+    // real donor SRAM is registered-read, write-NOT-through (SRAM.v's own
+    // documented contract matches exactly) -- `bht_dout_bypass` supplies a
+    // just-written row's value for the one cycle a refill-write/update
+    // would otherwise see stale (pre-write) `q`; `bht_dout_ff` latches the
+    // row a normal prediction (or a mispred read2) actually consumes.
+    reg        bht_bypass_sel;
+    reg [15:0] bht_dout_bypass;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                              bht_bypass_sel <= 1'b0;
+        else if (bht_miss_write || bht_upd_vld)   bht_bypass_sel <= 1'b1;
+        else if (pred_bht_br_vld)                 bht_bypass_sel <= 1'b0;
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                            bht_dout_bypass <= 16'b0;
+        else if (bht_miss_write || bht_upd_vld) bht_dout_bypass <= bht_dout;
+    end
+    wire [15:0] bht_dout_rslt = bht_bypass_sel ? bht_dout_bypass : bht_dout;
+
+    reg [15:0] bht_dout_ff;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                                    bht_dout_ff <= 16'b0;
+        else if (pred_bht_br_vld || bht_miss_read2)     bht_dout_ff <= bht_dout_rslt;
+    end
+
+    // i. Lane select / direction result (aq_ifu_bht.v:305-316). The A
+    // ("taken") plane is bits [15:8], the B ("not-taken") plane is bits
+    // [7:0], selected by the SAME one-hot lane (BPU notes S1.5).
+    wire [BHT_LANES-1:0] bht_sel_way = 8'b1 << bht_vghr[2:0];
+    wire [1:0] bht_sel_result = {|(bht_sel_way & bht_dout_ff[15:8]),
+                                 |(bht_sel_way & bht_dout_ff[7:0])};
+    wire bht_pred_taken = bht_sel_result[1];
+
+    // j. Same-row second-lookup trick (Task 9.1, BPU notes S1.6): the array
+    // is single-ported but a 2-wide fetch bundle can hold TWO conditional
+    // branches; this reuses the row `pred_bht_br_vld` already fetched for
+    // slot 0, picking a DIFFERENT one of the 8 lanes by substituting slot
+    // 0's own (not-yet-resolved) predicted outcome for the lane's low bit
+    // -- answering "what would the BHT have said for slot 1, assuming slot
+    // 0's prediction becomes part of history" from data already sitting in
+    // the just-read row, no second SRAM access needed. Consumed by the
+    // delay/replay mechanism (k) below, exactly as real aq_ifu_pred.v does
+    // (S4.2) -- still meaningful for rv906 even though only one
+    // instruction/cycle reaches IDU downstream, since the ICache itself
+    // fetches up to 2 halfwords/cycle into IPACK/IBUF (design doc S2.1) and
+    // this is where those two halfwords' branch predictions are resolved.
+    wire [2:0]            bht_mem_idx = {bht_vghr[1:0], bht_pred_taken};
+    wire [BHT_LANES-1:0]  bht_mem_way = 8'b1 << bht_mem_idx;
+    wire bht_pred_mem_taken = |(bht_mem_way & bht_dout_rslt[15:8]);
+
+    wire [1:0] bht_pred_rslt = bht_sel_result;
+
+    // k. Delay/replay for a not-taken-then-taken pair in one bundle
+    // (aq_ifu_pred.v:546-581, S4.2): when slot 0 is a branch predicted
+    // NOT-taken and slot 1 is ALSO a branch, the single BHT direction-mux
+    // path is occupied by slot 0 this cycle, so slot 1's own redirect (if
+    // its same-row lookup (j) says taken) is spliced in as a
+    // same-cycle-deferred replay the FOLLOWING cycle instead of waiting a
+    // full extra fetch round-trip.
+    wire pred_delay_br_raw    = pred_br_vld0 && !bht_pred_rslt[1] && pred_br_vld1;
+    wire pred_delay_br        = pred_delay_br_raw && !ibuf_ipack_stall;
+    wire pred_delay_br1_taken = pred_br_vld0 && !bht_pred_rslt[1] && pred_br_vld1
+                              && bht_pred_mem_taken && !ibuf_ipack_stall;
+    wire pred_delay_reissue   = pred_br_vld0 && !bht_pred_rslt[1] && pred_br_vld1
+                              && !ibuf_ipack_stall;
+    wire pred_delay_taken     = pred_delay_br1_taken || pred_delay_reissue;
+    wire [PC_WIDTH-1:0] delay_tar = pred_delay_br1_taken ? pred_br_tar : pred_nxt_pc;
+
+    reg delay_chgflw;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                             delay_chgflw <= 1'b0;
+        else if (pred_delay_taken)               delay_chgflw <= 1'b1;
+        else if (delay_chgflw && !ibuf_ipack_stall) delay_chgflw <= 1'b0;
+    end
+    reg [PC_WIDTH-1:0] chgflw_pc_ff;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)               chgflw_pc_ff <= {PC_WIDTH{1'b0}};
+        else if (pred_delay_br)   chgflw_pc_ff <= delay_tar;
+    end
+
+    // l. pred_ibuf_br_taken0/1 (aq_ifu_pred.v:599-600,787-788): the
+    // captured 2-bit counter state riding alongside each halfword pushed
+    // into IBUF (IFU.v's SECTION IBUF propagates this to
+    // `ifu_idu_id_bht_pred`, Task 9's own IFU.v amendment) -- slot 1's is
+    // gated by `!pred_inst0_bjtype` (real aq_ifu_pred.v:600): if slot 0 is
+    // itself a branch/jump, this cycle's single BHT read result belongs to
+    // slot 0, not slot 1.
+    wire [1:0] pred_br_rslt0 = {2{pred_br_vld0}} & bht_pred_rslt;
+    wire [1:0] pred_br_rslt1 = {2{pred_br_vld1 && !pred_inst0_bjtype}} & bht_pred_rslt;
+
+    //=========================================================================
+    // Output to PCGEN (BPU notes S4.3's "curflw" channel -- RAS bypasses
+    // BTB/chgflw entirely). `pred_curflw` (SECTION BTB above) is
+    // `pred_ras_ret_chgflw || delay_chgflw` (real aq_ifu_pred.v:738-739).
+    // Both OR terms get the SAME rv906 livelock gate (`!ibuf_ipack_stall`,
+    // Task 7's RAS-section rationale, extended here to the delay/replay
+    // term for the identical reason: `delay_chgflw` is a level that stays
+    // asserted across a multi-cycle `--sink-stall` stall exactly like a
+    // held RAS-return curflw would, so it needs the same "only pulse the
+    // one cycle IPACK's bundle actually retires" treatment) rather than the
+    // real RTL's un-gated-by-stall `pred_ras_ret_chgflw`/`delay_chgflw`.
+    // `pred_ras_ret_vld` already bakes this gate in (Task 7); applied here
+    // to `delay_chgflw` directly since it has no equivalent pre-gated wire.
+    //=========================================================================
+    assign pred_pcgen_curflw_vld = pred_ras_ret_vld || (delay_chgflw && !ibuf_ipack_stall);
+    assign pred_pcgen_curflw_pc  = pred_ras_ret_chgflw ? pred_ras_tar : chgflw_pc_ff;
+    assign pred_ctrl_stall       = pred_ret_stall || pred_delay_br;   // aq_ifu_pred.v:741 (real also ORs ibuf_pred_stall, no rv906 equivalent exists)
     assign pred_ipack_ret_stall  = pred_ret_stall;
+    assign pred_ipack_delay_stall = pred_delay_br_raw;                // aq_ifu_pred.v:782
+    assign pred_ipack_mask        = pred_delay_br_raw;                // aq_ifu_pred.v:783
+    assign pred_ibuf_br_taken0    = pred_br_rslt0;                    // aq_ifu_pred.v:787
+    assign pred_ibuf_br_taken1    = pred_br_rslt1;                    // aq_ifu_pred.v:788
+    assign bht_cp0_inv_done       = bht_inv_done;                     // real: ifu_cp0_bht_inv_done, aq_ifu_bht.v:543
 
     //=========================================================================
     // Output to PCGEN (BPU notes S4.3's "chgflw" channel -- BHT/BTB

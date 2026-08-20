@@ -547,15 +547,53 @@ module FetchSink #(
     // inert skeleton through Task 4 -- Tasks 7-9 build the real predictors),
     // NOTHING upstream of this module can classify or redirect any control
     // transfer on its own, so this fires for every taken conditional branch
-    // and every jal/c.j/jalr-family instruction, unconditionally. This
-    // remains correct once Tasks 7-9 land: if some future predictor already
-    // redirected IFU to the same actual_next this module computes
-    // independently, the redirect below is a harmless no-op re-fetch of the
-    // already-correct address (costs cycles, never correctness -- design
-    // doc S4.1: "predictors change WHEN an instruction is fetched, never
-    // WHICH instructions commit"). Task 7.2 is where this claim gets
-    // verified against a real RAS instead of just asserted.
-    wire redirect_needed = d.con_br   ? taken :
+    // and every jal/c.j/jalr-family instruction, unconditionally.
+    //
+    // TASK 9 FIX (found bringing up dense_br.S's Region G -- BHT training --
+    // at rung 4, not reachable before a real BHT existed): the original
+    // formula only asserted a redirect for a TAKEN conditional branch
+    // (`d.con_br ? taken : ...`), on the reasoning "if not taken, IFU's own
+    // default/sequential fetch already delivers the correct fall-through,
+    // no correction needed." That reasoning silently assumed NOTHING
+    // upstream could have ALREADY diverted the fetch stream away from
+    // fall-through for a branch that turns out not-taken -- true through
+    // Task 8 (no real predictor could ever predict a CONDITIONAL branch
+    // taken: `pred_inst0_taken` reduced to exactly `pred_jmp_vld0`, jal/c.j
+    // only, until Task 9's BHT term existed), but FALSE now that a real,
+    // pure-GHR-indexed BHT (zero PC disambiguation, BPU.v SECTION BHT) can
+    // and does alias a NOT-taken branch onto a table entry trained "taken"
+    // by unrelated history, driving `pred_chgflw` to speculatively redirect
+    // PCGEN to the branch's OWN taken-target -- a genuine misprediction in
+    // the OPPOSITE direction from anything Tasks 1-8 could produce. With the
+    // old formula, `redirect_needed=0` for this not-taken-but-speculatively-
+    // redirected branch, so FetchSink never corrected it: the wrong-path
+    // bytes fetched from the mispredicted target were accepted as if they
+    // were the true fall-through, corrupting the committed stream (confirmed
+    // via a temporary C++ probe, bring-up only, not left in the final RTL --
+    // FetchSink kept reporting the correct fall-through PC while delivering
+    // bytes from several instructions further down the wrong-path target).
+    //
+    // THE FIX, made surgical rather than unconditional: OR in
+    // `ifu_idu_id_bht_pred[1]` (the captured BHT prediction already riding
+    // with this exact instruction, IFU.v's SECTION IBUF `ibuf_tag[]`
+    // plumbing) -- redirect whenever the ACTUAL outcome is taken (the
+    // original case) OR the PREDICTOR claimed taken (catches a taken-
+    // mispredicted-not-taken branch too), but NOT for the overwhelmingly
+    // common "predicted not-taken, actually not-taken" case. At rungs 1-3
+    // (BHT chicken-bit off) `ifu_idu_id_bht_pred` is provably 0 for every
+    // con_br (BPU.v's BHT SRAM is never enabled, its output never departs
+    // from reset), so this reduces to EXACTLY the original formula there --
+    // zero behavioral change below rung 4. An unconditional
+    // `d.con_br ? 1'b1 : ...` (redirecting on literally every conditional
+    // branch, matching `d.ab_br`/`d.jalr_fam`) was considered and rejected:
+    // `iu_ifu_tar_pc_vld` firing on EVERY not-taken branch would ALSO
+    // unconditionally flush IPACK/IBUF every single cycle a branch commits
+    // (`ipack_buf_flush`/`ibuf_flush_en`, IFU.v SECTION IPACK/IBUF, both
+    // gate directly on this signal) -- correctness-preserving but a
+    // needless, drastic throughput regression with no real-hardware analog
+    // (real silicon only flushes on an actual misprediction). The
+    // BHT-prediction OR-term targets exactly the dangerous case.
+    wire redirect_needed = d.con_br   ? (taken || ifu_idu_id_bht_pred[1]) :
                             d.ab_br    ? 1'b1 :
                             d.jalr_fam ? 1'b1 : 1'b0;
 

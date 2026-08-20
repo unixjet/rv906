@@ -374,10 +374,44 @@ module IFU (
         else if (pcgen_buf_chgflw) pcgen_buf_chgflw <= 1'b0;
     end                                                                             // pcgen.v:221-229
 
+    // BUG FIX #4 (Task 9 bring-up, found running dense_br.S's region C
+    // through the full RTL at EVERY rung: two back-to-back compressed
+    // conditional branches sharing one fetch bundle, repeated for 128
+    // iterations, corrupted the committed stream starting ~90 iterations
+    // in -- FetchSink kept reporting the correct PC but delivered bytes
+    // from FAR ahead in the program, i.e. whole instructions were silently
+    // dropped from the stream). ROOT CAUSE, confirmed with a temporary C++
+    // probe (VERISIM_TRACE-style bring-up, per plan discipline -- not left
+    // in the final RTL): `pcgen_pipe_ifpc` (BPU's `pred_idpc`) was latching
+    // `pcgen_fetch_pc` on EVERY `icache_pcgen_grant` -- i.e. tracking
+    // "whatever PCGEN most recently REQUESTED" -- while SECTION IPACK's
+    // entry1/entry2 (the actual data BPU classifies as `ipack_pred_inst0/1`
+    // this cycle) can lag several GRANTS behind whenever IPACK is busy
+    // (Task 9's delay/replay mechanism, BPU.v SECTION BHT part (k), holds
+    // entry2 valid-but-unretired for multiple cycles while ICache keeps
+    // granting fresh, uncorrelated fetches in the meantime -- `grant` fires
+    // essentially every cycle regardless of IPACK's own backlog, confirmed
+    // in the trace). Once `pred_idpc` races even ONE word ahead of what
+    // entry1/entry2 actually hold, every address BPU derives from it
+    // (`pred_cur_pc`'s slot-1 term, RAS pushes, BTB tag/target, and Task 9's
+    // own delay-redirect target) is wrong by a whole word -- for the delay
+    // redirect specifically, this manifests as PCGEN jumping the fetch
+    // pointer PAST content that was never actually retired, permanently
+    // dropping it from the stream (exactly the corruption observed).
+    // THE FIX: latch `icache_pcgen_addr` (the address PAIRED WITH the data
+    // IPACK is actually consuming THIS cycle, an existing IFU.v input) on
+    // `icache_inst_vld` (SECTION IPACK's own "this cycle's fetch data is
+    // real and not cancelled/masked" gate) instead of `pcgen_fetch_pc` on
+    // `icache_pcgen_grant` -- this ties `pred_idpc` to the SAME event that
+    // actually feeds entry1/entry2, eliminating the race regardless of how
+    // many cycles IPACK spends processing one word. `icache_inst_vld` is
+    // defined later in this file (SECTION IPACK) -- a forward wire
+    // reference, harmless in Verilog and already this file's own
+    // convention (BPU.v's SECTION BHT does the same for `bht_pred_rslt`).
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) pcgen_pipe_ifpc <= {PC_WIDTH{1'b0}};
         else if (boot_rst_vld) pcgen_pipe_ifpc <= cp0_xx_mrvbr;
-        else if (icache_pcgen_grant) pcgen_pipe_ifpc <= pcgen_fetch_pc[PC_WIDTH-1:0];
+        else if (icache_inst_vld) pcgen_pipe_ifpc <= icache_pcgen_addr[PC_WIDTH-1:0];
         else pcgen_pipe_ifpc <= pcgen_pipe_ifpc;
     end                                                                             // pcgen.v:285-293
 
@@ -431,17 +465,16 @@ module IFU (
     // here, not an oversight; likewise `iu_ifu_pc_mispred` is consumed
     // directly by BPU.v (RAS pointer resync, Task 7), not by IFU.v's own
     // pipeline -- confirmed absent from aq_ifu_pcgen.v's port list.
-    // `icache_ipack_acc_err`/`_pgflt` and `pred_ibuf_br_taken0/1` are real
-    // frozen ports with no M1 consumer either: the first pair has nowhere
-    // to go (no exception path to IDU exists yet, SECTION IPACK below), and
-    // the second pair is provably always 0 while BPU.v ties both outputs
-    // inactive (SECTION IBUF below, `ifu_idu_id_bht_pred`) -- all four are
-    // genuinely unused, not dropped by oversight. (`h1_32bit_vld` WAS in
-    // this bucket through Task 3/5 -- see BUG FIX #3 in SECTION IPACK below
-    // for why it is genuinely consumed now.)
+    // `icache_ipack_acc_err`/`_pgflt` have nowhere to go (no exception path
+    // to IDU exists yet, SECTION IPACK below) -- genuinely unused, not
+    // dropped by oversight. `pred_ibuf_br_taken0/1` WERE in this bucket
+    // through Task 8 (BPU.v tied both to 0 with no BHT built) -- TASK 9:
+    // now real, consumed by `ibuf_tag[]`'s push logic above, removed from
+    // this bucket. (`h1_32bit_vld` WAS in this bucket through Task 3/5 --
+    // see BUG FIX #3 in SECTION IPACK below for why it is genuinely
+    // consumed now.)
     wire _unused_ok = &{1'b0, pred_ctrl_stall, icache_ctrl_stall, iu_ifu_pc_mispred,
-                         icache_ipack_acc_err, icache_ipack_pgflt,
-                         pred_ibuf_br_taken0, pred_ibuf_br_taken1};
+                         icache_ipack_acc_err, icache_ipack_pgflt};
 
     //=========================================================================
     // SECTION: IPACK  (aq_ifu_ipack.v + _entry.v -- 3 flop entries, ported
@@ -470,7 +503,7 @@ module IFU (
     //=========================================================================
     wire pred_ipack_chgflw_vld0 = 1'b0;   // see FLAGGED note above
 
-    wire icache_inst_vld    = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
+    wire icache_inst_vld   = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
     wire ipack_align_create = icache_inst_vld && !icache_ipack_unalign;                        // ipack.v:255
     // ibuf_ipack_stall is now a MODULE OUTPUT PORT (Task 7.1 amendment,
     // see the port-list note) driven in SECTION IBUF below -- no separate
@@ -481,7 +514,7 @@ module IFU (
     reg         entry0_vld, entry1_vld, entry2_vld;
     reg  [15:0] entry0_inst, entry1_inst, entry2_inst;
 
-    wire h0_vld       = entry0_vld && entry0_inst[1:0] == 2'b11;                     // ipack.v:373
+    wire h0_vld      = entry0_vld && entry0_inst[1:0] == 2'b11;                     // ipack.v:373
     wire h1_16bit_vld = entry1_vld && entry1_inst[1:0] != 2'b11;                     // ipack.v:375
     wire h1_32bit_vld = entry1_vld && entry1_inst[1:0] == 2'b11;                     // ipack.v:376 (BUG FIX #3 below: genuinely consumed here)
     wire h2_16bit_vld = entry2_vld && entry2_inst[1:0] != 2'b11;                     // ipack.v:378
@@ -537,11 +570,11 @@ module IFU (
     end
 
     // ---- Valid instruction package (ipack.v:382-424) -----------------------
-    wire        ipack_first_vld  = entry1_vld || (!h0_vld && h2_16bit_vld);          // ipack.v:388
+    wire        ipack_first_vld = entry1_vld || (!h0_vld && h2_16bit_vld);          // ipack.v:388
     wire [31:0] ipack_first_inst = entry0_vld ? {entry1_inst, entry0_inst}
                                  : entry1_vld ? {entry2_inst, entry1_inst}
                                               : {entry2_inst, entry2_inst};          // ipack.v:389-391
-    wire        ipack_secnd_vld  = (h0_vld || h1_16bit_vld) && h2_16bit_vld;         // ipack.v:393
+    wire        ipack_secnd_vld = (h0_vld || h1_16bit_vld) && h2_16bit_vld;         // ipack.v:393
     wire [15:0] ipack_secnd_inst = entry2_inst;                                      // ipack.v:395
 
     // ipack_one_16bit_vld (ipack.v:399-402) with pred_ipack_chgflw_vld0(=0
@@ -593,16 +626,50 @@ module IFU (
     wire ipack_one_32bit_vld = (!h0_vld && h1_32bit_vld && entry2_vld)
                             || (h0_vld && entry1_vld && h2_32bit_vld);
 
+    // BUG FIX #5 (Task 9 bring-up, found running dense_br.S's region
+    // C/D boundary through the full RTL: a 32-bit instruction straddling
+    // two fetch words -- h0_vld's carry case -- silently vanished from the
+    // committed stream whenever its OWN completing cycle also classified
+    // entry2 as a valid, DELAYED con_br partner). None of
+    // `ipack_one_16bit_vld`/`ipack_one_32bit_vld`/`ipack_secnd_vld`/
+    // `ipack_all_vld` cover "h0_vld && entry1_vld (a complete 32-bit
+    // instruction) && entry2_vld is ALSO a valid con_br, but
+    // `pred_ipack_delay_stall` (Task 9's delay/replay mechanism, BPU.v
+    // SECTION BHT part (k)) is deferring it" -- `ipack_all_vld` is the
+    // only formula that would otherwise retire h0+entry1+entry2 together,
+    // and it is UNCONDITIONALLY killed by `!pred_ipack_delay_stall`
+    // (matching the plain-RVC `ipack_one_16bit_vld` case's OWN documented
+    // precedent of retiring the COMPLETE, non-deferred piece alone and
+    // leaving entry2 for a later cycle) -- but nothing steps in to retire
+    // the NOW-COMPLETE h0+entry1 pair by itself the way
+    // `ipack_one_16bit_vld` does for a plain RVC entry1. Confirmed via a
+    // temporary C++ probe (bring-up only, not left in the final RTL):
+    // `entry0_retire_en`/`entry1_retire_en` (SECTION IBUF's own formulas,
+    // unchanged) still unconditionally clear entry0/entry1 this cycle
+    // regardless of push count, so the 32-bit instruction's VALID BITS
+    // cleared while ZERO halfwords were ever pushed -- a silent drop, not
+    // merely a stale value. THE FIX: a dedicated retire-2 term for exactly
+    // this combination, OUTSIDE the `!pred_ipack_delay_stall` gate that
+    // (correctly) suppresses `ipack_all_vld`/`ipack_secnd_vld`'s own
+    // 3-piece and slot1-inclusive pushes -- this is NOT a case the real
+    // RTL's own commented-out formula (BUG FIX #3 above) anticipated,
+    // since it predates Task 9's delay mechanism entirely; reasoned and
+    // derived locally from this file's own entry-retirement invariants,
+    // not found pre-existing in the real source.
+    wire ipack_h0_delay_vld = h0_vld && entry1_vld && pred_ipack_delay_stall
+                            && !pred_ipack_chgflw_vld0;
+
     wire        ipack_retire_vld  = entry1_vld || h2_16bit_vld;                      // ipack.v:419
     wire [47:0] ipack_retire_inst = {entry2_inst, ipack_first_inst};                 // ipack.v:424
 
     // ---- Output to ibuf (ipack.v:456-497) ----------------------------------
     wire ipack_ibuf_inst_vld_raw = ipack_retire_vld;
-    wire ipack_ibuf_inst_vld     = ipack_retire_vld && !ipack_buf_stall;
-    wire ipack_ibuf_inst_one     = ipack_one_16bit_vld;
-    wire ipack_ibuf_inst_two     = (ipack_secnd_vld || ipack_one_32bit_vld)
-                                 && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall; // BUG FIX #3
-    wire ipack_ibuf_inst_all     = ipack_all_vld;
+    wire ipack_ibuf_inst_vld    = ipack_retire_vld && !ipack_buf_stall;
+    wire ipack_ibuf_inst_one    = ipack_one_16bit_vld;
+    wire ipack_ibuf_inst_two    = ((ipack_secnd_vld || ipack_one_32bit_vld)
+                                 && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall) // BUG FIX #3
+                                 || ipack_h0_delay_vld;                              // BUG FIX #5
+    wire ipack_ibuf_inst_all    = ipack_all_vld;
     wire [47:0] ipack_ibuf_inst  = ipack_retire_inst;
 
     assign ipack_pcgen_reissue = ibuf_ipack_stall && icache_inst_vld;                // ipack.v:491
@@ -648,6 +715,7 @@ module IFU (
     // doc S6.2).
     //=========================================================================
     reg  [15:0] ibuf_mem [0:5];
+    reg  [1:0]  ibuf_tag [0:5];   // TASK 9: per-halfword bht_pred tag, see below
     reg  [2:0]  ibuf_head;     // 0..5, head-of-queue (oldest halfword) pointer
     reg  [2:0]  ibuf_count;    // 0..6, occupancy
 
@@ -685,7 +753,7 @@ module IFU (
     wire        ibuf_h1_vld = (ibuf_count >= 3'd2);
     wire [15:0] ibuf_h1     = ibuf_mem[ibuf_head1];
 
-    wire       pop_entry_vld  = ibuf_h0_vld && (!ibuf_h0_32 || ibuf_h1_vld);
+    wire       pop_entry_vld = ibuf_h0_vld && (!ibuf_h0_32 || ibuf_h1_vld);
     wire [1:0] ibuf_pop_count = pop_entry_vld ? (ibuf_h0_32 ? 2'd2 : 2'd1) : 2'd0;
     wire       ibuf_pop_fire  = pop_entry_vld && ctrl_ibuf_pop_en;
 
@@ -701,6 +769,24 @@ module IFU (
     wire [2:0] ibuf_tail0 = (ibuf_tail0_raw >= 4'd6) ? (ibuf_tail0_raw[2:0] - 3'd6) : ibuf_tail0_raw[2:0];
     wire [2:0] ibuf_tail1 = (ibuf_tail0 == 3'd5) ? 3'd0 : ibuf_tail0 + 3'd1;
     wire [2:0] ibuf_tail2 = (ibuf_tail1 == 3'd5) ? 3'd0 : ibuf_tail1 + 3'd1;
+
+    // TASK 9: which instruction slot owns the SECOND pushed halfword
+    // (tail1) -- fully determinable from wires IFU.v already computes
+    // (SECTION IPACK above), no ambiguity: tail1 is instr0's OWN high half
+    // whenever the 2-push came from a lone 32-bit instr0
+    // (`ipack_one_32bit_vld`), from the 3-push ALL case (entry0+entry1 =
+    // instr0's 32 bits, entry2 = instr1, `ipack_ibuf_inst_all`), OR from
+    // BUG FIX #5's h0-carry-plus-delay 2-push (`ipack_h0_delay_vld` --
+    // entry0+entry1 again form instr0's 32 bits, entry2 is deferred, not
+    // pushed at all this cycle); otherwise (the 2-push came from
+    // `ipack_secnd_vld`, two independent 16-bit halves) tail1 is instr1's
+    // own halfword. `ipack_secnd_vld`/`ipack_one_32bit_vld`/
+    // `ipack_h0_delay_vld` are mutually exclusive by construction
+    // (h2_16bit_vld/h2_32bit_vld can't both be the deciding term, and
+    // `ipack_h0_delay_vld` requires `pred_ipack_delay_stall` which the
+    // other two do not gate on), so this is a clean split, not a priority
+    // guess.
+    wire ibuf_tail1_is_instr0 = ipack_ibuf_inst_all || ipack_one_32bit_vld || ipack_h0_delay_vld;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -724,22 +810,32 @@ module IFU (
     end
 
     always @(posedge clk) begin
-        if (ibuf_push_count >= 2'd1) ibuf_mem[ibuf_tail0] <= ipack_ibuf_inst[15:0];
-        if (ibuf_push_count >= 2'd2) ibuf_mem[ibuf_tail1] <= ipack_ibuf_inst[31:16];
-        if (ibuf_push_count >= 2'd3) ibuf_mem[ibuf_tail2] <= ipack_ibuf_inst[47:32];
+        if (ibuf_push_count >= 2'd1) begin
+            ibuf_mem[ibuf_tail0] <= ipack_ibuf_inst[15:0];
+            ibuf_tag[ibuf_tail0] <= pred_ibuf_br_taken0;      // tail0 is ALWAYS instr0's low half
+        end
+        if (ibuf_push_count >= 2'd2) begin
+            ibuf_mem[ibuf_tail1] <= ipack_ibuf_inst[31:16];
+            ibuf_tag[ibuf_tail1] <= ibuf_tail1_is_instr0 ? pred_ibuf_br_taken0 : pred_ibuf_br_taken1;
+        end
+        if (ibuf_push_count >= 2'd3) begin
+            ibuf_mem[ibuf_tail2] <= ipack_ibuf_inst[47:32];
+            ibuf_tag[ibuf_tail2] <= pred_ibuf_br_taken1;      // only reachable via ipack_ibuf_inst_all: tail2 is instr1
+        end
     end
 
     // ---- Output to IDU (frozen ports) --------------------------------------
     assign ifu_idu_id_inst_vld = pop_entry_vld;                                      // ibuf.v:1354
     assign ifu_idu_id_inst     = {ibuf_h1, ibuf_h0};                                  // ibuf.v:1355-1356
     // ifu_idu_id_bht_pred (ibuf.v:1357-1358) rides pred_ibuf_br_taken{0,1}
-    // alongside each halfword in the real RTL. BPU.v's Task-1 skeleton ties
-    // BOTH br_taken0/1 to 2'b00 for as long as every predictor stays
-    // disabled, so this field is PROVABLY always 0 in M1's configuration --
-    // per-halfword tracking through the queue is deferred to Tasks 7-9,
-    // which need to touch this section anyway to wire the RAS/BTB/BHT
-    // redirect levels in; building unused plumbing for it now would be
-    // pure waste (flagged in the Task 3 report, not a silent gap).
-    assign ifu_idu_id_bht_pred = 2'b00;
+    // alongside each halfword in the real RTL. TASK 9: BPU.v's BHT is real
+    // now, and `pred_ibuf_br_taken0/1` carry the genuine captured 2-bit
+    // counter state -- propagated through IBUF via `ibuf_tag[]` (populated
+    // at push time above, per-halfword, using the SAME instr0-vs-instr1
+    // attribution as the data array) and read out here at pop time keyed
+    // off `ibuf_head`, i.e. h0's own tag -- h0 is the first (low) halfword
+    // of whichever instruction is about to be delivered to IDU, exactly
+    // where the real RTL anchors this field.
+    assign ifu_idu_id_bht_pred = ibuf_tag[ibuf_head];
 
 endmodule
