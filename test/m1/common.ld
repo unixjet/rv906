@@ -9,10 +9,17 @@
  *      default and rvproc_pkg.sv's cp0_xx_mrvbr wiring -- the core boots
  *      here, so the golden ISS's walk (m1_iss.h, M1::RESET_VECTOR) must
  *      start here too;
- *   2. the tohost line at rvproc_pkg.sv's ADDR_TOHOST (0x9000_1000), padded
- *      to a full 64-byte line -- the D-side AXI write FSM FetchSink lifted
- *      from TestMaster.v writes a whole line regardless of wstrb, so
- *      nothing else may share it.
+ *   2. the tohost line at rvproc_pkg.sv's ADDR_TOHOST, padded to a full
+ *      64-byte line -- the D-side AXI write FSM FetchSink lifted from
+ *      TestMaster.v writes a whole line regardless of wstrb, so nothing
+ *      else may share it.
+ *
+ * M2 Task 1 update: ADDR_TOHOST relocated from 0x9000_1000 to 0x7FFF_F000
+ * (rvproc_pkg.sv, contract 6) -- inside the uncached aperture below
+ * 0x8000_0000, resolving a real write-back-DCache/tohost hazard a
+ * cacheable mapping would otherwise create once M2's real DCache lands
+ * (design doc S2.3.5/S8). The `.tohost` section below moves to match; no
+ * other M1 file/convention changes.
  *
  * Everything a test executes lives in .text.init, in ONE section, because
  * the JR_PAD macro in macros.h places indirect-jump landing pads with
@@ -53,8 +60,11 @@ SECTIONS
     . = ALIGN(64);
     .bss : { *(.bss) *(.bss.*) *(.sbss) *(.sbss.*) *(COMMON) }
 
-    /* tohost/fromhost: see the padding note above. */
-    . = 0x90001000;
+    /* tohost/fromhost: see the padding note above. Relocated (M2 Task 1,
+     * contract 6) to ADDR_TOHOST = 0x7FFF_F000 -- 60KB past
+     * M1_UNCACHED_BASE (0x7FFF0000 above) so it sits clear of
+     * test/m1/uncached.S's own content, which peaks at offset 0xBE. */
+    . = 0x7FFFF000;
     .tohost : { *(.tohost) . = 0x40; }
 
     /DISCARD/ : { *(.comment) *(.note.*) *(.riscv.attributes) }
