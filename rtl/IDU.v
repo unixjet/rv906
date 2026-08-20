@@ -37,12 +37,19 @@
 //    note S6) -- there is no direct IU->IDU or LSU->IDU bypass wire on this
 //    port list, matching contract 1's "IDU never sees any of the four
 //    IU->RTU writeback buses directly."
-//  * `idu_lsu_ex1_dp_sel` is named per the design doc's/plan's own
-//    repeated spelling (design doc S4.1 unit graph, plan 1.2's LSU.v/IDU.v
-//    bullets) even though `aq_idu_id_ctrl.v:634`'s confirmed real name is
-//    `idu_lsu_ex1_sel` (no "dp"). Task 5 should verify which spelling is
-//    actually intended when LSU.v's real body is wired up and rename if
-//    the "dp" turns out to be a typo carried through the design doc.
+//  * `idu_lsu_ex1_dp_sel` and `idu_lsu_ex1_sel` are BOTH real, distinct
+//    donor signals (not a spelling variant of one signal) -- confirmed
+//    from the producer side, `aq_idu_id_ctrl.v:634` vs. `:646`:
+//      idu_lsu_ex1_sel    = eu_sel[EU_LSU] && !stall && rtu_idu_commit && !lsu_idu_full
+//      idu_lsu_ex1_dp_sel = eu_sel[EU_LSU] && !stall                  && !lsu_idu_full
+//    i.e. `_dp_sel` is the ungated early select AG's own speculative
+//    operand-mux datapath uses (fires before RTU's commit grant);
+//    `_sel` is the same term additionally gated on `rtu_idu_commit` --
+//    the true architectural go-ahead. Consumer side confirms both are
+//    independently read (`aq_lsu_ag.v:655-656`: `ag_dp_sel =
+//    idu_lsu_ex1_dp_sel`, `ag_inst_vld = idu_lsu_ex1_sel`). Both ports are
+//    frozen here; Task 5/6 wire the two different gating conditions for
+//    real, not just one signal under two names.
 //  * `lsu_idu_full` (LSU's single stall signal to IDU, contract 8) is
 //    CONFIRMED directly from `aq_idu_id_ctrl.v:634`'s real consumer-side
 //    reference (`!lsu_idu_full`), not guessed from the LSU note's prose.
@@ -87,6 +94,7 @@ module IDU (
     // input port group exactly -- see the header note on the "dp_sel" name).
     //=========================================================================
     output wire                     idu_lsu_ex1_dp_sel,
+    output wire                     idu_lsu_ex1_sel,
     output wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func,
     output wire [63:0]              idu_lsu_ex1_src0_data,
     output wire                     idu_lsu_ex1_src0_ready,
@@ -179,6 +187,7 @@ module IDU (
     assign idu_iu_ex1_dst0_reg     = {GPR_IDX_WIDTH{1'b0}};
 
     assign idu_lsu_ex1_dp_sel      = 1'b0;
+    assign idu_lsu_ex1_sel         = 1'b0;
     assign idu_lsu_ex1_func        = {FUNC_WIDTH{1'b0}};
     assign idu_lsu_ex1_src0_data   = 64'd0;
     assign idu_lsu_ex1_src0_ready  = 1'b0;

@@ -20,11 +20,15 @@
 // bank), contract 11 (victim writeback in scope), LSU note A2/A4/A5/A6/A7.
 //
 // SEAM NOTES:
-//  * `idu_lsu_ex1_dp_sel` is spelled per the design doc's/plan's own
-//    repeated usage (design doc S4.1, plan 1.2's LSU.v/IDU.v bullets),
-//    matching IDU.v's output of the same name -- see IDU.v's header for
-//    the note that `aq_idu_id_ctrl.v:634`'s real donor name is
-//    `idu_lsu_ex1_sel` (no "dp"); Task 5/6 reconcile which spelling stands.
+//  * `idu_lsu_ex1_dp_sel` and `idu_lsu_ex1_sel` are BOTH real, distinct
+//    donor signals, confirmed from the producer side (`aq_idu_id_ctrl.v:
+//    634` vs. `:646`) and the consumer side (`aq_lsu_ag.v:655-656`:
+//    `ag_dp_sel = idu_lsu_ex1_dp_sel`, `ag_inst_vld = idu_lsu_ex1_sel`):
+//    `_dp_sel` is the ungated early select AG's speculative operand-mux
+//    datapath uses; `_sel` is the same term additionally gated on
+//    `rtu_idu_commit` -- the true architectural go-ahead. Both ports are
+//    frozen here (see IDU.v's header for the full derivation); Task 5/6
+//    wire the two different gating conditions for real.
 //  * `lsu_idu_full` (this module's single point-to-point stall signal to
 //    IDU, contract 8) is CONFIRMED directly from `aq_idu_id_ctrl.v:634`'s
 //    consumer-side reference, not guessed.
@@ -58,6 +62,7 @@ module LSU #(
     // output group exactly).
     //=========================================================================
     input  wire                     idu_lsu_ex1_dp_sel,
+    input  wire                     idu_lsu_ex1_sel,
     input  wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func,
     input  wire [63:0]              idu_lsu_ex1_src0_data, // base addr reg
     input  wire                     idu_lsu_ex1_src0_ready,
