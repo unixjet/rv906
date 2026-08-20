@@ -11,39 +11,49 @@ design document.
 
 ## Status
 
-**M1: front end bring-up in progress.** `RVProcAXI` now instantiates the
-real core shell (`rtl/RVProc.v`): IFU + ICache + BPU (predictor structures
-still land in later M1 tasks) + `FetchSink.v` (an M1-only scaffold that
-plays fake BJU/RTU/CP0 until the real IDU/IU/RTU exist in M2). What exists
-and works:
+**M1: front end complete, pending review.** The instruction fetch unit, the
+32 KB L1 instruction cache and the full three-structure branch predictor
+(BHT + BTB + RAS) are built and green across the whole acceptance matrix.
+There is still no decode or execute stage — M2 brings those.
 
-- **A full AXI SoC simulation stack**: Verilator-simulated `RVProcAXI`
-  fabric (crossbar, memory controller, CLINT, PLIC — all real RTL) wired to
-  a C++ testbench (ELF loading, the tohost/fromhost protocol, FDT
-  generation, an NS16550A UART model).
-- **`rtl/ICache.v`** (complete + unit-tested) and **`rtl/IFU.v`** (complete,
-  predictor-less pipeline) — see `docs/superpowers/plans/2026-08-20-m1-ifu.md`
-  for the task-by-task history.
-- **`rtl/FetchSink.v`**, the M1 scaffolding core-shell tenant: consumes the
-  IFU's single-instruction-per-cycle delivery, resolves every control
-  transfer against its own predictor-independent oracle (direction rule,
-  decoded immediates, a 16-entry shadow call stack, the JR_TARGET formula),
-  and reports through `tohost` exactly as M0's `TestMaster.v` did.
-- **M0's `rtl/TestMaster.v` and `test/smoke/` are RETIRED** (design doc
-  S4.3): TestMaster's D-side AXI write FSM was lifted verbatim into
-  FetchSink.v, and every M1 test exercises a strict superset of what the
-  smoke test covered.
-- **A bare-metal firmware kit** (`test/`) that builds with the xpack
-  RISC-V toolchain but does not run yet — running it needs a real core
-  (M2).
+What exists and works:
 
-The M1 directed test suite, the C++ fetch-ISS/online checker, and the
-chicken-bit predictor ladder (Tasks 5-10 of the M1 plan) are still being
-built — there is no runnable M1 test target yet. A full M1 test-matrix
-quick-start lands with Task 10; until then, `make verisim` (below) is the
-build-correctness gate. See `docs/08-verification.md` for the simulation
-stack and the tohost protocol, and
-`docs/superpowers/plans/2026-08-20-m1-ifu.md` for the M1 task plan.
+- **The front end** (`docs/02-ifu.md` and `docs/03-bpu.md` are its two
+  chapters): `rtl/IFU.v`, the flat single-issue fetch pipeline (PCGEN →
+  ICache access → IPACK → IBUF) with its 7-level redirect ladder and
+  3-destination cancel network; `rtl/ICache.v`, 32 KB / 2-way / 64 B-line
+  with live RVC-boundary detection and the fence.i invalidate walk;
+  `rtl/BPU.v`, all three C906 predictors (BHT: 1024×16 SRAM, pure-GHR index;
+  BTB: 16-entry flop CAM; RAS: 4-entry flop stack, pointer-only resync);
+  `rtl/SRAM.v`, the one behavioral SRAM model for the project.
+- **The M1 oracle pair**: `rtl/FetchSink.v` stands in for IDU/IU/RTU/CP0
+  (fake BJU + fake RTU + the harness config bank) and reports over
+  `tohost`; a C++ golden fetch-ISS (`m1_iss.h`, driven from `RVProcTest.cpp`)
+  derives the expected committed stream independently from the same spec
+  text, and the testbench compares the two online, every cycle.
+- **The acceptance matrix**: 11 directed tests × 4 rungs of the predictor
+  chicken-bit ladder × `--sink-stall` off/on, plus a mid-run invalidate
+  sweep pass at the top rung — 110 runs, all green
+  (`test/m1/run_all.sh --full-matrix`). Every test's committed stream is
+  identical at every rung, which is the property the whole ladder rests on:
+  a predictor changes *when* instructions are fetched, never *which* ones
+  commit.
+- **A full AXI SoC simulation stack** (from M0): Verilator-simulated
+  `RVProcAXI` fabric (crossbar, memory controller, CLINT, PLIC) wired to a
+  C++ testbench (ELF loading, tohost/fromhost protocol, FDT generation, an
+  NS16550A UART model). The M0 `TestMaster.v` scaffold and its `test/smoke`
+  firmware are retired: their D-side write/tohost path is a strict subset of
+  what every M1 test exercises through FetchSink.
+- A bare-metal firmware kit (`test/`) that builds with the xpack RISC-V
+  toolchain but does not run yet (needs a back end, M2).
+
+See `docs/02-ifu.md` (fetch pipeline + ICache: principle, implementation,
+C906 file cross-reference, design discussion) and `docs/03-bpu.md` (branch
+predictor: same structure) for the front-end chapters, and
+`docs/08-verification.md` for the simulation stack, the tohost protocol and
+the M1 harness. `docs/superpowers/plans/2026-08-20-m1-ifu.md` has the
+task-by-task history, including every deviation and finding this milestone
+made while reading the real C906 RTL.
 
 ## Directory map
 
@@ -53,8 +63,8 @@ stack and the tohost protocol, and
 | `testbench/` | C++ simulation harness: ELF loader (`load_elf.cpp`), FDT builder (`fdt.cpp`), the tohost/fromhost `TestBench` base class |
 | `io/` | AXI4-Lite C++ models: external memory (`ExtMem.h`), the generic AXI4L slave/converter templates (`RVProc_io.h`) |
 | `device/` | Peripheral device models (NS16550A UART, tty server) |
-| `test/` | Bare-metal firmware kit (build-only until M2) and `test/m1/unit/`, the M1 standalone RTL unit benches (`icache_tb.cpp`, `fetchsink_tb.cpp`) |
-| `docs/` | Verification notes (`08-verification.md`) and the specs/plans under `docs/superpowers/` |
+| `test/` | Bare-metal firmware kit (build-only until M2); `test/m1/`, the M1 directed test suite (11 `.S` tests) plus `test/m1/run_all.sh` (the full matrix runner) and `test/m1/unit/`, the M1 standalone RTL/ISS unit benches (`icache_tb.cpp`, `fetchsink_tb.cpp`, `iss_tb.cpp`) |
+| `docs/` | Subsystem chapters (`02-ifu.md`, `03-bpu.md`), verification notes (`08-verification.md`), and the specs/plans under `docs/superpowers/` |
 | `refs/` | Reference RTL pulled in for porting/comparison (gitignored, not part of this repository's source) |
 
 ## Prerequisites
@@ -69,20 +79,47 @@ stack and the tohost protocol, and
 ## Quick start
 
 **M0's smoke test is retired** (design doc S4.3) along with `TestMaster.v` —
-there is no end-to-end runnable test target yet. M1 bring-up is in progress;
-a full M1 test-matrix quick-start (`test/m1/run_all.sh` across the
-chicken-bit predictor ladder) lands with plan Task 10. For now:
+`FetchSink.v` reports through the same `tohost` protocol now, exercised by
+every M1 test.
 
 ```bash
 make verisim                    # build the simulator (bin/verisim/testbench)
+make -C test/m1                 # build the M1 directed tests (.S -> .out ELFs)
 
-make -C test/m1/unit icache && bin/unit/icache_tb   # ICache standalone unit bench
-make -C test/m1/unit fetchsink && bin/unit/fetchsink_tb  # FetchSink standalone unit bench
+# one test: call/return nests at and just past the 4-entry RAS limit, at
+# rung 2 (RAS on), checked instruction by instruction against the golden ISS
+timeout 60 bin/verisim/testbench --print-result --m1-rung=2 test/m1/callret.out
+echo "exit=$?"                  # expect: "test/m1/callret.out: PASS." and exit=1
+```
+
+`--m1-rung=<1..4>` selects a rung of the predictor chicken-bit ladder — 1 =
+every predictor off, then +RAS, +BTB, +BHT. The same test must pass, with
+the same committed stream, at every rung.
+
+The full M1 acceptance matrix (110 runs: 11 tests × 4 rungs × `--sink-stall`
+off/on, plus 22 more at rung 4 with `--inv-test`):
+
+```bash
+test/m1/run_all.sh --full-matrix   # prints a per-rung table, a cycle-count
+                                    # summary and the slot-count invariant
+                                    # check; exits 0 on ALL PASS
+```
+
+(`test/m1/run_all.sh` with no arguments, or `--m1-rung=N`, runs the older
+single-rung mode used during Tasks 6-9's own bring-up.)
+
+The standalone unit benches, which drive `ICache.v`/`FetchSink.v` directly
+without the SoC around them, plus the golden ISS's own zero-RTL self-test:
+
+```bash
+make -C test/m1/unit run    # icache_tb + fetchsink_tb + iss_tb, UNIT-SUITE-PASS
+bin/verisim/testbench --iss-selftest    # the golden ISS's own gate, no RTL
 ```
 
 Each unit bench prints one line per check and ends with `UNIT-PASS` or
 `UNIT-FAIL`; see `docs/superpowers/plans/2026-08-20-m1-ifu.md` for what each
-task's gate actually is.
+task's gate actually is, and `docs/08-verification.md` for the full CLI flag
+table and the two-oracle architecture.
 
 To build the bare-metal firmware kit (build-only until M2 brings up a real
 core):
