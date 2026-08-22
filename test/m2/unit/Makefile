@@ -17,6 +17,9 @@
 #   make -C test/m2/unit iu         # build the IU bench (plan Task 3.7)
 #   make -C test/m2/unit rtu        # build the RTU bench (plan Task 4.3)
 #   make -C test/m2/unit idu        # build the IDU bench (plan Task 5.6)
+#   make -C test/m2/unit dcache     # build the DCache bench (plan Task 6.4)
+#   make -C test/m2/unit mmu        # build the MMU bench (plan Task 6.4)
+#   make -C test/m2/unit lsu        # build the LSU bench (plan Task 6.4)
 #   make -C test/m2/unit run        # build and run every bench (UNIT-SUITE-PASS/FAIL)
 #   make -C test/m2/unit clean
 
@@ -29,7 +32,7 @@ VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
 BIN_DIR = $(ROOT)/bin/unit
 
 .PHONY: all run clean
-all: csr iu rtu idu
+all: csr iu rtu idu dcache mmu lsu
 
 #-----------------------------------------------------------------------------
 # CSR (plan task 2.2)
@@ -95,6 +98,57 @@ $(IDU_BIN): $(IDU_RTL) $(CURDIR)/idu_tb.cpp
 		-o $@ $(IDU_RTL) $(CURDIR)/idu_tb.cpp
 	$(MAKE) -C $(IDU_OBJ) -f VIDU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
 
+#-----------------------------------------------------------------------------
+# DCache (plan task 6.4)
+#-----------------------------------------------------------------------------
+DCACHE_OBJ = $(ROOT)/obj/unit/dcache
+DCACHE_BIN = $(BIN_DIR)/dcache_tb
+DCACHE_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v
+
+.PHONY: dcache
+dcache: $(DCACHE_BIN)
+
+$(DCACHE_BIN): $(DCACHE_RTL) $(CURDIR)/dcache_tb.cpp
+	@mkdir -p $(DCACHE_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module DCache --Mdir $(DCACHE_OBJ) \
+		-o $@ $(DCACHE_RTL) $(CURDIR)/dcache_tb.cpp
+	$(MAKE) -C $(DCACHE_OBJ) -f VDCache.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
+#-----------------------------------------------------------------------------
+# MMU (plan task 6.4)
+#-----------------------------------------------------------------------------
+MMU_OBJ = $(ROOT)/obj/unit/mmu
+MMU_BIN = $(BIN_DIR)/mmu_tb
+MMU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/MMU.v
+
+.PHONY: mmu
+mmu: $(MMU_BIN)
+
+$(MMU_BIN): $(MMU_RTL) $(CURDIR)/mmu_tb.cpp
+	@mkdir -p $(MMU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module MMU --Mdir $(MMU_OBJ) \
+		-o $@ $(MMU_RTL) $(CURDIR)/mmu_tb.cpp
+	$(MAKE) -C $(MMU_OBJ) -f VMMU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
+#-----------------------------------------------------------------------------
+# LSU (plan task 6.4) -- verilates LSU.v + the DCache.v it instantiates
+# internally + SRAM.v underneath that, exactly mirroring how RVProc.v will
+# eventually build it (DCache.v is instantiated INSIDE LSU.v, not at
+# RVProc.v's top level -- see DCache.v's own header).
+#-----------------------------------------------------------------------------
+LSU_OBJ = $(ROOT)/obj/unit/lsu
+LSU_BIN = $(BIN_DIR)/lsu_tb
+LSU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v $(ROOT)/rtl/LSU.v
+
+.PHONY: lsu
+lsu: $(LSU_BIN)
+
+$(LSU_BIN): $(LSU_RTL) $(CURDIR)/lsu_tb.cpp
+	@mkdir -p $(LSU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module LSU --Mdir $(LSU_OBJ) \
+		-o $@ $(LSU_RTL) $(CURDIR)/lsu_tb.cpp
+	$(MAKE) -C $(LSU_OBJ) -f VLSU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
 # Run EVERY bench even when one fails, then report -- a recipe line that
 # exits non-zero would otherwise abort the target and hide the benches
 # behind it, exactly backwards for a regression run (test/m1/unit/Makefile
@@ -105,8 +159,12 @@ run: all
 	$(IU_BIN) || rc=1; \
 	$(RTU_BIN) || rc=1; \
 	$(IDU_BIN) || rc=1; \
+	$(DCACHE_BIN) || rc=1; \
+	$(MMU_BIN) || rc=1; \
+	$(LSU_BIN) || rc=1; \
 	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
 	exit $$rc
 
 clean:
-	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN) $(ROOT)/obj/unit/idu $(IDU_BIN)
+	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN) $(ROOT)/obj/unit/idu $(IDU_BIN) \
+	       $(ROOT)/obj/unit/dcache $(DCACHE_BIN) $(ROOT)/obj/unit/mmu $(MMU_BIN) $(ROOT)/obj/unit/lsu $(LSU_BIN)

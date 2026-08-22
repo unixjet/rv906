@@ -211,9 +211,30 @@ parameter DCACHE_SIZE       = 32768;       // 32KB
 parameter DCACHE_WAYS       = 4;
 parameter DCACHE_LINE_BYTES = 64;
 parameter DCACHE_SETS       = 128;         // = 32KB / 4 ways / 64B
-parameter DCACHE_TAG_WIDTH  = 28;          // PA[39:12]
-parameter DCACHE_INDEX_W    = 7;           // log2(128 sets) -- PA[11:6], no
-                                            // VA[12] alias bit (contract 9)
+// TASK 6 DISCOVERED GAP, FIXED HERE (same "documented amendment, not silent"
+// discipline as CSR.v Task 2's/RTU.v Task 4's/IDU.v Task 5's own "discovered
+// gap" notes): the M2-Task-1-pinned values below (`DCACHE_TAG_WIDTH=28` with
+// the comment "PA[39:12]", `DCACHE_INDEX_W=7` with the comment "PA[11:6]")
+// cannot be simultaneously true -- PA[11:6] is only 6 bits, not 7, and
+// 28(tag)+7(index)+6(line-offset, 64B line) = 41 bits, one more than the
+// 40-bit PA (PC_WIDTH=40) this whole design uses everywhere else. This is a
+// carried-over consequence of the donor's OWN 128-"set" figure actually
+// counting BOTH VIPT-alias-bank halves together (LSU note A3: "index =
+// {VA[12] (alias bit), PA[11:6]} (7 bits)" -- each physical bank is only
+// 64 rows deep, addressed by the 6-bit PA[11:6]; VA[12] selects the bank,
+// not an extra index bit within one bank). Contract 9 already resolved M2
+// to a SINGLE 128-set x 4-way group with NO alias bank -- meaning M2's own
+// single group genuinely needs a full 7-bit index living entirely inside
+// the PA (no VA[12] bank-select bit to borrow), which only balances against
+// a 40-bit PA and a 6-bit (64B) line offset if the tag is 27 bits, not 28:
+// 27(tag)+7(index)+6(offset)=40, exact. Fixed here, before Task 6's DCache.v
+// becomes the first real consumer of either constant (confirmed via grep:
+// no other committed file referenced either constant before this commit) --
+// tag = PA[39:13] (27 bits), index = PA[12:6] (7 bits), line offset =
+// PA[5:0] (6 bits).
+parameter DCACHE_TAG_WIDTH  = 27;          // PA[39:13] (Task 6 fix, was 28/PA[39:12])
+parameter DCACHE_INDEX_W    = 7;           // PA[12:6] (Task 6 fix, was documented as
+                                            // PA[11:6]) -- no VA[12] alias bit (contract 9)
 
 //-----------------------------------------------------------------------------
 // M2: standard RISC-V M-mode CSR addresses (privileged ISA spec, not donor-
