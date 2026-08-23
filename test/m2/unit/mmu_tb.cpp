@@ -80,14 +80,14 @@ static void test_result(const char *name)
 }
 
 //=============================================================================
-// Helpers: an "address" here is a full 40-bit byte address. The ITLB port's
-// `ifu_mmu_va` is the VPN (addr >> 12), matching ICache.v's own convention
-// (icache.v drives `icache_rd_addr[63:12]`). The DTLB port's `lsu_mmu_va`
-// is the full BYTE VA (LSU.v drives `ag_addr[51:0]`) -- MMU.v extracts the
-// page number itself (va[39:12]). Feeding a VPN to the DTLB port here (as
-// an earlier draft of this bench did) would shift the page number a further
-// 12 bits down and silently break every check; the two ports' input
-// conventions are DIFFERENT, on purpose.
+// Helpers: an "address" here is a full 40-bit byte address. BOTH request
+// ports carry the PAGE NUMBER, not the byte address -- the I-side's
+// `ifu_mmu_va` is `icache_rd_addr[63:12]` (ICache.v's own convention,
+// confirmed against icache.v's ports) and the D-side's `lsu_mmu_va` is
+// `ag_pipe_addr[63:12]` (aq_lsu_ag.v:1566; LSU.v drives `ag_addr[63:12]`
+// since the 2026-08-23 donor-faithful fix). The response is likewise a page
+// number (`mmu_lsu_pa` is 28 bits, aq_lsu_ag.v:201), which the requester
+// reassembles into a full PA as `{pa_ppn, addr[11:0]}` (aq_lsu_ag.v:1446).
 //=============================================================================
 static inline uint64_t vpn_of(uint64_t addr) { return addr >> 12; }
 
@@ -98,7 +98,7 @@ struct DtlbResp {
 
 static DtlbResp query_dtlb(uint64_t addr, bool st_inst = false)
 {
-    dut->lsu_mmu_va        = addr;   // BYTE VA, per LSU.v's own driving
+    dut->lsu_mmu_va        = vpn_of(addr);   // PAGE NUMBER (aq_lsu_ag.v:1566), not the byte VA
     dut->lsu_mmu_va_vld    = 1;
     dut->lsu_mmu_priv_mode = 3;
     dut->lsu_mmu_st_inst   = st_inst ? 1 : 0;

@@ -143,19 +143,21 @@ static AxiDSlave g_slave;
 
 //-----------------------------------------------------------------------------
 // MMU stub: identity map + a simplified PMA rule matching contract 5's
-// shape (cacheable iff PA >= 0x8000_0000) -- lsu_mmu_va is the VPN (an
-// OUTPUT of LSU.v, already computed by AG), so this mirrors what a real
-// MMU.v would answer combinationally, same cycle.
+// shape (cacheable iff PA >= 0x8000_0000). `lsu_mmu_va` is the PAGE NUMBER
+// (LSU.v drives `ag_addr[63:12]`, exactly the donor's own split,
+// aq_lsu_ag.v:1566) -- the SAME convention the I-side uses -- so this
+// mirrors what a real MMU.v would answer combinationally, same cycle:
+// page in, page out, PMA attribute from the page-aligned PA.
 //-----------------------------------------------------------------------------
 static void drive_mmu(void)
 {
-    uint64_t va = dut->lsu_mmu_va;   // byte VA (LSU drives ag_addr[51:0])
-    // page number = va[39:12] -- must match rtl/MMU.v's D-side identity
-    // map (the ITLB port takes a VPN directly, but the DTLB port takes the
-    // full byte VA and extracts the page number itself).
-    dut->mmu_lsu_pa           = (uint32_t)((va >> 12) & 0x0FFFFFFFULL);
+    uint64_t ppn = dut->lsu_mmu_va;   // PAGE NUMBER (ag_addr[63:12]), not a byte VA
+    // Identity map: page in, page out (rtl/MMU.v D-side, donor aq_lsu_ag.v:201).
+    dut->mmu_lsu_pa           = (uint32_t)(ppn & 0x0FFFFFFFULL);
     dut->mmu_lsu_pa_vld       = 1;
-    bool cacheable            = (va >= 0x0000000080000000ULL);
+    // PMA cacheability: reconstruct the page-aligned PA and check the
+    // DRAM range (contract 5) -- mirrors pma_cacheable() in rtl/MMU.v.
+    bool cacheable            = ((ppn << 12) >= 0x0000000080000000ULL);
     dut->mmu_lsu_ca           = cacheable ? 1 : 0;
     dut->mmu_lsu_so           = cacheable ? 0 : 1;
     dut->mmu_lsu_buf          = cacheable ? 1 : 0;

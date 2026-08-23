@@ -31,13 +31,17 @@
 //    `mmu_lsu_*` ports exactly (this task's own LSU.v skeleton).
 //  * Stub behavior for BOTH ports (contract 2, implemented for real in
 //    Task 6, tied inactive here): `pa_vld=1` always, `pa[27:0]` = the
-//    identity-map page number (ITLB: the input IS the VPN, so
-//    `pa = ifu_mmu_va[27:0]`; DTLB: the input is the full BYTE VA, so
-//    `pa = lsu_mmu_va[39:12]` -- the two sides are NOT the same bit-slice,
-//    a discrepancy that silently truncated all of DRAM until lsu_tb.cpp's
-//    T4/T5 caught it), `page_fault=access_fault=0` always;
-//    `ca`/`so`/`buf`/`sec`/`sh` come from the PMA/sysmap lookup
-//    (contract 5), independent of the identity-map logic. The ITLB side's M1 protocol packs
+//    identity-map page number, and BOTH request inputs ARE page numbers
+//    (the I-side's `ifu_mmu_va` is `icache_rd_addr[63:12]`, the D-side's
+//    `lsu_mmu_va` is `ag_addr[63:12]` -- donor: aq_lsu_ag.v:1566), so the
+//    identity map is the same bit-slice on both sides: `pa =
+//    <port>_mmu_va[27:0]`. (An earlier draft of this file misread the
+//    D-side input as a byte VA and extracted `va[39:12]` here; a donor
+//    check found the page-number shift belongs in the requester, LSU.v --
+//    see LSU.v's own comment at its `lsu_mmu_va` assign. 2026-08-23.)
+//    `page_fault=access_fault=0` always; `ca`/`so`/`buf`/`sec`/`sh` come
+//    from the PMA/sysmap lookup (contract 5), independent of the
+//    identity-map logic. The ITLB side's M1 protocol packs
 //    cacheable/bufferable/secure into one 5-bit `prot` field instead of
 //    separate wires (ICache.v's own header note) -- this module must
 //    produce that same packed encoding for the ITLB port while producing
@@ -141,17 +145,18 @@ module MMU (
     wire _lsu_priv_unused = lsu_mmu_priv_mode[0] ^ lsu_mmu_priv_mode[1];
     wire _lsu_st_unused   = lsu_mmu_st_inst;   // no permission checks in M2 (bare M-mode)
 
-    // NOTE the asymmetry with the ITLB port above: `ifu_mmu_va` is the VPN
-    // (icache.v drives `icache_rd_addr[63:12]`), so `va[27:0]` there IS the
-    // page number. `lsu_mmu_va` is the full BYTE VA (LSU.v drives
-    // `ag_addr[51:0]`), so the page number is `va[39:12]` (== va >> 12) --
-    // using `va[27:0]` on this side would silently truncate every address
-    // above 256MB (i.e. ALL of DRAM at 0x8000_0000) to the wrong page, a
-    // bug found by lsu_tb.cpp's T4/T5 before it was wired into the SoC.
-    wire [MMU_PA_WIDTH-1:0] lsu_page_num = lsu_mmu_va[12 +: MMU_PA_WIDTH];  // va[39:12]
-    wire lsu_ca = pma_cacheable(lsu_page_num);
+    // `lsu_mmu_va` is the PAGE NUMBER, not the byte address -- the SAME
+    // convention as the ITLB port above (icache.v drives
+    // `icache_rd_addr[63:12]`). Donor proof: aq_lsu_ag.v:1566 `assign
+    // lsu_mmu_va[51:0] = ag_pipe_addr[63:12]`, response aq_lsu_ag.v:201
+    // `input [27:0] mmu_lsu_pa`, PA reassembled by the requester itself,
+    // aq_lsu_ag.v:1446 `ag_pipe_pa = {mmu_pa, ag_pipe_addr[11:0]}`. (An
+    // earlier revision of this file misread contract 2's "va[51:0]" as a
+    // byte VA and did the >>12 HERE; a donor check found LSU.v was the
+    // module that deviated, so the shift lives in LSU.v -- 2026-08-23.)
+    wire lsu_ca = pma_cacheable(lsu_mmu_va[MMU_PA_WIDTH-1:0]);
 
-    assign mmu_lsu_pa           = lsu_page_num;          // identity map
+    assign mmu_lsu_pa           = lsu_mmu_va[MMU_PA_WIDTH-1:0];   // identity map: page in, page out
     assign mmu_lsu_pa_vld       = 1'b1;                            // contract 2: never a miss
     assign mmu_lsu_ca           = lsu_ca;
     assign mmu_lsu_so           = !lsu_ca;

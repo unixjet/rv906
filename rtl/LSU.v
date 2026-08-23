@@ -302,7 +302,17 @@ module LSU #(
     // contract 3: `cp0_lsu_mm` is NEVER consulted here -- always trap.
     wire _cp0_lsu_mm_unused = cp0_lsu_mm;
 
-    assign lsu_mmu_va        = ag_addr[MMU_VA_WIDTH-1:0];
+    // The MMU request carries the PAGE NUMBER, not the byte address --
+    // exactly the donor's own split (aq_lsu_ag.v:1566: `lsu_mmu_va[51:0] =
+    // ag_pipe_addr[63:12]`), the SAME convention the I-side uses (ICache
+    // drives `icache_rd_addr[63:12]`). The MMU answers with the 28-bit
+    // physical page number (aq_lsu_ag.v:201: `input [27:0] mmu_lsu_pa`)
+    // and THIS module reassembles the full PA as {page number,
+    // addr[11:0]} (aq_lsu_ag.v:1446: `ag_pipe_pa = {mmu_pa,
+    // ag_pipe_addr[11:0]}`). An earlier draft drove the byte VA here and
+    // made the MMU do the >>12 -- observably equivalent but not
+    // clone-faithful; corrected against the donor 2026-08-23.
+    assign lsu_mmu_va        = ag_addr[12 +: MMU_VA_WIDTH];      // = ag_addr[63:12]
     assign lsu_mmu_va_vld    = ag_valid;
     assign lsu_mmu_priv_mode = 2'b11;          // M-mode always (M2 has no other level)
     assign lsu_mmu_st_inst   = ag_is_store;

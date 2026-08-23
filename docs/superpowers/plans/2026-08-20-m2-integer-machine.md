@@ -98,10 +98,18 @@ re-derives or contradicts them:**
 2. **MMU/DTLB stub interface (design doc §2.3.2), shared by IFU's ITLB port
    and LSU's DTLB port:** request `{va[51:0], va_vld, priv_mode, st_inst}`
    per port; response `{pa[27:0], pa_vld, ca, so, buf, sec, sh, page_fault,
-   access_fault}`. Stub behavior: `pa_vld=1` always; `pa[27:0]=va[27:0]`
-   (identity map); `page_fault=access_fault=0` always; `ca`/`so`/`buf`/
-   `sec`/`sh` come from the PMA/sysmap lookup (item 5 below), independent of
-   the identity-map logic.
+   access_fault}`. **`va` is the PAGE NUMBER (VPN), not the byte VA, on
+   BOTH ports** — exactly the donor's own split: the I-side's `ifu_mmu_va`
+   is `icache_rd_addr[63:12]` and the D-side's `lsu_mmu_va` is
+   `ag_pipe_addr[63:12]` (donor `aq_lsu_ag.v:1566`; `lsu_mmu_va` is a
+   52-bit *output* of the LSU, `aq_lsu_ag.v:271`). Likewise `pa[27:0]` is
+   the PHYSICAL PAGE NUMBER — the donor's `mmu_lsu_pa` is `input [27:0]`
+   (`aq_lsu_ag.v:201`) and the requester reassembles the full PA itself as
+   `{mmu_pa, addr[11:0]}` (`aq_lsu_ag.v:1446`). Stub behavior: `pa_vld=1`
+   always; `pa[27:0]=va[27:0]` (identity map on the page number);
+   `page_fault=access_fault=0` always; `ca`/`so`/`buf`/`sec`/`sh` come
+   from the PMA/sysmap lookup (item 5 below), independent of the
+   identity-map logic.
 3. **Misalignment: trap-only for M2, HW-split deferred.** AG detects
    misalignment combinationally exactly as C906 does and LSU always raises
    the misaligned-address exception (cause 4 load / 6 store) — the value of
