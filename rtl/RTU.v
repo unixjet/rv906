@@ -191,6 +191,9 @@ module RTU (
     input  wire [63:0]              iu_rtu_ex3_mul_data,
     input  wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex3_mul_preg,
     input  wire                     iu_rtu_ex3_mul_wb_vld,
+    // Task 7.3: completing-MULT length for the pcgen inst_len mux (tied 1
+    // upstream -- no 16-bit MULT in M2).
+    input  wire                     iu_rtu_ex1_mul_inst_len,
 
     input  wire                     iu_rtu_ex1_div_cmplt,
     input  wire                     iu_rtu_ex1_div_cmplt_dp,
@@ -198,6 +201,9 @@ module RTU (
     input  wire [GPR_IDX_WIDTH-1:0] iu_rtu_div_preg,
     input  wire                     iu_rtu_div_wb_dp,
     input  wire                     iu_rtu_div_wb_vld,
+    // Task 7.3: completing-DIV length for the pcgen inst_len mux (tied 1
+    // upstream -- no 16-bit DIV in M2).
+    input  wire                     iu_rtu_ex1_div_inst_len,
 
     //=========================================================================
     // RTU -> IU : the two writeback-race grants (IU note S0/S5/S6).
@@ -206,12 +212,27 @@ module RTU (
     output wire                     rtu_iu_div_wb_grant,
 
     //=========================================================================
+    // RTU -> IU : Task 7.3 PC-generator retire feedback (closes IU.v's
+    // documented "no rtu_iu_ex1_cmplt/_inst_split" scope gap). Donor
+    // aq_iu_bju.v:148-151 / aq_rtu_top.v:403-406:
+    //   rtu_iu_ex1_cmplt      = ctrl_ex1_cmplt_for_pcgen (aq_rtu_ctrl.v:240)
+    //   rtu_iu_ex1_inst_len   = dp_ex1_inst_len   (aq_rtu_dp.v:537)
+    //   rtu_iu_ex1_inst_split = dp_ex1_inst_split (aq_rtu_dp.v:537)
+    //=========================================================================
+    output wire                     rtu_iu_ex1_cmplt,
+    output wire                     rtu_iu_ex1_inst_len,
+    output wire                     rtu_iu_ex1_inst_split,
+
+    //=========================================================================
     // LSU -> RTU : lsu_rtu_t (design doc S4.2) -- see the header's LSU-
     // writeback-path resolution note. `lsu_rtu_ex2_dest_reg` is a Task 4
     // port amendment (see header).
     //=========================================================================
     input  wire                     lsu_rtu_ex1_cmplt,
     input  wire                     lsu_rtu_ex1_cmplt_dp,
+    // Task 7.3: completing-LSU length for the pcgen inst_len mux
+    // (donor aq_rtu_dp.v:367 lsu arm).
+    input  wire                     lsu_rtu_ex1_inst_len,
     input  wire [63:0]              lsu_rtu_wb_data,
     input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     input  wire                     lsu_rtu_wb_vld,
@@ -237,6 +258,9 @@ module RTU (
     // it, anticipating exactly this.
     //=========================================================================
     input  wire                     cp0_rtu_ex1_cmplt_dp,
+    // Task 7.3: completing-CP0 length for the pcgen inst_len mux
+    // (donor aq_rtu_dp.v:371 cp0 arm).
+    input  wire                     cp0_rtu_ex1_inst_len,
     input  wire [63:0]              cp0_rtu_ex1_wb_data,
     input  wire [GPR_IDX_WIDTH-1:0] cp0_rtu_ex1_wb_preg,
     input  wire                     cp0_rtu_ex1_wb_vld,
@@ -322,6 +346,55 @@ module RTU (
                                    ex1_div_cmplt_dp, ex1_lsu_cmplt_dp, ex1_cp0_cmplt_dp,
                                    ex1_vec_cmplt_dp};
     wire dp_ex1_cmplt_dp = |dp_cmplt_source;
+
+    //=========================================================================
+    // SECTION TASK 7.3 -- PC-generator retire feedback to IU (closes IU.v's
+    // documented "no rtu_iu_ex1_cmplt/_inst_split" scope gap). The donor
+    // (aq_rtu_dp.v:344-379,537; aq_rtu_ctrl.v:148-156,240) muxes the
+    // completing EU's inst_len/inst_split off this same one-hot vector and
+    // ORs the completion terms for the pcgen trigger. Bit order matches the
+    // concatenation above: {alu,mul,bju,div,lsu,cp0,vec} = bits {6..0}.
+    //=========================================================================
+    localparam [6:0] CBUS_ALU_SEL = 7'b1000000;
+    localparam [6:0] CBUS_MUL_SEL = 7'b0100000;
+    localparam [6:0] CBUS_BJU_SEL = 7'b0010000;
+    localparam [6:0] CBUS_DIV_SEL = 7'b0001000;
+    localparam [6:0] CBUS_LSU_SEL = 7'b0000100;
+    localparam [6:0] CBUS_CP0_SEL = 7'b0000010;
+    localparam [6:0] CBUS_VEC_SEL = 7'b0000001;
+
+    // rtu_iu_ex1_cmplt = the pcgen completion OR (donor
+    // ctrl_ex1_cmplt_for_pcgen, aq_rtu_ctrl.v:148-156). In the donor the LSU
+    // arm uses the special `lsu_rtu_ex1_cmplt_for_pcgen` (aq_lsu_ag.v:1675
+    // ag_pipe_cmplt_normal, which excludes PC-non-advancing ops); in M2 every
+    // LSU load/store advances the PC and a faulting access redirects through
+    // the higher-priority changeflow branch in IU's pcgen, so `dp_ex1_cmplt_
+    // dp` (which ORs lsu_rtu_ex1_cmplt_dp) is an exact stand-in. Re-verify if
+    // M2 ever adds a PC-non-advancing LSU op.
+    assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_dp;
+
+    // rtu_iu_ex1_inst_len = the COMPLETING instruction's length, muxed by
+    // the completing EU (donor aq_rtu_dp.v:350-379). ALU/BJU/LSU/CP0 carry
+    // real RVC-aware lengths; MULT/DIV/VEC are 32-bit-only in M2 (no 16-bit
+    // form in the RVC decoder) so they fall to the 1'b1 default.
+    reg rtu_iu_ex1_inst_len_r;
+    always @* begin
+        case (dp_cmplt_source)
+            CBUS_ALU_SEL: rtu_iu_ex1_inst_len_r = iu_rtu_ex1_alu_inst_len;
+            CBUS_BJU_SEL: rtu_iu_ex1_inst_len_r = iu_rtu_ex1_bju_inst_len;
+            CBUS_LSU_SEL: rtu_iu_ex1_inst_len_r = lsu_rtu_ex1_inst_len;
+            CBUS_CP0_SEL: rtu_iu_ex1_inst_len_r = cp0_rtu_ex1_inst_len;
+            default:      rtu_iu_ex1_inst_len_r = 1'b1;   // MULT/DIV/VEC: 32-bit
+        endcase
+    end
+    assign rtu_iu_ex1_inst_len = rtu_iu_ex1_inst_len_r;
+
+    // rtu_iu_ex1_inst_split = the completing instruction's split flag (donor
+    // aq_rtu_dp.v:537). No M2 producer sets inst_split (IU ties
+    // alu_inst_split=0; the other EUs have no split class), so this is
+    // structurally 0 and IU's pcgen advance gate (`!rtu_iu_ex1_inst_split`)
+    // is vacuous -- kept for structural fidelity to the donor.
+    assign rtu_iu_ex1_inst_split = 1'b0;
 
     // The donor's own PLAIN (non-`_dp`) completion family
     // (`iu_rtu_ex1_alu_cmplt`/`_mul_cmplt`/`_bju_cmplt`/`_div_cmplt`,
@@ -485,7 +558,11 @@ module RTU (
     wire [63:0] ex1_tval = ex1_lsu_cmplt_dp ? lsu_rtu_tval : 64'd0;   // CP0 has no tval port, see header
 
     reg        ex2_retire_vld;
-    reg [PC_WIDTH-1:0] ex2_cur_pc, ex2_next_pc;
+    // Task 7.2: ex2_cur_pc is public-marked for the verisim harness
+    // (rtl/verisim.h CPU_PC) -- it holds the PC of the instruction that
+    // just crossed EX1->EX2, i.e. the retiring instruction's PC.
+    reg [PC_WIDTH-1:0] ex2_cur_pc /* verilator public */;
+    reg [PC_WIDTH-1:0] ex2_next_pc;
     reg        ex2_inst_expt;
     reg [4:0]  ex2_expt_vec;
     reg [63:0] ex2_tval;

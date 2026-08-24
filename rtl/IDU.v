@@ -166,6 +166,12 @@ module IDU (
     output wire [1:0]               idu_iu_ex1_bht_pred,
     output wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src0_reg,
     output wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src1_reg,
+    // Task 7.3: the EX1 instruction's LENGTH (1 = 32-bit, 0 = 16-bit RVC),
+    // latched with the rest of the EX1 data. Donor ref: aq_iu_bju.v:127
+    // `input idu_iu_ex1_inst_len` (bju.v's PC-generator/writeback length
+    // source) and aq_idu_id_dp.v's ex1_t. Closes the IU.v header's
+    // documented "fixed +4" scope gap (see that file's Task 7.3 note).
+    output wire                     idu_iu_ex1_inst_len,
 
     //=========================================================================
     // IDU -> LSU : EX1 dispatch, LSU's slice of id_ex1_t (matches LSU.v's
@@ -181,6 +187,10 @@ module IDU (
     output wire [63:0]              idu_lsu_ex1_src2_data,
     output wire                     idu_lsu_ex1_src2_ready,
     output wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg,
+    // Task 7.3: EX1 instruction length (1=32b,0=16b) for the LSU slice --
+    // the completing-LSU-instruction length the RTU's pcgen inst_len mux
+    // needs (aq_rtu_dp.v:367 `dp_ex1_inst_len = lsu_rtu_ex1_inst_len`).
+    output wire                     idu_lsu_ex1_inst_len,
 
     //=========================================================================
     // IDU -> CSR : EX1 dispatch, CSR's slice of id_ex1_t (matches CSR.v's
@@ -193,6 +203,9 @@ module IDU (
     output wire [63:0]              idu_cp0_ex1_src0_data,
     output wire [63:0]              idu_cp0_ex1_src1_data,
     output wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg,
+    // Task 7.3: EX1 instruction length (1=32b,0=16b) for the CSR slice
+    // (c.ebreak is 16-bit). aq_rtu_dp.v:371 cp0 arm.
+    output wire                     idu_cp0_ex1_inst_len,
 
     //=========================================================================
     // RTU -> IDU : the exclusive bypass network (IDU note S6) + the 2
@@ -1029,15 +1042,24 @@ module IDU (
     //=========================================================================
     // SECTION GPR (IDU note S5.4, aq_idu_id_gpr.v/_gated_reg.v) -- 31-entry
     // gated register file + hardwired x0, 3 read ports, 2 write ports.
+    //
+    // Task 7.2: the array is declared [0:31] (not [1:31]) so that the
+    // architectural register number maps 1:1 onto the array index for
+    // the verisim harness (rtl/verisim.h CPU_GPR, restore-checklist item
+    // 1). x0's READ path is unchanged -- gpr_read() below still hardwires
+    // regnum==0 to 64'd0 -- and a writeback targeting x0 (rd=x0 is a
+    // RISC-V architectural no-op) lands in dead storage at gpr_r[0] that
+    // nothing ever reads. Behavior bit-identical; only the array shape
+    // and the public mark changed.
     //=========================================================================
-    reg [63:0] gpr_r [1:31];
+    reg [63:0] gpr_r [0:31] /* verilator public */;
 
     wire [31:0] gpr_wb0_oh = onehot32(rtu_idu_wb0_reg[4:0], rtu_idu_wb0_vld);
     wire [31:0] gpr_wb1_oh = onehot32(rtu_idu_wb1_reg[4:0], rtu_idu_wb1_vld);
 
     genvar gj;
     generate
-        for (gj = 1; gj <= 31; gj = gj + 1) begin : g_gpr
+        for (gj = 0; gj < 32; gj = gj + 1) begin : g_gpr
             // same-cycle wb0==wb1 collision on THIS register: no 2'b11 arm
             // exists (gated_reg.v:86-99 verbatim) -- the write is silently
             // DROPPED (register holds its old value), not merged/prioritized.
@@ -1166,6 +1188,11 @@ module IDU (
     reg [1:0]               ex1_bht_pred_r;
     reg [31:0]              ex1_opcode_r;
     reg                     ex1_illegal_r;
+    // Task 7.3: latched length of the EX1 instruction (1=32b,0=16b). Source
+    // is the combinational `is32` discriminator (line ~273), latched the
+    // same cycle the EX1 data registers load. Feeds idu_iu_ex1_inst_len /
+    // idu_lsu_ex1_inst_len / idu_cp0_ex1_inst_len below.
+    reg                     ex1_inst_len_r;
 
     // EX1 issue-gate stall terms (ctrl.v:669-692, M2-simplified per header:
     // no lsu_idu_global_full/cp0_idu_issue_stall ports exist).
@@ -1224,6 +1251,7 @@ module IDU (
             ex1_bht_pred_r  <= 2'd0;
             ex1_opcode_r    <= 32'd0;
             ex1_illegal_r   <= 1'b0;
+            ex1_inst_len_r  <= 1'b0;
         end else if (adv) begin
             ex1_func_r      <= dis_func;
             ex1_src0_data_r <= dis_src0_data; ex1_src0_rdy_r <= dis_src0_rdy; ex1_src0_reg_r <= dis_src0_reg5;
@@ -1233,6 +1261,7 @@ module IDU (
             ex1_bht_pred_r  <= ifu_idu_id_bht_pred;
             ex1_opcode_r    <= inst;
             ex1_illegal_r   <= dis_illegal;
+            ex1_inst_len_r  <= is32;
         end else begin
             if (lf0_hit) begin ex1_src0_data_r <= lf0_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src0_rdy_r <= 1'b1; end
             if (lf1_hit) begin ex1_src1_data_r <= lf1_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src1_rdy_r <= 1'b1; end
@@ -1270,6 +1299,7 @@ module IDU (
     assign idu_iu_ex1_bht_pred   = ex1_bht_pred_r;
     assign idu_iu_ex1_src0_reg   = {1'b0, ex1_src0_reg_r};
     assign idu_iu_ex1_src1_reg   = {1'b0, ex1_src1_reg_r};
+    assign idu_iu_ex1_inst_len   = ex1_inst_len_r;
 
     assign idu_lsu_ex1_func       = ex1_func_r;
     assign idu_lsu_ex1_src0_data  = ex1_src0_data_r;
@@ -1279,6 +1309,7 @@ module IDU (
     assign idu_lsu_ex1_src2_data  = ex1_src2_data_r;
     assign idu_lsu_ex1_src2_ready = ex1_src2_rdy_r;
     assign idu_lsu_ex1_dst0_reg   = {1'b0, ex1_dst0_reg_r};
+    assign idu_lsu_ex1_inst_len   = ex1_inst_len_r;
 
     assign idu_cp0_ex1_func      = ex1_func_r;
     assign idu_cp0_ex1_opcode    = ex1_opcode_r;
@@ -1286,6 +1317,7 @@ module IDU (
     assign idu_cp0_ex1_src0_data = ex1_src0_data_r;
     assign idu_cp0_ex1_src1_data = ex1_src1_data_r;
     assign idu_cp0_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};
+    assign idu_cp0_ex1_inst_len  = ex1_inst_len_r;
 
     //=========================================================================
     // SECTION FRONT-END STALL (ctrl.v:350-394, M2-simplified: no split FSM

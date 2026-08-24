@@ -92,6 +92,10 @@ module LSU #(
     input  wire [63:0]              idu_lsu_ex1_src2_data, // store data
     input  wire                     idu_lsu_ex1_src2_ready,
     input  wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg,  // load dest
+    // Task 7.3: the EX1 instruction's length (1=32b,0=16b RVC) for the LSU
+    // slice -- latched with the in-flight instruction, reported back to the
+    // RTU's pcgen inst_len mux (aq_rtu_dp.v:367 lsu arm).
+    input  wire                     idu_lsu_ex1_inst_len,
 
     //=========================================================================
     // LSU -> IDU : the single EX1 issue-gate stall signal (contract 8;
@@ -105,6 +109,9 @@ module LSU #(
     //=========================================================================
     output wire                     lsu_rtu_ex1_cmplt,
     output wire                     lsu_rtu_ex1_cmplt_dp,
+    // Task 7.3: the COMPLETING LSU instruction's length, for the RTU pcgen
+    // inst_len mux (donor aq_lsu_top.v:405 / aq_rtu_dp.v:367).
+    output wire                     lsu_rtu_ex1_inst_len,
     output wire [63:0]              lsu_rtu_wb_data,
     output wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     output wire                     lsu_rtu_wb_vld,
@@ -370,6 +377,9 @@ module LSU #(
     reg        dc_ca_r;             // "this transaction touches the array"
     reg        dc_misalign_r;
     reg [GPR_IDX_WIDTH-1:0] dc_dst0_reg_r;
+    // Task 7.3: length of the in-flight LSU instruction, latched on issue
+    // (1=32b,0=16b RVC); reported as lsu_rtu_ex1_inst_len at completion.
+    reg                     dc_inst_len_r;
     reg        dc_is_drain_r /* verilator public */;
     reg [1:0]  dc_drain_idx_r;
     reg        dc_wa_r;
@@ -509,6 +519,7 @@ module LSU #(
             dc_ca_r         <= 1'b0;
             dc_misalign_r   <= 1'b0;
             dc_dst0_reg_r   <= {GPR_IDX_WIDTH{1'b0}};
+            dc_inst_len_r   <= 1'b0;
             dc_is_drain_r   <= 1'b0;
             dc_drain_idx_r  <= 2'd0;
             dc_wa_r         <= 1'b0;
@@ -536,6 +547,7 @@ module LSU #(
                         dc_ca_r         <= mmu_lsu_ca;
                         dc_misalign_r   <= ag_misalign;
                         dc_dst0_reg_r   <= idu_lsu_ex1_dst0_reg;
+                        dc_inst_len_r   <= idu_lsu_ex1_inst_len;
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
                         dc_touched_array_r <= touches_array;
@@ -714,7 +726,10 @@ module LSU #(
                                     axi_w_active  <= 1'b1;
                                     axi_w_aw_sent <= 1'b0;
                                     axi_w_w_sent  <= 1'b0;
-                                    axi_w_addr_r  <= {dc_tag_r, dc_index_r, 6'b0};
+                                    // PA is PC_WIDTH bits (tag+index+6); zero-extend
+                                    // onto the wider 64-bit AXI bus (Task 7.3: full-
+                                    // stack lint, behavior unchanged).
+                                    axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
                                     axi_w_data_r  <= ({448'b0, (dc_is_drain_r ? stb_data[dc_drain_idx_r] : dc_store_data_r)})
                                                        << ({58'b0, (dc_is_drain_r ? stb_dw_off[dc_drain_idx_r] : dc_dw_off_r)} * 64);
                                     axi_w_strb_r  <= ({56'b0, (dc_is_drain_r ? stb_byte_vld[dc_drain_idx_r] : dc_byte_mask_r)})
@@ -723,7 +738,7 @@ module LSU #(
                                 end else begin
                                     axi_r_active  <= 1'b1;
                                     axi_r_ar_sent <= 1'b0;
-                                    axi_r_addr_r  <= {dc_tag_r, dc_index_r, 6'b0};
+                                    axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
                                     miss_state <= MS_DIRECT_READ;
                                 end
                             end else begin
@@ -741,7 +756,7 @@ module LSU #(
                                 axi_w_active  <= 1'b1;
                                 axi_w_aw_sent <= 1'b0;
                                 axi_w_w_sent  <= 1'b0;
-                                axi_w_addr_r  <= {u_dc_resp_victim_tag, dc_index_r, 6'b0};
+                                axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, dc_index_r, 6'b0};
                                 axi_w_data_r  <= u_dc_resp_rdata;
                                 axi_w_strb_r  <= 64'hFFFF_FFFF_FFFF_FFFF;
                                 miss_state <= MS_VB_WRITE;
@@ -754,7 +769,7 @@ module LSU #(
                                 axi_w_w_sent  <= 1'b0;
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
-                                axi_r_addr_r  <= {dc_tag_r, dc_index_r, 6'b0};
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
                                 miss_state <= MS_REFILL_READ;
                             end
                         end
@@ -762,7 +777,7 @@ module LSU #(
                             if (miss_state == MS_REFILL_READ && axi_r_active == 1'b0) begin
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
-                                axi_r_addr_r  <= {dc_tag_r, dc_index_r, 6'b0};
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
                             end else if (axi_r_data_hs) begin
                                 axi_r_active <= 1'b0;
                                 frz_rdata_r   <= axi_d_rdata;
@@ -874,10 +889,18 @@ module LSU #(
     wire [7:0]  stb_fwd_mask = stb_m0_rp ? stb_byte_vld[0] : stb_m1_rp ? stb_byte_vld[1]
                              : stb_m2_rp ? stb_byte_vld[2] : stb_m3_rp ? stb_byte_vld[3] : 8'd0;
     wire [63:0] stb_fwd_bits  = expand_byte_mask(stb_fwd_mask);
-    wire [63:0] raw_dword     = dc_rdata_r[({58'b0,dc_dw_off_r} * 64) +: 64];
+    // Task 7.3 width-hygiene: dword offset -> bit offset, computed at
+    // exactly 9 bits (the width this part-select's base requires; max
+    // 7*64 = 448) instead of the original formally-122-bit product.
+    wire [8:0]  dc_dword_bitoff = {6'b0, dc_dw_off_r} << 6;
+    wire [63:0] raw_dword       = dc_rdata_r[dc_dword_bitoff +: 64];
     wire [63:0] merged_dword  = (stb_fwd_bits & stb_fwd_data) | (~stb_fwd_bits & raw_dword);
 
-    wire [63:0] rotated = ({merged_dword, merged_dword} >> ({61'b0, dc_byte_off_r} * 8));
+    // Rotate-by-byte via the double-width-shift idiom; the explicit [63:0]
+    // is the same slice the 128->64 assignment took implicitly (Task 7.3).
+    wire [127:0] merged2     = {merged_dword, merged_dword};
+    wire [127:0] merged2_rsh = merged2 >> ({61'b0, dc_byte_off_r} * 8);
+    wire [63:0] rotated     = merged2_rsh[63:0];
 
     reg [63:0] da_final;
     always @* begin
@@ -968,6 +991,9 @@ module LSU #(
 
     assign lsu_rtu_ex1_cmplt_dp   = (state == ST_REPLY) && reply_can_complete && !dc_is_drain_r;
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
+    // Task 7.3: the completing LSU instruction's length (drains excluded by
+    // the same !dc_is_drain_r the cmplt above already applies).
+    assign lsu_rtu_ex1_inst_len   = dc_inst_len_r;
 
     assign lsu_rtu_wb_vld  = reply_is_load && !reply_is_misalign;
     assign lsu_rtu_wb_data = da_final;

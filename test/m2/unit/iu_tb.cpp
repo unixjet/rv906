@@ -119,6 +119,7 @@ static void tie_idle_inputs(void) {
     dut->idu_iu_ex1_src2_data   = 0;
     dut->idu_iu_ex1_src2_ready  = 1;
     dut->idu_iu_ex1_dst0_reg    = 0;
+    dut->idu_iu_ex1_inst_len    = 1;   // 32-bit by default; this bench tests 32-bit decodes (RVC cases override to 0)
     dut->idu_iu_ex1_bht_pred    = 0;
     dut->idu_iu_ex1_src0_reg    = 0;
     dut->idu_iu_ex1_src1_reg    = 0;
@@ -323,8 +324,9 @@ struct BjuResult {
 
 static BjuResult bju_op(uint32_t func, bool br_sel, uint64_t src0, uint64_t src1,
                          uint64_t src2, unsigned src0_reg, unsigned src1_reg,
-                         unsigned dst_reg, unsigned bht_pred) {
+                         unsigned dst_reg, unsigned bht_pred, unsigned inst_len = 1) {
     tie_idle_inputs();
+    dut->idu_iu_ex1_inst_len   = inst_len;   // RVC-aware link/next-pc (1=32-bit, 0=16-bit)
     dut->idu_iu_ex1_inst_vld   = 1;
     dut->idu_iu_ex1_bju_sel    = 1;
     dut->idu_iu_ex1_bju_br_sel = br_sel ? 1 : 0;
@@ -733,12 +735,22 @@ static void test_bju_cond_branch_matrix(void) {
 }
 
 static void test_bju_jal_jalr_auipc(void) {
-    // JAL: dst=x1 -> link_vld; wb_data == pc+4 (fixed-32-bit assumption).
-    BjuResult r = bju_op(BJU_FUNC_JAL, false, 0, 0, 0x100, 0, 0, /*dst=*/1, 0);
+    // JAL (32-bit): dst=x1 -> link_vld; the link (wb_data) == pc+4. The PC
+    // increment is now RVC-aware (Task 7, donor aq_iu_bju.v:576-583): the
+    // link advances by the DISPATCHED instruction's real length, so a
+    // 32-bit JAL links to pc+4 and a 16-bit c.jal links to pc+2.
+    BjuResult r = bju_op(BJU_FUNC_JAL, false, 0, 0, 0x100, 0, 0, /*dst=*/1, 0, /*inst_len=*/1);
     check(r.link_vld, "JAL rd=x1: link_vld asserted");
-    check(r.wb_vld && r.wb_data == r.cur_pc + 4, "JAL: writes back pc+4 (link address)",
+    check(r.wb_vld && r.wb_data == r.cur_pc + 4, "JAL (32-bit): writes back pc+4 (link address)",
           r.wb_data, r.cur_pc + 4);
     check(r.next_pc == ((r.cur_pc + 0x100) & PC_MASK), "JAL: next_pc == pc+offset");
+
+    // c.jal (16-bit): the same unconditional-jump link path, but the RVC-aware
+    // increment advances by 2 -- link == pc+2. (Drives the shared JAL link
+    // path with inst_len=0; the length, not the function code, selects +2.)
+    r = bju_op(BJU_FUNC_JAL, false, 0, 0, 0x100, 0, 0, /*dst=*/1, 0, /*inst_len=*/0);
+    check(r.wb_vld && r.wb_data == r.cur_pc + 2, "c.jal (16-bit): writes back pc+2 (RVC-aware link)",
+          r.wb_data, r.cur_pc + 2);
 
     // JALR rs1=x1, rd!=x1 -> a real return (ret_vld).
     r = bju_op(BJU_FUNC_JALR, false, 0x80009000ULL, 0, 0, /*src0_reg=*/1, 0, /*dst=*/5, 0);

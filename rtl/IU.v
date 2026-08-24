@@ -81,24 +81,25 @@
 // Task 7), so this amendment breaks nothing today -- exactly the same
 // "nothing consumes this port today" reasoning CSR.v's Task 2 note used.
 //
-// KNOWN, DOCUMENTED SCOPE GAPS this task's frozen port list could not close
-// (flagged for whichever later task needs to revisit them, not silently
-// worked around):
-//   - No `idu_iu_ex1_inst_len` input exists anywhere on this port list, so
-//     BJU's self-tracked PC (`bju_pcgen_pc`) cannot distinguish a 16-bit
-//     RVC instruction from a 32-bit one; it assumes a FIXED +4 advance.
-//     `iu_rtu_ex1_alu_inst_len`/`_bju_inst_len` are tied to the "32-bit"
-//     encoding (1'b1) to match. Task 5 (IDU's native RVC decode, contract
-//     14) almost certainly needs to add this port, mirroring this file's
-//     own port-amendment precedent above -- flagged prominently in the
-//     Task 3 completion report, not left implicit.
-//   - No `rtu_iu_ex1_cmplt`/`_inst_split` (RTU retire feedback) or
-//     `rtu_iu_ex2_cur_pc`/`_next_pc` input exists (RTU.v itself has no real
-//     body until Task 4). `bju_pcgen_pc` therefore advances whenever
-//     `idu_iu_ex1_inst_vld` is asserted (or the BJU entry pops), a
-//     reasonable stand-in given IDU is expected (once Task 5 builds it) to
-//     only ever present a genuinely-new/continuing dispatch on this bus --
-//     re-verify this exact assumption once RTU's real retire timing exists.
+// RESOLVED in Task 7.3 (the core-swap integration, which finally gave the
+// pipeline a real RTU retire timing to re-verify against -- the trigger the
+// Task 3 note asked for):
+//   - `idu_iu_ex1_inst_len` (1=32b/0=16b RVC) is now a real IDU->IU input,
+//     and BJU's PC increment is RVC-aware (`bju_inc_pc_live`/`bju_inc_pc_rt`,
+//     aq_iu_bju.v:576-583). `iu_rtu_ex1_{alu,bju}_inst_len` now report the
+//     real completing length (was tied to the "32-bit" encoding 1'b1).
+//   - `rtu_iu_ex1_cmplt`/`_inst_len`/`_inst_split` (RTU retire feedback) are
+//     now real RTU->IU inputs. `bju_pcgen_pc` advances on
+//     `rtu_iu_ex1_cmplt && !rtu_iu_ex1_inst_split` (donor aq_iu_bju.v:696-697),
+//     NOT the dispatch-side `idu_iu_ex1_inst_vld` stand-in -- that stand-in
+//     was observed to over-advance the tracker ~91 instructions in RVC-mixed
+//     code and self-pin it (see the PC-generator comment). `_inst_split` is
+//     tied 0 in M2 (no split classes reach an EU); `_inst_len` is the
+//     completing EU's length muxed in the RTU (aq_rtu_dp.v:350-379).
+// Still OPEN scope gaps on this port list:
+//   - No `rtu_iu_ex2_cur_pc`/`_next_pc` input (the donor's parked-entry
+//     bht/hpcp recompute, aq_iu_bju.v:702-703) -- not needed by any M2
+//     consumer.
 //   - No `ifu_iu_ex1_pc_pred` input exists (the RAS-predicted-target BJU
 //     would compare a JALR-return's real target against). The JALR-vs-RAS
 //     mismatch path (`bju_pc_cmp_fail`/`bju_ras_mispred_vld`) is therefore
@@ -171,6 +172,11 @@ module IU (
     input  wire [1:0]               idu_iu_ex1_bht_pred,
     input  wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src0_reg,
     input  wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src1_reg,
+    // Task 7.3 port-list amendment (closes the header's "fixed +4" scope
+    // gap): the EX1 instruction's LENGTH (1=32-bit, 0=16-bit RVC), latched
+    // in IDU's EX1. Drives BJU's RVC-aware PC increment and the real
+    // iu_rtu_ex1_{alu,bju}_inst_len. Donor ref: aq_iu_bju.v:127.
+    input  wire                     idu_iu_ex1_inst_len,
 
     //=========================================================================
     // IU -> IDU : point-to-point stall/full signals (contract 8; confirmed
@@ -219,6 +225,11 @@ module IU (
     output wire [63:0]              iu_rtu_ex3_mul_data,
     output wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex3_mul_preg,
     output wire                     iu_rtu_ex3_mul_wb_vld,
+    // Task 7.3: completing-MULT length for the RTU pcgen inst_len mux.
+    // Tied 1 (32-bit): M2's RVC decoder (IDU.v) never emits a 16-bit
+    // MULT (no c.mul in the d16_eu table), so a MULT completion is always
+    // a 32-bit instruction.
+    output wire                     iu_rtu_ex1_mul_inst_len,
 
     // DIV (EX1 early-accept, variable-EX-stage data/writeback -- gated on
     // rtu_iu_div_wb_grant, IU note S6/S10).
@@ -228,6 +239,9 @@ module IU (
     output wire [GPR_IDX_WIDTH-1:0] iu_rtu_div_preg,
     output wire                     iu_rtu_div_wb_dp,
     output wire                     iu_rtu_div_wb_vld,
+    // Task 7.3: completing-DIV length for the RTU pcgen inst_len mux.
+    // Tied 1 (32-bit): no 16-bit DIV in M2's RVC decoder.
+    output wire                     iu_rtu_ex1_div_inst_len,
 
     //=========================================================================
     // RTU -> IU : the single-bit writeback-race grants for MULT/DIV -- RTU
@@ -236,6 +250,25 @@ module IU (
     //=========================================================================
     input  wire                     rtu_iu_mul_wb_grant,
     input  wire                     rtu_iu_div_wb_grant,
+
+    //=========================================================================
+    // RTU -> IU : Task 7.3 PC-generator retire feedback (closes the header's
+    // "no rtu_iu_ex1_cmplt/_inst_split" scope gap). The donor's bju.v
+    // (aq_iu_bju.v:148-151) advances its PC generator only on a genuine
+    // RTU-confirmed EX1 completion of the completing instruction's length,
+    // NOT on the dispatch-side idu_iu_ex1_inst_vld our Task 3 stand-in used.
+    //   - rtu_iu_ex1_cmplt : the completing-EU OR (donor aq_rtu_ctrl.v:240
+    //     ctrl_ex1_cmplt_for_pcgen).
+    //   - rtu_iu_ex1_inst_len : the COMPLETING instruction's length (donor
+    //     aq_rtu_dp.v:537 rtu_iu_ex1_inst_len = dp_ex1_inst_len) -- drives the
+    //     RVC-aware +2/+4 PC increment (aq_iu_bju.v:581).
+    //   - rtu_iu_ex1_inst_split : the completing instruction's split flag
+    //     (aq_rtu_dp.v:537); gates the advance. Tied 0 in M2 (no split
+    //     classes reach an EU -- see RTU.v note), so the gate is vacuous.
+    //=========================================================================
+    input  wire                     rtu_iu_ex1_cmplt,
+    input  wire                     rtu_iu_ex1_inst_len,
+    input  wire                     rtu_iu_ex1_inst_split,
 
     //=========================================================================
     // Already-frozen-since-M1 IFU-facing BJU ports, reused UNCHANGED --
@@ -484,7 +517,7 @@ module IU (
     assign iu_rtu_ex1_alu_cmplt      = alu_active;
     assign iu_rtu_ex1_alu_cmplt_dp   = alu_active;
     assign iu_rtu_ex1_alu_data       = alu_result;
-    assign iu_rtu_ex1_alu_inst_len   = 1'b1;   // fixed 32-bit assumption, see header
+    assign iu_rtu_ex1_alu_inst_len   = idu_iu_ex1_inst_len; // Task 7.3: real RVC-aware length (was fixed 1'b1)
     assign iu_rtu_ex1_alu_inst_split = 1'b0;   // no split-instruction classes reach ALU in M2
     assign iu_rtu_ex1_alu_preg       = idu_iu_ex1_dst0_reg;
     assign iu_rtu_ex1_alu_wb_dp      = alu_active;
@@ -521,6 +554,11 @@ module IU (
     reg  [1:0]                 bju_entry_bht_pred_r;
     reg  [PC_WIDTH-1:0]        bju_entry_target_r, bju_entry_inc_pc_r, bju_entry_not_pred_pc_r;
     reg  [GPR_IDX_WIDTH-1:0]   bju_entry_src0_reg_r, bju_entry_src1_reg_r;
+    // Task 7.3: the length of the branch PARKED in the entry (donor
+    // aq_iu_bju.v:208 bju_inst_len_flop). Latched at entry creation; selects
+    // the parked-entry length over the live one when the entry is resolving
+    // (aq_iu_bju.v:806).
+    reg                        bju_inst_len_flop;
 
     wire bju_src0_missing = idu_iu_ex1_bju_br_sel && !idu_iu_ex1_src0_ready;
     wire bju_src1_missing = idu_iu_ex1_bju_br_sel && !idu_iu_ex1_src1_ready;
@@ -591,7 +629,20 @@ module IU (
     // matches the donor's own AG independence from the entry-pending path.
     // -----------------------------------------------------------------
     wire [PC_WIDTH-1:0] bju_pc_now     = bju_pcgen_pc;
-    wire [PC_WIDTH-1:0] bju_inc_pc_now = bju_pc_now + {{(PC_WIDTH-3){1'b0}}, 3'd4};
+    // Task 7.3: RVC-aware PC increments (donor aq_iu_bju.v:576-583). The old
+    // +4-only increment assumed every instruction is 32-bit; with RVC in
+    // scope (the M2 bring-up ladder's RVC-mix stream) a 16-bit instruction
+    // must advance the PC by 2, not 4. Two variants, mirroring the donor's
+    // separate `bju_inc_pc_wb_data` (live) and `bju_inc_pc_ext` (rtu):
+    //   - bju_inc_pc_live : the DISPATCHED instruction's length (live), for
+    //     the JAL writeback link + the not-predicted-PC / entry-inc latch.
+    //   - bju_inc_pc_rt   : the COMPLETING instruction's length (RTU
+    //     feedback rtu_iu_ex1_inst_len), for the PC generator's advance.
+    // Addends sized to PC_WIDTH (avoid WIDTHEXPAND); 16-bit -> +2, 32-bit -> +4.
+    localparam [PC_WIDTH-1:0] PC_INC16 = {{(PC_WIDTH-3){1'b0}}, 3'd2};
+    localparam [PC_WIDTH-1:0] PC_INC32 = {{(PC_WIDTH-3){1'b0}}, 3'd4};
+    wire [PC_WIDTH-1:0] bju_inc_pc_live = bju_pc_now + (idu_iu_ex1_inst_len ? PC_INC32 : PC_INC16);
+    wire [PC_WIDTH-1:0] bju_inc_pc_rt   = bju_pc_now + (rtu_iu_ex1_inst_len  ? PC_INC32 : PC_INC16);
 
     wire [63:0] ag_rs1_live = bju_is_jalr_live ? idu_iu_ex1_src0_data
                                                 : {{(64-PC_WIDTH){1'b0}}, bju_pc_now};
@@ -599,7 +650,7 @@ module IU (
     wire [63:0] ag_result_live = ag_rs1_live + ag_rs2_live;
     wire [PC_WIDTH-1:0] bju_target_now = ag_result_live[PC_WIDTH-1:0];
     wire [PC_WIDTH-1:0] bju_not_pred_pc_now =
-        idu_iu_ex1_bht_pred[1] ? bju_inc_pc_now : bju_target_now;
+        idu_iu_ex1_bht_pred[1] ? bju_inc_pc_live : bju_target_now;
 
     // Entry data capture (create: latch fresh values; otherwise: absorb a
     // matching forward into whichever slot(s) it satisfies).
@@ -610,10 +661,11 @@ module IU (
             bju_entry_func_r        <= idu_iu_ex1_func;
             bju_entry_bht_pred_r    <= idu_iu_ex1_bht_pred;
             bju_entry_target_r      <= bju_target_now;
-            bju_entry_inc_pc_r      <= bju_inc_pc_now;
+            bju_entry_inc_pc_r      <= bju_inc_pc_live;
             bju_entry_not_pred_pc_r <= bju_not_pred_pc_now;
             bju_entry_src0_reg_r    <= idu_iu_ex1_src0_reg;
             bju_entry_src1_reg_r    <= idu_iu_ex1_src1_reg;
+            bju_inst_len_flop       <= idu_iu_ex1_inst_len;
         end
         else if (bju_entry_vld_r) begin
             if (bju_da_hit0)
@@ -636,7 +688,7 @@ module IU (
     wire [63:0] bju_cmp_src1 = bju_entry_vld_r ? bju_entry_src1_r : idu_iu_ex1_src1_data;
     wire [1:0]  bju_bht_pred_sel = bju_entry_vld_r ? bju_entry_bht_pred_r : idu_iu_ex1_bht_pred;
     wire [PC_WIDTH-1:0] bju_target_pc  = bju_entry_vld_r ? bju_entry_target_r      : bju_target_now;
-    wire [PC_WIDTH-1:0] bju_inc_pc     = bju_entry_vld_r ? bju_entry_inc_pc_r      : bju_inc_pc_now;
+    wire [PC_WIDTH-1:0] bju_inc_pc     = bju_entry_vld_r ? bju_entry_inc_pc_r      : bju_inc_pc_rt;
     wire [PC_WIDTH-1:0] bju_not_pred_pc = bju_entry_vld_r ? bju_entry_not_pred_pc_r : bju_not_pred_pc_now;
 
     wire bju_cmp_is_beq  = (bju_func_sel == BJU_FUNC_BEQ);
@@ -699,21 +751,45 @@ module IU (
     assign iu_ifu_ret_vld     = bju_resolves_now && bju_ret_vld_raw;
 
     // -----------------------------------------------------------------
-    // BJU's own PC copy (IU note S4.5, restore-checklist item 4): reset
-    // from cp0_xx_mrvbr, redirected on ifu_iu_chgflw_vld (RTU/exception,
-    // highest priority), else advanced whenever a dispatch resolves this
-    // cycle (see header's documented stand-in for the missing RTU-commit
-    // feedback).
+    // BJU's own PC copy (IU note S4.5, restore-checklist item 4).
+    //
+    // TASK 7.3 -- the Task 3 stand-in is RETIRED. The old advance condition
+    // (`bju_advances_pc = idu_iu_ex1_inst_vld || bju_entry_pop`, a dispatch-
+    // side proxy) advanced the tracker every cycle EX1 held a valid
+    // instruction, and the increment was a fixed +4 -- together they drove
+    // the self-tracked PC ~91 instructions PAST the true retire PC in
+    // RVC-mixed code, where it self-pinned (the sentinel `jal x0` recomputes
+    // its target from the already-wrong PC). This is exactly the failure the
+    // header's "re-verify this exact assumption once RTU's real retire
+    // timing exists" note predicted.
+    //
+    // Donor-faithful mechanism (aq_iu_bju.v:680-700, the "PC Generator"
+    // always block): a priority mux that advances the tracker ONLY on a
+    // genuine RTU-confirmed EX1 completion of the completing instruction's
+    // length (`rtu_iu_ex1_cmplt && !rtu_iu_ex1_inst_split`), redirecting on
+    // the RTU changeflow (`ifu_iu_chgflw_vld`, highest non-reset priority)
+    // and seeding from `cp0_xx_mrvbr` at reset. The advance VALUE is
+    // `bju_next_pc` (line ~705), whose non-taken term is now the RVC-aware
+    // `bju_inc_pc_rt` (aq_iu_bju.v:576-583,581).
+    //
+    // Out of scope here (documented, matches the header's RAS note): the
+    // donor's 3rd branch `bju_not_ex1_chgflw` (aq_iu_bju.v:687-691) -- the
+    // parked-entry/BHT-mispred and RAS-mispred fast-redirect. Our M2 does not
+    // build the RAS path (`ifu_iu_ex1_pc_pred` absent, `iu_rtu_ex2_bju_ras_
+    // mispred` tied 0), and a mispredict's redirect still reaches this
+    // register through the higher-priority changeflow branch (the RTU flush
+    // drives `ifu_iu_chgflw_vld`). Re-verify in the Task 9 mispredict
+    // bring-up test if a parked-entry BHT mispredict is observed to leave the
+    // tracker stale.
     // -----------------------------------------------------------------
     reg [PC_WIDTH-1:0] bju_pcgen_pc;
-    wire bju_advances_pc = idu_iu_ex1_inst_vld || bju_entry_pop;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             bju_pcgen_pc <= cp0_xx_mrvbr;
         else if (ifu_iu_chgflw_vld)
             bju_pcgen_pc <= ifu_iu_chgflw_pc;
-        else if (bju_advances_pc)
+        else if (rtu_iu_ex1_cmplt && !rtu_iu_ex1_inst_split)
             bju_pcgen_pc <= bju_next_pc;
     end
 
@@ -731,13 +807,13 @@ module IU (
     wire bju_writes_reg = (bju_uncond_sel || (bju_is_auipc_live && !bju_entry_vld_r))
                         && idu_iu_ex1_bju_sel;
     wire [63:0] bju_wb_data = bju_uncond_sel
-                            ? {{(64-PC_WIDTH){1'b0}}, bju_inc_pc_now}
+                            ? {{(64-PC_WIDTH){1'b0}}, bju_inc_pc_live}
                             : ag_result_live;
 
     assign iu_rtu_ex1_bju_cmplt            = bju_resolves_now;
     assign iu_rtu_ex1_bju_cmplt_dp         = bju_resolves_now;
     assign iu_rtu_ex1_bju_data             = bju_wb_data;
-    assign iu_rtu_ex1_bju_inst_len         = 1'b1;   // fixed 32-bit assumption, see header
+    assign iu_rtu_ex1_bju_inst_len         = bju_entry_vld_r ? bju_inst_len_flop : idu_iu_ex1_inst_len; // Task 7.3 (donor aq_iu_bju.v:806)
     assign iu_rtu_ex1_bju_preg             = idu_iu_ex1_dst0_reg;
     assign iu_rtu_ex1_bju_wb_dp            = bju_writes_reg;
     assign iu_rtu_ex1_bju_wb_vld           = bju_writes_reg;
@@ -855,6 +931,9 @@ module IU (
 
     assign iu_rtu_ex1_mul_cmplt    = idu_iu_ex1_mult_sel && mul_is_final_pass;
     assign iu_rtu_ex1_mul_cmplt_dp = idu_iu_ex1_mult_sel && mul_is_final_pass;
+    // Task 7.3: completing-MULT length. Tied 1 (32-bit) -- M2's RVC decoder
+    // has no 16-bit MULT (see the port-list note).
+    assign iu_rtu_ex1_mul_inst_len = 1'b1;
     assign iu_rtu_ex3_mul_wb_vld   = mul_ex3_valid;
     assign iu_rtu_ex3_mul_data     = mul_ex3_data;
     assign iu_rtu_ex3_mul_preg     = mul_ex3_preg;
@@ -1078,6 +1157,9 @@ module IU (
 
     assign iu_rtu_ex1_div_cmplt    = idu_iu_ex1_div_sel;
     assign iu_rtu_ex1_div_cmplt_dp = idu_iu_ex1_div_sel;
+    // Task 7.3: completing-DIV length. Tied 1 (32-bit) -- no 16-bit DIV in
+    // M2's RVC decoder (see the port-list note).
+    assign iu_rtu_ex1_div_inst_len = 1'b1;
     assign iu_rtu_div_wb_dp      = div_wb_now;
     assign iu_rtu_div_wb_vld     = div_wb_now;
     assign iu_rtu_div_preg       = div_cmplt_now ? idu_iu_ex1_dst0_reg : div_preg_reg;

@@ -62,67 +62,53 @@ int RVProcAXI_Verilator(AXI4L::BUS<NUM_MASTERS, NUM_SLAVES> *axi_bus, IO_PINS *i
     do{dut.init(initial_pc, initial_sp, dtb_addr); dut.sync(cpu);}while(0)
 
 //=============================================================================
-// M1 FetchSink accessors (rtl/verisim.h) -- plan Task 5.2
+// M1 FetchSink accessors -- RETIRED in Task 7 (FetchSink.v deleted)
 //=============================================================================
-// EVERY use of the M1_* macros has to be compiled HERE, above the
-// `#define RVProcAXI RVProcAXI_Verilator` below: the macros reach the sink
-// through `rootp->RVProcAXI->u_core->u_fetchsink`, and that define would
-// rewrite the member name mid-chain if it were already active.
+// These functions used to poke/sample FetchSink's harness config bank and
+// committed-stream registers through the (now removed) rtl/verisim.h
+// M1_* macros. The real core has no such registers: the config bank is
+// CSR.v's MHCR (written by the test program itself via CSRS, not poked by
+// the harness), and the committed stream is RTU's per-retire trace, which
+// Task 8 re-exports (contract 13). Per Task 7.2's bar ("compiles and
+// links; dead M1 paths neutralized with a pointer at Task 8"), the
+// functions below are NEUTRALIZED -- no-ops and constant returns -- and
+// the M1 test bodies that consumed them (the online committed-stream
+// checker, see TB::term()/TB::sample_commit()) are disabled below. Task
+// 8 replaces this whole namespace with the real retire-trace accessors.
 namespace m1sink {
 
-// Config bank (plan "Global contracts": harness config mechanism). Poked
-// once after dut.init() and before the first step. These registers have no
-// RTL driver (rtl/FetchSink.v SECTION CONFIG BANK), so whatever is written
-// here stays written for the rest of the run.
-//   --m1-rung=<1..4>: 1=all predictors off, 2=+RAS, 3=+BTB, 4=+BHT (spec
-//   S4.3's ladder; cumulative, matching cfg_ras_en/cfg_btb_en/cfg_bht_en's
-//   ordering in rtl/verisim.h).
+// Config bank: no RTL target exists anymore (it was FetchSink's; the real
+// bank is CSR.v's MHCR). No-op; Task 8 owns any harness-side config.
 static void poke_cfg(int rung, bool sink_stall, uint32_t max_insts)
 {
-    M1_CFG_ICACHE_EN(dut.vdut)      = 1;   // the cache is not a rung of the ladder
-    M1_CFG_IWPE(dut.vdut)           = 0;   // stays 0 in M1 (rtl/verisim.h)
-    M1_CFG_ICACHE_PREF_EN(dut.vdut) = 0;   // not exercised by this task
-    M1_CFG_RAS_EN(dut.vdut)         = (rung >= 2);
-    M1_CFG_BTB_EN(dut.vdut)         = (rung >= 3);
-    M1_CFG_BHT_EN(dut.vdut)         = (rung >= 4);
-    M1_CFG_ICACHE_INV(dut.vdut)     = 0;
-    M1_CFG_BHT_INV(dut.vdut)        = 0;
-    M1_CFG_BTB_CLR(dut.vdut)        = 0;
-    M1_CFG_SINK_STALL(dut.vdut)     = sink_stall ? 1 : 0;
-    M1_CFG_MAX_INSTS(dut.vdut)      = max_insts;
+    (void) rung; (void) sink_stall; (void) max_insts;
 }
 
-// --inv-test: pulse one of {bht, btb} at a time. which==0 -> cfg_bht_inv,
-// which==1 -> cfg_btb_clr; any other value (-1) drops both (used to clear a
-// pulse the cycle after it was raised -- both bits are level-sensitive
-// requests, not edge-triggered, per rtl/verisim.h's note on rising-edge
-// detection living on the CONSUMER side).
+// --inv-test pulse: no RTL target (it was FetchSink's cfg_bht_inv /
+// cfg_btb_clr passthroughs; the real BPU config is CSR.v's MHCR). No-op.
 static void set_inv(int which)
 {
-    M1_CFG_BHT_INV(dut.vdut) = (which == 0);
-    M1_CFG_BTB_CLR(dut.vdut) = (which == 1);
+    (void) which;
 }
 
-// --fencei-patch (Task 6): pulse the ICache's own invalidate-all request for
-// one cycle. Same level-sensitive/rising-edge-detected convention as the
-// bht/btb bits above (ICache.v SECTION INVALIDATE: `inv_req_rise =
-// cp0_ifu_icache_inv_req && !inv_req_r`), so the caller must clear this
-// again the cycle after raising it.
+// --fencei-patch: no RTL target (it was FetchSink's cfg_icache_inv; the
+// real ICache invalidate request is CSR.v's cp0_ifu_icache_inv_req, which
+// M2's minimal CSR set does not expose to the harness). No-op.
 static void set_icache_inv(bool on)
 {
-    M1_CFG_ICACHE_INV(dut.vdut) = on ? 1 : 0;
+    (void) on;
 }
 
-// Committed stream + resolve event/kind (sampled once per simulated cycle).
-// ONE instruction, not a slot array -- C906 delivers a single
-// instruction/cycle to IDU (plan "Global contracts").
-static bool     cmt_valid()     { return M1_CMT_VALID(dut.vdut); }
-static uint64_t cmt_pc()        { return M1_CMT_PC(dut.vdut); }
-static uint32_t cmt_opcode()    { return M1_CMT_OPCODE(dut.vdut); }
-static uint64_t cmt_count()     { return M1_CMT_COUNT(dut.vdut); }
-static bool     resolve_event() { return M1_RESOLVE_EVENT(dut.vdut); }
-static unsigned resolve_kind()  { return M1_RESOLVE_KIND(dut.vdut); }
-static unsigned perr_code()     { return M1_PERR_CODE(dut.vdut); }
+// Committed stream + resolve event/kind: the M1 fetch-stream oracle has
+// no consumer (Task 7). Neutral constants until Task 8 exports RTU's
+// per-retire trace (contract 13).
+static bool     cmt_valid()     { return false; }
+static uint64_t cmt_pc()        { return 0; }
+static uint32_t cmt_opcode()    { return 0; }
+static uint64_t cmt_count()     { return 0; }
+static bool     resolve_event() { return false; }
+static unsigned resolve_kind()  { return 0; }
+static unsigned perr_code()     { return 0; }
 
 } // namespace m1sink
 
@@ -134,6 +120,12 @@ static unsigned perr_code()     { return M1_PERR_CODE(dut.vdut); }
 // are stripped from argv in main() below before TestBench::parse_arg ever
 // sees them. That keeps testbench/TestBench.cpp's protocol untouched: the
 // extra M1 checks are layered on the TB side (init/step/term) instead.
+//
+// TASK 7 NOTE: the M1 flags below are all parsed but INERT now that
+// FetchSink is gone (their poke/sample targets are the neutralized
+// m1sink:: no-ops above); --iss-selftest is the only one with a live
+// effect. Task 8 replaces this machinery with the per-retire trace
+// harness (contract 13).
 //
 //   --m1-rung=<1..4>   predictor chicken-bit ladder (spec S4.3, cumulative):
 //                      1 = all predictors off, 2 = +RAS, 3 = +BTB, 4 = +BHT.
@@ -515,6 +507,7 @@ struct TB : public TestBench {
         // Post-clock: the committed-stream registers hold what this edge
         // retired, so sample before anything else disturbs the model.
         tb_cycle++;
+
         fencei_pulse_clear();
         sample_commit();
         inv_pulse_update();
@@ -553,55 +546,22 @@ struct TB : public TestBench {
             return;
         }
 
-        const uint64_t rtl_count = m1sink::cmt_count();
-        const unsigned perr = m1sink::perr_code();
-        const uint64_t th = (tohost != (uint64_t)-1) ? read_mem(tohost) : 0;
-
-        printf("[checker] %llu instructions compared (FetchSink cmt_count=%llu) "
-               "in %llu cycles, tohost=%llu perr_code=%u, ISS %s the sentinel\n",
-               (unsigned long long)m1_chk.compared, (unsigned long long)rtl_count,
-               (unsigned long long)tb_cycle, (unsigned long long)th, perr,
-               m1_chk.iss.sentinel_seen ? "reached" : "did NOT reach");
+        // Task 7: the M1 fetch-stream oracle is RETIRED -- FetchSink (and
+        // its committed-stream registers) no longer exist, so there is
+        // nothing for this checker to sample or compare. The tohost
+        // protocol verdict still applies via TestBench's own result block
+        // (run() calls term() before printing it); the per-retire trace
+        // harness that replaces the deleted M1 decision block arrives in
+        // Task 8 (contract 13). test/m1/run_all.sh --full-matrix is
+        // therefore expected to fail / be meaningless from the Task 7
+        // commit on -- a documented end of that regression, not a bug to
+        // chase.
         printf("[checker] AXI memory traffic: %llu reads, %llu writes\n",
                (unsigned long long)mem_reads, (unsigned long long)mem_writes);
-        if (m1_opts.inv_test)
-            printf("[checker] %d invalidate pulses issued\n", inv_issued);
-        if (m1_opts.fencei_armed)
-            printf("[checker] fence.i patch %s (commit boundary %llu)\n",
-                   fencei_fired ? "applied" : "NEVER APPLIED",
-                   (unsigned long long)m1_opts.fencei_commit);
-
-        const char *why = NULL;
-        if (tohost == (uint64_t)-1)
-            why = "the ELF has no tohost symbol -- the run cannot report a result";
-        else if (th != 1)
-            why = "tohost is not 1 (the sentinel was never reported)";
-        else if (perr != 0)
-            why = "FetchSink raised a protocol error (perr_code != 0)";
-        else if (m1_chk.compared == 0)
-            why = "no committed instruction was ever compared";
-        else if (rtl_count != m1_chk.compared)
-            why = "FetchSink's commit count disagrees with the number of "
-                  "instructions the checker sampled (some were missed)";
-        else if (!m1_chk.iss.sentinel_seen)
-            why = "the golden stream never reached the sentinel (missing tail)";
-        else if (m1_chk.compared < m1_chk.iss.prefix_count + 1)
-            why = "the run stopped before committing the sentinel";
-        else if (m1_opts.fencei_armed && !fencei_fired)
-            // Otherwise fencei.S would pass vacuously: with no patch, both
-            // oracles read the same unmodified image and the run "passes"
-            // without ever exercising the invalidate path at all.
-            why = "--fencei-patch was given but the patch never fired (the "
-                  "run ended before commit boundary was reached)";
-
-        if (why) {
-            printf("[checker] M1-CHECKER-FAIL: %s\n", why);
-            if (m1_chk.compared)
-                m1_chk.dump_streams();
-            fflush(stdout);
-            exit(M1_FAIL_STATUS);
-        }
-        printf("[checker] committed stream matches the golden ISS end to end\n");
+        printf("[m1] fetch-stream checker RETIRED in Task 7 (FetchSink "
+               "removed; no committed-stream registers on the real core) "
+               "-- Task 8 installs the per-retire trace harness "
+               "(contract 13); no stream comparison this run\n");
     }
 
 

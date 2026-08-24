@@ -1,32 +1,32 @@
 //=============================================================================
-// RVProc.v - rv906 core shell v0.1  (M1: real body, TASK 4.2)
+// RVProc.v - rv906 core shell  (M2: real body, TASK 7)
 //=============================================================================
 // C906 files covered:
 //   gen_rtl/ifu/rtl/aq_ifu_top.v   (the IFU/ICache/BPU glue, 863 lines of it)
 //   gen_rtl/cpu/rtl/aq_cpu_*.v     (core-level instantiation, MMU hookup)
-// References: design doc S3 (file organization: "IFU + ICache + BPU + MMU
-// stub + FetchSink, drop-in replacement for TestMaster"), umbrella spec S6.2
-// rule 1 ("top file is the table of contents").
+// References: design doc S3 (file organization), S4.1 (the unit graph),
+// umbrella spec S6.2 rule 1 ("top file is the table of contents").
 //
-// The outer port list is TestMaster.v's, VERBATIM (plan Task 1.3). Task 4.2
-// turned RVProcAXI.v's core instance into RVProc with the planned one-word
-// swap (rtl/RVProcAXI.v); TestMaster.v and test/smoke/ are retired (design
-// doc S4.3).
+// The outer port list is TestMaster.v's, VERBATIM (plan Task 1.3) and is
+// UNCHANGED by Task 7 -- RVProcAXI.v's `u_core` instance (the one-word M1
+// Task 4.2 swap) connects to it exactly as before.
 //
-// The internal instantiation below (ICache/IFU/BPU/FetchSink, fully wired)
-// was already complete as of Task 1's frozen skeleton -- every internal wire
-// name and width was fully determined once IFU.v/ICache.v/BPU.v/FetchSink.v's
-// port lists were pinned, so there was nothing left for Task 4.2 to add here
-// structurally. Task 4.2's actual work for this milestone landed in
-// FetchSink.v's real body (plan Task 4.1), rtl/verisim.h's M1 export paths,
-// and the RVProcAXI.v/README/Makefile retirement housekeeping described
-// above -- confirmed by re-linting this file after FetchSink.v went from
-// skeleton to real body and finding no port mismatch.
+// M2 stage of the core (this task): the full integer pipeline is wired for
+// real -- IFU -> IDU -> IU -> LSU -> RTU, plus CSR.v (the MHCR-derived
+// config bank that FetchSink's harness bank stood in for) and the real
+// MMU.v instance that REPLACES the M1 inline bare-physical-mapping ITLB
+// stub (design doc S2.1) by serving BOTH ICache's frozen ITLB port group
+// and LSU's DTLB port group (contract 2). FetchSink.v is deleted: its
+// fake BJU/RTU/CP0 outputs are now the real modules' outputs, and its
+// tohost-only D-side write FSM is replaced by LSU.v's real D-side AXI
+// master (the same ch[1] channel, same outer port names -- the connection
+// moved, the shape did not).
 //
-// M1 stage of the core: there is no decode, no execute and no retire yet.
-// FetchSink stands in for IDU+IU+RTU+CP0 (design doc S4.1) and hosts the
-// harness config bank; the MMU is the zero-latency bare-physical-mapping
-// stub below (design doc S2.1), replaced by the real MMU in M4.
+// The IFU/ICache/BPU interconnect wires (seams 1-3 below) are byte-for-
+// byte what M1 froze them to; Task 7 only changes which module instance
+// drives the back-end-facing wires (u_fetchsink -> u_iu/u_rtu/u_csr) and
+// adds the back-end seams (4-11) and the six new instances. The per-seam
+// comment banners below are the file's table of contents: read them first.
 //=============================================================================
 
 import rvproc_pkg::*;
@@ -138,11 +138,16 @@ module RVProc #(
     output wire                 quitted
 );
 
-    // mtip/msip/meip are unconnected until the CSR file and the exception
-    // vector path exist (M2+); M1 has no interrupt-taking machinery.
+    // mtip/msip/meip terminate in CSR.v's mip wiring (contract 7); the
+    // instance connection is at the bottom of this file.
 
     //=========================================================================
-    // IFU <-> ICache seam (see ICache.v's header for the port rationale)
+    // IFU <-> ICache seam (see ICache.v's header for the port rationale).
+    // The `cp0_ifu_icache_*`/`ifu_cp0_icache_inv_done` group at the top of
+    // this seam is the I-side slice of the CSR config fan-out (banner 4
+    // below) -- M2 drives it from u_csr's MHCR-derived wires; the wire
+    // names are unchanged from M1, only the driver instance moved
+    // (u_fetchsink -> u_csr).
     //=========================================================================
     wire                     cp0_ifu_icache_en;
     wire                     cp0_ifu_iwpe;
@@ -170,9 +175,25 @@ module RVProc #(
     wire                     icache_ipack_unalign;
 
     //=========================================================================
-    // ICache <-> MMU stub seam (design doc S2.1: bare physical mapping, zero
-    // latency; M4 replaces this block with the real MMU without touching
-    // ICache.v's port list)
+    // MMU seam (TASK 7: the `MMU` instance below replaces M1's inline
+    // bare-physical-mapping stub block that used to occupy this section).
+    // One module, two independent port groups (contract 2):
+    //   * the ITLB group, names/widths byte-for-byte ICache.v's
+    //     frozen-since-M1 `ifu_mmu_*`/`mmu_ifu_*` ports;
+    //   * the DTLB group, names/widths byte-for-byte LSU.v's
+    //     `lsu_mmu_*`/`mmu_lsu_*` ports.
+    // BOTH request inputs carry the PAGE NUMBER (VPN), not the byte VA --
+    // `ifu_mmu_va = icache_rd_addr[63:12]` (ICache.v), `lsu_mmu_va =
+    // ag_addr[63:12]` (LSU.v; donor aq_lsu_ag.v:1566), and each requester
+    // reassembles the PA from the page-number response itself.
+    //
+    // I-side cacheability: the M1 stub decoded VA byte bit 31
+    // (`ifu_mmu_va[19]`); MMU.v's PMA range check (contract 5,
+    // {vpn,12'b0} in [0x8000_0000, 0xFFFF_FFFF]) now decides instead.
+    // The two agree across all of M1's test space (< 2GB); the PMA check
+    // is the more correct of the two (HANDOFF "known latent note").
+    // `mmu_ifu_prot[4:0]` = {pgflt,supv,ca,ba,sec} -- the same pinned
+    // encoding ICache.v's header documents, now sourced from MMU.v.
     //=========================================================================
     wire                     ifu_mmu_abort;
     wire [MMU_VA_WIDTH-1:0]  ifu_mmu_va;
@@ -182,54 +203,26 @@ module RVProc #(
     wire                     mmu_ifu_pa_vld;
     wire [MMU_PROT_WIDTH-1:0] mmu_ifu_prot;
 
-    // Bare physical mapping: PA page number = the low MMU_PA_WIDTH bits of
-    // the VA page number, same cycle (no TLB, no page walk).
-    //
-    // `mmu_ifu_prot[4:0]` encoding PINNED by Task 2 (ICache.v's own header,
-    // "MMU request-response" section) from icache.v's actual consumers:
-    // [4]=pgflt/deny (forces a fault report instead of a refill), [3]=supv,
-    // [2]=cacheable (allocate gate), [1]=bufferable, [0]=secure (unused M1).
-    // Task 1 left this field tied to all-1s as an "every bit set" permissive
-    // placeholder without pinning the bits; under the now-pinned encoding
-    // that ties bit[4]=1, i.e. EVERY fetch would report a permanent page
-    // fault -- clearly not the bare, fault-free M1 stub's intent. Fixed
-    // here (an internal wire assignment, not a port -- outside the Task 1.4
-    // freeze, which covers ICache.v/IFU.v/BPU.v/RVProc.v PORT LISTS only):
-    // pgflt/secure 0 (no fault-capable MMU exists until M4), bufferable/supv
-    // permissively 1.
-    //
-    // CACHEABLE (Task 6 finding, revises Task 4.2's comment above): the
-    // system-level tie-off originally left `ca` permissively 1 everywhere,
-    // deferring the M1 spec S4.2 "uncached-region fetch" directed test to
-    // ICache.v's own unit bench (icache_tb.cpp T6) on the theory that the
-    // bare stub has "one flat memory region, no uncacheable window". That
-    // meant test/m1/uncached.S could never actually exercise ICache.v's
-    // bypass-refill path through the REAL wired-together pipeline (IFU +
-    // ICache + FetchSink) -- exactly the integration surface Task 6 exists to
-    // gate. A bare-physical-mapping MMU stub deciding cacheability from a
-    // fixed VA window is still a bare mapping (no TLB, no page walk, same
-    // cycle) -- it is simply address-decoded rather than a flat constant.
-    // rv906 adopts rv12's own resolution for the identical M0 SoC address map
-    // (rv12 RVProc.v's MMU stub, and rv12 test/m1/uncached.S's derivation):
-    // cacheable = VA BYTE ADDRESS BIT 31. `ifu_mmu_va[51:0]` is the VPN
-    // (icache.v: `ifu_mmu_va = icache_rd_addr[63:12]`), so VA bit 31 is
-    // `ifu_mmu_va[19]`. Addresses below 0x8000_0000 (bit 31 clear) -- e.g.
-    // test/m1/uncached.S's 0x7FFF_0000 window, common.ld -- are therefore
-    // fetched uncached (ICache.v: `alloc_r_r <= mmu_ifu_prot[2] && ...`, so
-    // no array allocation, one AXI beat per request, bypass_word every time);
-    // 0x8000_0000 and above (every other M1 test's .text.init) stay cacheable
-    // exactly as before. RVProcAXI.v's own crossbar (AXIAddrDecode.v,
-    // DEFAULT_SLAVE = SI_MEM) routes 0x7FFF_0000 to the same wide 512-bit MEM
-    // slave as 0x8000_0000 (it matches none of CLINT/PLIC/UART's base/mask
-    // pairs), so this is a genuine cacheable/uncacheable split of ONE
-    // otherwise-uniform memory, not a different device.
-    assign mmu_ifu_pa           = ifu_mmu_va[MMU_PA_WIDTH-1:0];
-    assign mmu_ifu_pa_vld       = ifu_mmu_va_vld;
-    assign mmu_ifu_access_fault = 1'b0;
-    assign mmu_ifu_prot         = {1'b0, 1'b1, ifu_mmu_va[19], 1'b1, 1'b0};   // {pgflt,supv,ca,ba,sec}
+    wire [MMU_VA_WIDTH-1:0]  lsu_mmu_va;
+    wire                     lsu_mmu_va_vld;
+    wire [1:0]               lsu_mmu_priv_mode;
+    wire                     lsu_mmu_st_inst;
+    wire [MMU_PA_WIDTH-1:0]  mmu_lsu_pa;
+    wire                     mmu_lsu_pa_vld;
+    wire                     mmu_lsu_ca;
+    wire                     mmu_lsu_so;
+    wire                     mmu_lsu_buf;
+    wire                     mmu_lsu_sec;
+    wire                     mmu_lsu_sh;
+    wire                     mmu_lsu_page_fault;
+    wire                     mmu_lsu_access_fault;
 
     //=========================================================================
-    // IFU <-> BPU seam (see BPU.v's header for the port rationale)
+    // IFU <-> BPU seam (see BPU.v's header for the port rationale).
+    // The `cp0_ifu_bht_en/_btb_en/_ras_en/_bht_inv/_btb_clr` group at the
+    // bottom of this seam is the BPU slice of the CSR config fan-out --
+    // M2 drives it from u_csr's MHCR-derived wires (u_fetchsink was the
+    // driver in M1); wire names unchanged.
     //=========================================================================
     wire [PC_WIDTH-1:0]      pcgen_btb_ifpc;
     wire [PC_WIDTH-1:0]      pred_idpc;
@@ -270,7 +263,12 @@ module RVProc #(
     wire                     idu_ifu_id_stall;
 
     //=========================================================================
-    // IFU/BPU <-> fake BJU (IU) + fake RTU + CP0 stand-in (FetchSink)
+    // IFU/BPU <-> IU (BJU) + RTU redirect seam. M1 froze these wires
+    // against FetchSink's fake BJU/RTU; M2 drives them from the real
+    // u_iu / u_rtu (names/widths unchanged -- IU.v's and RTU.v's headers
+    // re-verified them byte-for-byte against this file's M1 declarations).
+    // `cp0_xx_mrvbr` is the reset-vector seed, now driven by u_csr
+    // (mrvbr for real) and consumed by u_ifu AND u_iu (BJU's PC seed).
     //=========================================================================
     wire                     iu_ifu_tar_pc_vld;
     wire [63:0]              iu_ifu_tar_pc;
@@ -289,6 +287,213 @@ module RVProc #(
     wire                     rtu_ifu_flush_fe;
 
     wire [PC_WIDTH-1:0]      cp0_xx_mrvbr;
+
+    //=========================================================================
+    // IDU <-> IU : EX1 dispatch (IU's slice of id_ex1_t) + IU's five
+    // point-to-point stall/full signals back (contract 8)
+    //=========================================================================
+    wire                     idu_iu_ex1_inst_vld;
+    wire                     idu_iu_ex1_pipedown_vld;
+    wire                     idu_iu_ex1_alu_sel;
+    wire                     idu_iu_ex1_bju_sel;
+    wire                     idu_iu_ex1_bju_br_sel;
+    wire                     idu_iu_ex1_mult_sel;
+    wire                     idu_iu_ex1_div_sel;
+    wire [FUNC_WIDTH-1:0]    idu_iu_ex1_func;
+    wire [63:0]              idu_iu_ex1_src0_data;
+    wire                     idu_iu_ex1_src0_ready;
+    wire [63:0]              idu_iu_ex1_src1_data;
+    wire                     idu_iu_ex1_src1_ready;
+    wire [63:0]              idu_iu_ex1_src2_data;
+    wire                     idu_iu_ex1_src2_ready;
+    wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_dst0_reg;
+    wire [1:0]               idu_iu_ex1_bht_pred;
+    wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src0_reg;
+    wire [GPR_IDX_WIDTH-1:0] idu_iu_ex1_src1_reg;
+    // Task 7.3: EX1 instruction length (1=32b,0=16b RVC) -- the RVC-aware
+    // PC increment source (IDU latches it; IU/LSU/CSR each consume their
+    // slice; the RTU re-exposes the completing one back to IU's pcgen).
+    wire                     idu_iu_ex1_inst_len;
+
+    wire                     iu_idu_mult_issue_stall;
+    wire                     iu_idu_mult_full;
+    wire                     iu_idu_div_full;
+    wire                     iu_idu_bju_full;
+    wire                     iu_idu_bju_global_full;
+
+    //=========================================================================
+    // IDU <-> LSU : EX1 dispatch (LSU's slice of id_ex1_t) + LSU's single
+    // EX1 issue-gate stall (contract 8)
+    //=========================================================================
+    wire                     idu_lsu_ex1_dp_sel;
+    wire                     idu_lsu_ex1_sel;
+    wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func;
+    wire [63:0]              idu_lsu_ex1_src0_data;
+    wire                     idu_lsu_ex1_src0_ready;
+    wire [63:0]              idu_lsu_ex1_src1_data;
+    wire                     idu_lsu_ex1_src1_ready;
+    wire [63:0]              idu_lsu_ex1_src2_data;
+    wire                     idu_lsu_ex1_src2_ready;
+    wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg;
+    wire                     idu_lsu_ex1_inst_len;   // Task 7.3
+    wire                     lsu_idu_full;
+
+    //=========================================================================
+    // IDU/IU -> CSR : EX1 dispatch (CSR's slice of id_ex1_t) + BJU's PC
+    // passthrough (the only IU<->CP0 data connection, IU note S4.5/S9)
+    //=========================================================================
+    wire                     idu_cp0_ex1_sel;
+    wire [FUNC_WIDTH-1:0]    idu_cp0_ex1_func;
+    wire [31:0]              idu_cp0_ex1_opcode;
+    wire                     idu_cp0_ex1_illegal;
+    wire [63:0]              idu_cp0_ex1_src0_data;
+    wire [63:0]              idu_cp0_ex1_src1_data;
+    wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
+    wire                     idu_cp0_ex1_inst_len;   // Task 7.3
+    wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
+
+    //=========================================================================
+    // IU <-> RTU : the four separate writeback buses (contract 1) + RTU's
+    // two MULT/DIV writeback-race grants
+    //=========================================================================
+    wire                     iu_rtu_ex1_alu_cmplt;
+    wire                     iu_rtu_ex1_alu_cmplt_dp;
+    wire [63:0]              iu_rtu_ex1_alu_data;
+    wire                     iu_rtu_ex1_alu_inst_len;
+    wire                     iu_rtu_ex1_alu_inst_split;
+    wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex1_alu_preg;
+    wire                     iu_rtu_ex1_alu_wb_dp;
+    wire                     iu_rtu_ex1_alu_wb_vld;
+
+    wire                     iu_rtu_ex1_bju_cmplt;
+    wire                     iu_rtu_ex1_bju_cmplt_dp;
+    wire [63:0]              iu_rtu_ex1_bju_data;
+    wire                     iu_rtu_ex1_bju_inst_len;
+    wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex1_bju_preg;
+    wire                     iu_rtu_ex1_bju_wb_dp;
+    wire                     iu_rtu_ex1_bju_wb_vld;
+    wire                     iu_rtu_ex1_branch_inst;
+    wire [PC_WIDTH-1:0]      iu_rtu_ex1_cur_pc;
+    wire [PC_WIDTH-1:0]      iu_rtu_ex1_next_pc;
+    wire                     iu_rtu_ex2_bju_ras_mispred;
+    wire                     iu_rtu_depd_lsu_chgflow_vld;
+    wire [PC_WIDTH-1:0]      iu_rtu_depd_lsu_chgflow_next_pc;
+
+    wire                     iu_rtu_ex1_mul_cmplt;
+    wire                     iu_rtu_ex1_mul_cmplt_dp;
+    wire [63:0]              iu_rtu_ex3_mul_data;
+    wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex3_mul_preg;
+    wire                     iu_rtu_ex3_mul_wb_vld;
+    wire                     iu_rtu_ex1_mul_inst_len;   // Task 7.3
+
+    wire                     iu_rtu_ex1_div_cmplt;
+    wire                     iu_rtu_ex1_div_cmplt_dp;
+    wire [63:0]              iu_rtu_div_data;
+    wire [GPR_IDX_WIDTH-1:0] iu_rtu_div_preg;
+    wire                     iu_rtu_div_wb_dp;
+    wire                     iu_rtu_div_wb_vld;
+    wire                     iu_rtu_ex1_div_inst_len;   // Task 7.3
+
+    wire                     rtu_iu_mul_wb_grant;
+    wire                     rtu_iu_div_wb_grant;
+    // Task 7.3: RTU -> IU PC-generator retire feedback (the completing
+    // instruction's cmplt/length/split for IU's bju_pcgen_pc advance).
+    wire                     rtu_iu_ex1_cmplt;
+    wire                     rtu_iu_ex1_inst_len;
+    wire                     rtu_iu_ex1_inst_split;
+
+    //=========================================================================
+    // LSU <-> RTU : lsu_rtu_t completion/exception bus + RTU's "point of
+    // no return" acks (RTU note S6)
+    //=========================================================================
+    wire                     lsu_rtu_ex1_cmplt;
+    wire                     lsu_rtu_ex1_cmplt_dp;
+    wire                     lsu_rtu_ex1_inst_len;   // Task 7.3
+    wire [63:0]              lsu_rtu_wb_data;
+    wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg;
+    wire                     lsu_rtu_wb_vld;
+    wire [63:0]              lsu_rtu_ex2_data;
+    wire                     lsu_rtu_ex2_data_vld;
+    wire [GPR_IDX_WIDTH-1:0] lsu_rtu_ex2_dest_reg;
+    wire                     lsu_rtu_expt_vld;
+    wire [4:0]               lsu_rtu_expt_vec;
+    wire [63:0]              lsu_rtu_tval;
+    wire                     lsu_rtu_async_expt_vld;
+    wire                     lsu_rtu_async_ld_inst;
+
+    wire                     rtu_lsu_expt_ack;
+    wire                     rtu_lsu_expt_exit;
+
+    //=========================================================================
+    // LSU -> IU : BJU's LSU-dependent-branch forwards (IU note S4.4).
+    // WIRING DECISION (documented, Task 7): the donor's LSU carries TWO
+    // distinct forward groups to IU -- the DA-stage `da_xx_fwd_*`
+    // (aq_lsu_dc.v:2412-2414) and the DC-stage `lsu_iu_ex2_*`
+    // (aq_lsu_dc.v:2210-2212), one stage apart. M2's LSU.v (frozen port
+    // list) collapses both into its single REPLY-cycle output family
+    // `lsu_rtu_ex2_data/_data_vld/_dest_reg` (LSU.v header: driven in the
+    // same cycle as the load/store completes), so this file fans that ONE
+    // group out to BOTH of IU's input groups. No new LSU ports are
+    // invented -- this is a fan-out of a frozen output.
+    //=========================================================================
+
+    //=========================================================================
+    // CSR <-> RTU : cp0_rtu_t (CSR's EX1 completion + trap-declaration bus
+    // + mtvec redirect target) and the RTU->CSR trap-entry capture group
+    //=========================================================================
+    wire                     cp0_rtu_ex1_cmplt_dp;
+    wire                     cp0_rtu_ex1_inst_len;   // Task 7.3
+    wire [63:0]              cp0_rtu_ex1_wb_data;
+    wire [GPR_IDX_WIDTH-1:0] cp0_rtu_ex1_wb_preg;
+    wire                     cp0_rtu_ex1_wb_vld;
+    wire                     cp0_rtu_ex1_expt_vld;
+    wire                     cp0_rtu_ex1_expt_int;
+    wire [4:0]               cp0_rtu_ex1_expt_vec;
+    wire                     cp0_rtu_ex1_chgflw;
+    wire [PC_WIDTH-1:0]      cp0_rtu_ex1_chgflw_pc;
+    wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc;
+
+    wire                     rtu_yy_xx_expt_vld;
+    wire                     rtu_yy_xx_expt_int;
+    wire [4:0]               rtu_yy_xx_expt_vec;
+    wire                     rtu_yy_xx_flush_fe;
+    wire                     rtu_yy_xx_flush;
+    wire [PC_WIDTH-1:0]      rtu_cp0_epc;
+    wire [63:0]              rtu_cp0_tval;
+
+    //=========================================================================
+    // RTU <-> IDU : the exclusive bypass network (fwd0/1/2 + wb0/1, IDU
+    // note S6) + the flush/drain/commit group (RTU note S6)
+    //=========================================================================
+    wire [63:0]              rtu_idu_fwd0_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_fwd0_reg;
+    wire                     rtu_idu_fwd0_vld;
+    wire [63:0]              rtu_idu_fwd1_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_fwd1_reg;
+    wire                     rtu_idu_fwd1_vld;
+    wire [63:0]              rtu_idu_fwd2_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_fwd2_reg;
+    wire                     rtu_idu_fwd2_vld;
+    wire [63:0]              rtu_idu_wb0_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb0_reg;
+    wire                     rtu_idu_wb0_vld;
+    wire [63:0]              rtu_idu_wb1_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg;
+    wire                     rtu_idu_wb1_vld;
+
+    wire                     rtu_idu_flush_fe;
+    wire                     rtu_idu_flush_stall;
+    wire                     rtu_idu_flush_wbt;
+    wire                     rtu_idu_commit;
+    wire                     rtu_idu_commit_for_bju;
+    wire                     rtu_idu_pipeline_empty;
+
+    //=========================================================================
+    // CSR -> LSU : MHCR.de/wa + MXSTATUS.mm (design doc S2.3.3/S2.3.6)
+    //=========================================================================
+    wire                     cp0_lsu_dcache_en;
+    wire                     cp0_lsu_mm;
+    wire                     cp0_lsu_wa;
 
     //=========================================================================
     // ICache instance
@@ -462,14 +667,42 @@ module RVProc #(
     );
 
     //=========================================================================
-    // FetchSink instance: fake BJU + fake RTU + CP0 stand-in
+    // MMU instance (contract 2): serves ICache's ITLB port group and
+    // LSU's DTLB port group. No parameters; clk/rst_n for symmetry with
+    // the rest of the core (the body is a combinational lookup today --
+    // the M4 real MMU will use the clock).
     //=========================================================================
-    FetchSink #(
-        .DATA_WIDTH   (DATA_WIDTH),
-        .ADDR_WIDTH   (ADDR_WIDTH),
-        .TOHOST_ADDR  (ADDR_TOHOST),
-        .RESET_VECTOR (RESET_VECTOR)
-    ) u_fetchsink (
+    MMU u_mmu (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+
+        .ifu_mmu_abort          (ifu_mmu_abort),
+        .ifu_mmu_va             (ifu_mmu_va),
+        .ifu_mmu_va_vld         (ifu_mmu_va_vld),
+        .mmu_ifu_access_fault   (mmu_ifu_access_fault),
+        .mmu_ifu_pa             (mmu_ifu_pa),
+        .mmu_ifu_pa_vld         (mmu_ifu_pa_vld),
+        .mmu_ifu_prot           (mmu_ifu_prot),
+
+        .lsu_mmu_va             (lsu_mmu_va),
+        .lsu_mmu_va_vld         (lsu_mmu_va_vld),
+        .lsu_mmu_priv_mode      (lsu_mmu_priv_mode),
+        .lsu_mmu_st_inst        (lsu_mmu_st_inst),
+        .mmu_lsu_pa             (mmu_lsu_pa),
+        .mmu_lsu_pa_vld         (mmu_lsu_pa_vld),
+        .mmu_lsu_ca             (mmu_lsu_ca),
+        .mmu_lsu_so             (mmu_lsu_so),
+        .mmu_lsu_buf            (mmu_lsu_buf),
+        .mmu_lsu_sec            (mmu_lsu_sec),
+        .mmu_lsu_sh             (mmu_lsu_sh),
+        .mmu_lsu_page_fault     (mmu_lsu_page_fault),
+        .mmu_lsu_access_fault   (mmu_lsu_access_fault)
+    );
+
+    //=========================================================================
+    // IDU instance: decode + WBT + GPR + EU dispatch (Task 5)
+    //=========================================================================
+    IDU u_idu (
         .clk                     (clk),
         .rst_n                   (rst_n),
 
@@ -477,6 +710,160 @@ module RVProc #(
         .ifu_idu_id_inst_vld     (ifu_idu_id_inst_vld),
         .ifu_idu_id_bht_pred     (ifu_idu_id_bht_pred),
         .idu_ifu_id_stall        (idu_ifu_id_stall),
+
+        .idu_iu_ex1_inst_vld     (idu_iu_ex1_inst_vld),
+        .idu_iu_ex1_pipedown_vld (idu_iu_ex1_pipedown_vld),
+        .idu_iu_ex1_alu_sel      (idu_iu_ex1_alu_sel),
+        .idu_iu_ex1_bju_sel      (idu_iu_ex1_bju_sel),
+        .idu_iu_ex1_bju_br_sel   (idu_iu_ex1_bju_br_sel),
+        .idu_iu_ex1_mult_sel     (idu_iu_ex1_mult_sel),
+        .idu_iu_ex1_div_sel      (idu_iu_ex1_div_sel),
+        .idu_iu_ex1_func         (idu_iu_ex1_func),
+        .idu_iu_ex1_src0_data    (idu_iu_ex1_src0_data),
+        .idu_iu_ex1_src0_ready   (idu_iu_ex1_src0_ready),
+        .idu_iu_ex1_src1_data    (idu_iu_ex1_src1_data),
+        .idu_iu_ex1_src1_ready   (idu_iu_ex1_src1_ready),
+        .idu_iu_ex1_src2_data    (idu_iu_ex1_src2_data),
+        .idu_iu_ex1_src2_ready   (idu_iu_ex1_src2_ready),
+        .idu_iu_ex1_dst0_reg     (idu_iu_ex1_dst0_reg),
+        .idu_iu_ex1_bht_pred     (idu_iu_ex1_bht_pred),
+        .idu_iu_ex1_src0_reg     (idu_iu_ex1_src0_reg),
+        .idu_iu_ex1_src1_reg     (idu_iu_ex1_src1_reg),
+        .idu_iu_ex1_inst_len     (idu_iu_ex1_inst_len),
+
+        .idu_lsu_ex1_dp_sel      (idu_lsu_ex1_dp_sel),
+        .idu_lsu_ex1_sel         (idu_lsu_ex1_sel),
+        .idu_lsu_ex1_func        (idu_lsu_ex1_func),
+        .idu_lsu_ex1_src0_data   (idu_lsu_ex1_src0_data),
+        .idu_lsu_ex1_src0_ready  (idu_lsu_ex1_src0_ready),
+        .idu_lsu_ex1_src1_data   (idu_lsu_ex1_src1_data),
+        .idu_lsu_ex1_src1_ready  (idu_lsu_ex1_src1_ready),
+        .idu_lsu_ex1_src2_data   (idu_lsu_ex1_src2_data),
+        .idu_lsu_ex1_src2_ready  (idu_lsu_ex1_src2_ready),
+        .idu_lsu_ex1_dst0_reg    (idu_lsu_ex1_dst0_reg),
+        .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
+
+        .idu_cp0_ex1_sel         (idu_cp0_ex1_sel),
+        .idu_cp0_ex1_func        (idu_cp0_ex1_func),
+        .idu_cp0_ex1_opcode      (idu_cp0_ex1_opcode),
+        .idu_cp0_ex1_illegal     (idu_cp0_ex1_illegal),
+        .idu_cp0_ex1_src0_data   (idu_cp0_ex1_src0_data),
+        .idu_cp0_ex1_src1_data   (idu_cp0_ex1_src1_data),
+        .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
+        .idu_cp0_ex1_inst_len    (idu_cp0_ex1_inst_len),
+
+        .rtu_idu_fwd0_data       (rtu_idu_fwd0_data),
+        .rtu_idu_fwd0_reg        (rtu_idu_fwd0_reg),
+        .rtu_idu_fwd0_vld        (rtu_idu_fwd0_vld),
+        .rtu_idu_fwd1_data       (rtu_idu_fwd1_data),
+        .rtu_idu_fwd1_reg        (rtu_idu_fwd1_reg),
+        .rtu_idu_fwd1_vld        (rtu_idu_fwd1_vld),
+        .rtu_idu_fwd2_data       (rtu_idu_fwd2_data),
+        .rtu_idu_fwd2_reg        (rtu_idu_fwd2_reg),
+        .rtu_idu_fwd2_vld        (rtu_idu_fwd2_vld),
+        .rtu_idu_wb0_data        (rtu_idu_wb0_data),
+        .rtu_idu_wb0_reg         (rtu_idu_wb0_reg),
+        .rtu_idu_wb0_vld         (rtu_idu_wb0_vld),
+        .rtu_idu_wb1_data        (rtu_idu_wb1_data),
+        .rtu_idu_wb1_reg         (rtu_idu_wb1_reg),
+        .rtu_idu_wb1_vld         (rtu_idu_wb1_vld),
+
+        .iu_idu_mult_issue_stall (iu_idu_mult_issue_stall),
+        .iu_idu_mult_full        (iu_idu_mult_full),
+        .iu_idu_div_full         (iu_idu_div_full),
+        .iu_idu_bju_full         (iu_idu_bju_full),
+        .iu_idu_bju_global_full  (iu_idu_bju_global_full),
+
+        .lsu_idu_full            (lsu_idu_full),
+
+        .rtu_idu_flush_fe        (rtu_idu_flush_fe),
+        .rtu_idu_flush_stall     (rtu_idu_flush_stall),
+        .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),
+        .rtu_idu_commit          (rtu_idu_commit),
+        .rtu_idu_commit_for_bju  (rtu_idu_commit_for_bju),
+        .rtu_idu_pipeline_empty  (rtu_idu_pipeline_empty)
+    );
+
+    //=========================================================================
+    // IU instance: ALU + BJU + MULT + DIV (Task 3). `da_xx_fwd_*` and
+    // `lsu_iu_ex2_*` both tie to LSU's single `lsu_rtu_ex2_*` output
+    // family -- see the "LSU -> IU" seam banner above for the rationale
+    // (donor's two stage-apart forwards collapsed to one REPLY-cycle
+    // family in M2's frozen LSU.v port list).
+    //=========================================================================
+    IU u_iu (
+        .clk                     (clk),
+        .rst_n                   (rst_n),
+
+        .idu_iu_ex1_inst_vld     (idu_iu_ex1_inst_vld),
+        .idu_iu_ex1_pipedown_vld (idu_iu_ex1_pipedown_vld),
+        .idu_iu_ex1_alu_sel      (idu_iu_ex1_alu_sel),
+        .idu_iu_ex1_bju_sel      (idu_iu_ex1_bju_sel),
+        .idu_iu_ex1_bju_br_sel   (idu_iu_ex1_bju_br_sel),
+        .idu_iu_ex1_mult_sel     (idu_iu_ex1_mult_sel),
+        .idu_iu_ex1_div_sel      (idu_iu_ex1_div_sel),
+        .idu_iu_ex1_func         (idu_iu_ex1_func),
+        .idu_iu_ex1_src0_data    (idu_iu_ex1_src0_data),
+        .idu_iu_ex1_src0_ready   (idu_iu_ex1_src0_ready),
+        .idu_iu_ex1_src1_data    (idu_iu_ex1_src1_data),
+        .idu_iu_ex1_src1_ready   (idu_iu_ex1_src1_ready),
+        .idu_iu_ex1_src2_data    (idu_iu_ex1_src2_data),
+        .idu_iu_ex1_src2_ready   (idu_iu_ex1_src2_ready),
+        .idu_iu_ex1_dst0_reg     (idu_iu_ex1_dst0_reg),
+        .idu_iu_ex1_bht_pred     (idu_iu_ex1_bht_pred),
+        .idu_iu_ex1_src0_reg     (idu_iu_ex1_src0_reg),
+        .idu_iu_ex1_src1_reg     (idu_iu_ex1_src1_reg),
+        .idu_iu_ex1_inst_len     (idu_iu_ex1_inst_len),
+
+        .iu_idu_mult_issue_stall (iu_idu_mult_issue_stall),
+        .iu_idu_mult_full        (iu_idu_mult_full),
+        .iu_idu_div_full         (iu_idu_div_full),
+        .iu_idu_bju_full         (iu_idu_bju_full),
+        .iu_idu_bju_global_full  (iu_idu_bju_global_full),
+
+        .iu_rtu_ex1_alu_cmplt    (iu_rtu_ex1_alu_cmplt),
+        .iu_rtu_ex1_alu_cmplt_dp (iu_rtu_ex1_alu_cmplt_dp),
+        .iu_rtu_ex1_alu_data     (iu_rtu_ex1_alu_data),
+        .iu_rtu_ex1_alu_inst_len (iu_rtu_ex1_alu_inst_len),
+        .iu_rtu_ex1_alu_inst_split (iu_rtu_ex1_alu_inst_split),
+        .iu_rtu_ex1_alu_preg     (iu_rtu_ex1_alu_preg),
+        .iu_rtu_ex1_alu_wb_dp    (iu_rtu_ex1_alu_wb_dp),
+        .iu_rtu_ex1_alu_wb_vld   (iu_rtu_ex1_alu_wb_vld),
+
+        .iu_rtu_ex1_bju_cmplt    (iu_rtu_ex1_bju_cmplt),
+        .iu_rtu_ex1_bju_cmplt_dp (iu_rtu_ex1_bju_cmplt_dp),
+        .iu_rtu_ex1_bju_data     (iu_rtu_ex1_bju_data),
+        .iu_rtu_ex1_bju_inst_len (iu_rtu_ex1_bju_inst_len),
+        .iu_rtu_ex1_bju_preg     (iu_rtu_ex1_bju_preg),
+        .iu_rtu_ex1_bju_wb_dp    (iu_rtu_ex1_bju_wb_dp),
+        .iu_rtu_ex1_bju_wb_vld   (iu_rtu_ex1_bju_wb_vld),
+        .iu_rtu_ex1_branch_inst  (iu_rtu_ex1_branch_inst),
+        .iu_rtu_ex1_cur_pc       (iu_rtu_ex1_cur_pc),
+        .iu_rtu_ex1_next_pc      (iu_rtu_ex1_next_pc),
+        .iu_rtu_ex2_bju_ras_mispred (iu_rtu_ex2_bju_ras_mispred),
+        .iu_rtu_depd_lsu_chgflow_vld (iu_rtu_depd_lsu_chgflow_vld),
+        .iu_rtu_depd_lsu_chgflow_next_pc (iu_rtu_depd_lsu_chgflow_next_pc),
+
+        .iu_rtu_ex1_mul_cmplt    (iu_rtu_ex1_mul_cmplt),
+        .iu_rtu_ex1_mul_cmplt_dp (iu_rtu_ex1_mul_cmplt_dp),
+        .iu_rtu_ex3_mul_data     (iu_rtu_ex3_mul_data),
+        .iu_rtu_ex3_mul_preg     (iu_rtu_ex3_mul_preg),
+        .iu_rtu_ex3_mul_wb_vld   (iu_rtu_ex3_mul_wb_vld),
+        .iu_rtu_ex1_mul_inst_len (iu_rtu_ex1_mul_inst_len),
+
+        .iu_rtu_ex1_div_cmplt    (iu_rtu_ex1_div_cmplt),
+        .iu_rtu_ex1_div_cmplt_dp (iu_rtu_ex1_div_cmplt_dp),
+        .iu_rtu_div_data         (iu_rtu_div_data),
+        .iu_rtu_div_preg         (iu_rtu_div_preg),
+        .iu_rtu_div_wb_dp        (iu_rtu_div_wb_dp),
+        .iu_rtu_div_wb_vld       (iu_rtu_div_wb_vld),
+        .iu_rtu_ex1_div_inst_len (iu_rtu_ex1_div_inst_len),
+
+        .rtu_iu_mul_wb_grant     (rtu_iu_mul_wb_grant),
+        .rtu_iu_div_wb_grant     (rtu_iu_div_wb_grant),
+        .rtu_iu_ex1_cmplt        (rtu_iu_ex1_cmplt),
+        .rtu_iu_ex1_inst_len     (rtu_iu_ex1_inst_len),
+        .rtu_iu_ex1_inst_split   (rtu_iu_ex1_inst_split),
 
         .iu_ifu_tar_pc_vld       (iu_ifu_tar_pc_vld),
         .iu_ifu_tar_pc           (iu_ifu_tar_pc),
@@ -490,26 +877,88 @@ module RVProc #(
         .ifu_iu_chgflw_vld       (ifu_iu_chgflw_vld),
         .ifu_iu_chgflw_pc        (ifu_iu_chgflw_pc),
 
-        .rtu_ifu_chgflw_vld      (rtu_ifu_chgflw_vld),
-        .rtu_ifu_chgflw_pc       (rtu_ifu_chgflw_pc),
-        .rtu_ifu_flush_fe        (rtu_ifu_flush_fe),
+        .da_xx_fwd_data          (lsu_rtu_ex2_data),
+        .da_xx_fwd_dst_reg       (lsu_rtu_ex2_dest_reg),
+        .da_xx_fwd_vld           (lsu_rtu_ex2_data_vld),
+        .lsu_iu_ex2_data         (lsu_rtu_ex2_data),
+        .lsu_iu_ex2_data_vld     (lsu_rtu_ex2_data_vld),
+        .lsu_iu_ex2_dest_reg     (lsu_rtu_ex2_dest_reg),
 
-        .cp0_ifu_icache_en       (cp0_ifu_icache_en),
-        .cp0_ifu_iwpe            (cp0_ifu_iwpe),
-        .cp0_ifu_icache_pref_en  (cp0_ifu_icache_pref_en),
-        .cp0_ifu_icache_inv_addr (cp0_ifu_icache_inv_addr),
-        .cp0_ifu_icache_inv_req  (cp0_ifu_icache_inv_req),
-        .cp0_ifu_icache_inv_type (cp0_ifu_icache_inv_type),
-        .ifu_cp0_icache_inv_done (ifu_cp0_icache_inv_done),
+        .iu_cp0_ex1_cur_pc       (iu_cp0_ex1_cur_pc),
 
-        .cp0_ifu_bht_en          (cp0_ifu_bht_en),
-        .cp0_ifu_btb_en          (cp0_ifu_btb_en),
-        .cp0_ifu_ras_en          (cp0_ifu_ras_en),
-        .cp0_ifu_bht_inv         (cp0_ifu_bht_inv),
-        .cp0_ifu_btb_clr         (cp0_ifu_btb_clr),
-        .bht_cp0_inv_done        (bht_cp0_inv_done),
+        .cp0_xx_mrvbr            (cp0_xx_mrvbr)
+    );
 
-        .cp0_xx_mrvbr            (cp0_xx_mrvbr),
+    //=========================================================================
+    // LSU instance: AG/DC/DA pipe + 4-entry STB + D-side AXI master
+    // (Task 6). The `axi_d_*` group moves here from FetchSink's tohost-only
+    // write FSM -- same channel, same outer port names, real bus path now.
+    // DCache is INSIDE this module (no separate top-level instance).
+    //
+    // ADDR_TOHOST confirmation (Task 7.1): the M2 Task-1 relocation of
+    // tohost to rvproc_pkg's ADDR_TOHOST = 0x7FFF_F000 reaches this store
+    // path unchanged -- 0x7FFF_F000 matches none of RVProcAXI's
+    // CLINT/PLIC/UART base/mask pairs, so AXIAddrDecode.v routes it to
+    // DEFAULT_SLAVE (SI_MEM), the same wide 512-bit MEM slave the M1
+    // FetchSink tohost stores used (and the same routing test/m1/common.ld
+    // relies on). No new decision; the value was already landed in Task 1.
+    //=========================================================================
+    LSU #(
+        .DATA_WIDTH   (DATA_WIDTH),
+        .ADDR_WIDTH   (ADDR_WIDTH)
+    ) u_lsu (
+        .clk                     (clk),
+        .rst_n                   (rst_n),
+
+        .idu_lsu_ex1_dp_sel      (idu_lsu_ex1_dp_sel),
+        .idu_lsu_ex1_sel         (idu_lsu_ex1_sel),
+        .idu_lsu_ex1_func        (idu_lsu_ex1_func),
+        .idu_lsu_ex1_src0_data   (idu_lsu_ex1_src0_data),
+        .idu_lsu_ex1_src0_ready  (idu_lsu_ex1_src0_ready),
+        .idu_lsu_ex1_src1_data   (idu_lsu_ex1_src1_data),
+        .idu_lsu_ex1_src1_ready  (idu_lsu_ex1_src1_ready),
+        .idu_lsu_ex1_src2_data   (idu_lsu_ex1_src2_data),
+        .idu_lsu_ex1_src2_ready  (idu_lsu_ex1_src2_ready),
+        .idu_lsu_ex1_dst0_reg    (idu_lsu_ex1_dst0_reg),
+        .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
+
+        .lsu_idu_full            (lsu_idu_full),
+
+        .lsu_rtu_ex1_cmplt       (lsu_rtu_ex1_cmplt),
+        .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
+        .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
+        .lsu_rtu_wb_data         (lsu_rtu_wb_data),
+        .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
+        .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
+        .lsu_rtu_ex2_data        (lsu_rtu_ex2_data),
+        .lsu_rtu_ex2_data_vld    (lsu_rtu_ex2_data_vld),
+        .lsu_rtu_ex2_dest_reg    (lsu_rtu_ex2_dest_reg),
+        .lsu_rtu_expt_vld        (lsu_rtu_expt_vld),
+        .lsu_rtu_expt_vec        (lsu_rtu_expt_vec),
+        .lsu_rtu_tval            (lsu_rtu_tval),
+        .lsu_rtu_async_expt_vld  (lsu_rtu_async_expt_vld),
+        .lsu_rtu_async_ld_inst   (lsu_rtu_async_ld_inst),
+
+        .rtu_lsu_expt_ack        (rtu_lsu_expt_ack),
+        .rtu_lsu_expt_exit       (rtu_lsu_expt_exit),
+
+        .lsu_mmu_va              (lsu_mmu_va),
+        .lsu_mmu_va_vld          (lsu_mmu_va_vld),
+        .lsu_mmu_priv_mode       (lsu_mmu_priv_mode),
+        .lsu_mmu_st_inst         (lsu_mmu_st_inst),
+        .mmu_lsu_pa              (mmu_lsu_pa),
+        .mmu_lsu_pa_vld          (mmu_lsu_pa_vld),
+        .mmu_lsu_ca              (mmu_lsu_ca),
+        .mmu_lsu_so              (mmu_lsu_so),
+        .mmu_lsu_buf             (mmu_lsu_buf),
+        .mmu_lsu_sec             (mmu_lsu_sec),
+        .mmu_lsu_sh              (mmu_lsu_sh),
+        .mmu_lsu_page_fault      (mmu_lsu_page_fault),
+        .mmu_lsu_access_fault    (mmu_lsu_access_fault),
+
+        .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
+        .cp0_lsu_mm              (cp0_lsu_mm),
+        .cp0_lsu_wa              (cp0_lsu_wa),
 
         .axi_d_awvalid           (axi_d_awvalid),
         .axi_d_awready           (axi_d_awready),
@@ -540,6 +989,201 @@ module RVProc #(
         .axi_d_rdata             (axi_d_rdata),
         .axi_d_rresp             (axi_d_rresp),
         .axi_d_rlast             (axi_d_rlast)
+    );
+
+    //=========================================================================
+    // RTU instance: retire unit (Task 4). `rtu_yy_xx_dbgon` (the donor's
+    // debug-on broadcast) has no M2 consumer -- no debug unit exists in
+    // this milestone -- so it is left unconnected here, same as the
+    // pre-existing empty `.G_mem_pin_intr()` pin in RVProcAXI.v.
+    //=========================================================================
+    RTU u_rtu (
+        .clk                     (clk),
+        .rst_n                   (rst_n),
+
+        .iu_rtu_ex1_alu_cmplt    (iu_rtu_ex1_alu_cmplt),
+        .iu_rtu_ex1_alu_cmplt_dp (iu_rtu_ex1_alu_cmplt_dp),
+        .iu_rtu_ex1_alu_data     (iu_rtu_ex1_alu_data),
+        .iu_rtu_ex1_alu_inst_len (iu_rtu_ex1_alu_inst_len),
+        .iu_rtu_ex1_alu_inst_split (iu_rtu_ex1_alu_inst_split),
+        .iu_rtu_ex1_alu_preg     (iu_rtu_ex1_alu_preg),
+        .iu_rtu_ex1_alu_wb_dp    (iu_rtu_ex1_alu_wb_dp),
+        .iu_rtu_ex1_alu_wb_vld   (iu_rtu_ex1_alu_wb_vld),
+
+        .iu_rtu_ex1_bju_cmplt    (iu_rtu_ex1_bju_cmplt),
+        .iu_rtu_ex1_bju_cmplt_dp (iu_rtu_ex1_bju_cmplt_dp),
+        .iu_rtu_ex1_bju_data     (iu_rtu_ex1_bju_data),
+        .iu_rtu_ex1_bju_inst_len (iu_rtu_ex1_bju_inst_len),
+        .iu_rtu_ex1_bju_preg     (iu_rtu_ex1_bju_preg),
+        .iu_rtu_ex1_bju_wb_dp    (iu_rtu_ex1_bju_wb_dp),
+        .iu_rtu_ex1_bju_wb_vld   (iu_rtu_ex1_bju_wb_vld),
+        .iu_rtu_ex1_branch_inst  (iu_rtu_ex1_branch_inst),
+        .iu_rtu_ex1_cur_pc       (iu_rtu_ex1_cur_pc),
+        .iu_rtu_ex1_next_pc      (iu_rtu_ex1_next_pc),
+        .iu_rtu_ex2_bju_ras_mispred (iu_rtu_ex2_bju_ras_mispred),
+        .iu_rtu_depd_lsu_chgflow_vld (iu_rtu_depd_lsu_chgflow_vld),
+        .iu_rtu_depd_lsu_chgflow_next_pc (iu_rtu_depd_lsu_chgflow_next_pc),
+
+        .iu_rtu_ex1_mul_cmplt    (iu_rtu_ex1_mul_cmplt),
+        .iu_rtu_ex1_mul_cmplt_dp (iu_rtu_ex1_mul_cmplt_dp),
+        .iu_rtu_ex1_mul_inst_len (iu_rtu_ex1_mul_inst_len),
+        .iu_rtu_ex3_mul_data     (iu_rtu_ex3_mul_data),
+        .iu_rtu_ex3_mul_preg     (iu_rtu_ex3_mul_preg),
+        .iu_rtu_ex3_mul_wb_vld   (iu_rtu_ex3_mul_wb_vld),
+
+        .iu_rtu_ex1_div_cmplt    (iu_rtu_ex1_div_cmplt),
+        .iu_rtu_ex1_div_cmplt_dp (iu_rtu_ex1_div_cmplt_dp),
+        .iu_rtu_ex1_div_inst_len (iu_rtu_ex1_div_inst_len),
+        .iu_rtu_div_data         (iu_rtu_div_data),
+        .iu_rtu_div_preg         (iu_rtu_div_preg),
+        .iu_rtu_div_wb_dp        (iu_rtu_div_wb_dp),
+        .iu_rtu_div_wb_vld       (iu_rtu_div_wb_vld),
+
+        .rtu_iu_mul_wb_grant     (rtu_iu_mul_wb_grant),
+        .rtu_iu_div_wb_grant     (rtu_iu_div_wb_grant),
+
+        .rtu_iu_ex1_cmplt        (rtu_iu_ex1_cmplt),
+        .rtu_iu_ex1_inst_len     (rtu_iu_ex1_inst_len),
+        .rtu_iu_ex1_inst_split   (rtu_iu_ex1_inst_split),
+
+        .lsu_rtu_ex1_cmplt       (lsu_rtu_ex1_cmplt),
+        .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
+        .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
+        .lsu_rtu_wb_data         (lsu_rtu_wb_data),
+        .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
+        .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
+        .lsu_rtu_ex2_data        (lsu_rtu_ex2_data),
+        .lsu_rtu_ex2_data_vld    (lsu_rtu_ex2_data_vld),
+        .lsu_rtu_ex2_dest_reg    (lsu_rtu_ex2_dest_reg),
+        .lsu_rtu_expt_vld        (lsu_rtu_expt_vld),
+        .lsu_rtu_expt_vec        (lsu_rtu_expt_vec),
+        .lsu_rtu_tval            (lsu_rtu_tval),
+        .lsu_rtu_async_expt_vld  (lsu_rtu_async_expt_vld),
+        .lsu_rtu_async_ld_inst   (lsu_rtu_async_ld_inst),
+
+        .rtu_lsu_expt_ack        (rtu_lsu_expt_ack),
+        .rtu_lsu_expt_exit       (rtu_lsu_expt_exit),
+
+        .cp0_rtu_ex1_cmplt_dp    (cp0_rtu_ex1_cmplt_dp),
+        .cp0_rtu_ex1_inst_len    (cp0_rtu_ex1_inst_len),
+        .cp0_rtu_ex1_wb_data     (cp0_rtu_ex1_wb_data),
+        .cp0_rtu_ex1_wb_preg     (cp0_rtu_ex1_wb_preg),
+        .cp0_rtu_ex1_wb_vld      (cp0_rtu_ex1_wb_vld),
+        .cp0_rtu_ex1_expt_vld    (cp0_rtu_ex1_expt_vld),
+        .cp0_rtu_ex1_expt_int    (cp0_rtu_ex1_expt_int),
+        .cp0_rtu_ex1_expt_vec    (cp0_rtu_ex1_expt_vec),
+        .cp0_rtu_ex1_chgflw      (cp0_rtu_ex1_chgflw),
+        .cp0_rtu_ex1_chgflw_pc   (cp0_rtu_ex1_chgflw_pc),
+        .cp0_rtu_trap_pc         (cp0_rtu_trap_pc),
+
+        .rtu_yy_xx_expt_vld      (rtu_yy_xx_expt_vld),
+        .rtu_yy_xx_expt_int      (rtu_yy_xx_expt_int),
+        .rtu_yy_xx_expt_vec      (rtu_yy_xx_expt_vec),
+        .rtu_yy_xx_flush_fe      (rtu_yy_xx_flush_fe),
+        .rtu_yy_xx_flush         (rtu_yy_xx_flush),
+        .rtu_yy_xx_dbgon         (),
+        .rtu_cp0_epc             (rtu_cp0_epc),
+        .rtu_cp0_tval            (rtu_cp0_tval),
+
+        .rtu_ifu_chgflw_vld      (rtu_ifu_chgflw_vld),
+        .rtu_ifu_chgflw_pc       (rtu_ifu_chgflw_pc),
+        .rtu_ifu_flush_fe        (rtu_ifu_flush_fe),
+
+        .rtu_idu_fwd0_data       (rtu_idu_fwd0_data),
+        .rtu_idu_fwd0_reg        (rtu_idu_fwd0_reg),
+        .rtu_idu_fwd0_vld        (rtu_idu_fwd0_vld),
+        .rtu_idu_fwd1_data       (rtu_idu_fwd1_data),
+        .rtu_idu_fwd1_reg        (rtu_idu_fwd1_reg),
+        .rtu_idu_fwd1_vld        (rtu_idu_fwd1_vld),
+        .rtu_idu_fwd2_data       (rtu_idu_fwd2_data),
+        .rtu_idu_fwd2_reg        (rtu_idu_fwd2_reg),
+        .rtu_idu_fwd2_vld        (rtu_idu_fwd2_vld),
+        .rtu_idu_wb0_data        (rtu_idu_wb0_data),
+        .rtu_idu_wb0_reg         (rtu_idu_wb0_reg),
+        .rtu_idu_wb0_vld         (rtu_idu_wb0_vld),
+        .rtu_idu_wb1_data        (rtu_idu_wb1_data),
+        .rtu_idu_wb1_reg         (rtu_idu_wb1_reg),
+        .rtu_idu_wb1_vld         (rtu_idu_wb1_vld),
+        .rtu_idu_flush_fe        (rtu_idu_flush_fe),
+        .rtu_idu_flush_stall     (rtu_idu_flush_stall),
+        .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),
+        .rtu_idu_commit          (rtu_idu_commit),
+        .rtu_idu_commit_for_bju  (rtu_idu_commit_for_bju),
+        .rtu_idu_pipeline_empty  (rtu_idu_pipeline_empty)
+    );
+
+    //=========================================================================
+    // CSR instance: the minimal M-mode CSR file (Task 2). Drives the
+    // I-side config bank (re-pointed from FetchSink's harness bank per
+    // design doc S2.3.6's open integration item), the BPU config bank,
+    // the LSU MHCR/MXSTATUS wires, and cp0_xx_mrvbr (reset vector, for
+    // real from mrvbr). mtip/msip/meip land in its mip wiring (contract 7).
+    // RESET_VECTOR is passed through from this module's own parameter so
+    // mrvbr's reset value matches what IFU/BJU/ICache seed from (the same
+    // value FetchSink's TOHOST-era RESET_VECTOR parameter used to carry).
+    //=========================================================================
+    CSR #(
+        .RESET_VECTOR (RESET_VECTOR)
+    ) u_csr (
+        .clk                     (clk),
+        .rst_n                   (rst_n),
+
+        .idu_cp0_ex1_sel         (idu_cp0_ex1_sel),
+        .idu_cp0_ex1_func        (idu_cp0_ex1_func),
+        .idu_cp0_ex1_opcode      (idu_cp0_ex1_opcode),
+        .idu_cp0_ex1_illegal     (idu_cp0_ex1_illegal),
+        .idu_cp0_ex1_src0_data   (idu_cp0_ex1_src0_data),
+        .idu_cp0_ex1_src1_data   (idu_cp0_ex1_src1_data),
+        .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
+        .idu_cp0_ex1_inst_len    (idu_cp0_ex1_inst_len),
+
+        .iu_cp0_ex1_cur_pc       (iu_cp0_ex1_cur_pc),
+
+        .cp0_rtu_ex1_cmplt_dp    (cp0_rtu_ex1_cmplt_dp),
+        .cp0_rtu_ex1_inst_len    (cp0_rtu_ex1_inst_len),
+        .cp0_rtu_ex1_wb_data     (cp0_rtu_ex1_wb_data),
+        .cp0_rtu_ex1_wb_preg     (cp0_rtu_ex1_wb_preg),
+        .cp0_rtu_ex1_wb_vld      (cp0_rtu_ex1_wb_vld),
+        .cp0_rtu_ex1_expt_vld    (cp0_rtu_ex1_expt_vld),
+        .cp0_rtu_ex1_expt_int    (cp0_rtu_ex1_expt_int),
+        .cp0_rtu_ex1_expt_vec    (cp0_rtu_ex1_expt_vec),
+        .cp0_rtu_ex1_chgflw      (cp0_rtu_ex1_chgflw),
+        .cp0_rtu_ex1_chgflw_pc   (cp0_rtu_ex1_chgflw_pc),
+
+        .cp0_rtu_trap_pc         (cp0_rtu_trap_pc),
+
+        .rtu_yy_xx_expt_vld      (rtu_yy_xx_expt_vld),
+        .rtu_yy_xx_expt_int      (rtu_yy_xx_expt_int),
+        .rtu_yy_xx_expt_vec      (rtu_yy_xx_expt_vec),
+        .rtu_yy_xx_flush_fe      (rtu_yy_xx_flush_fe),
+        .rtu_yy_xx_flush         (rtu_yy_xx_flush),
+        .rtu_cp0_epc             (rtu_cp0_epc),
+        .rtu_cp0_tval            (rtu_cp0_tval),
+
+        .cp0_ifu_icache_en       (cp0_ifu_icache_en),
+        .cp0_ifu_iwpe            (cp0_ifu_iwpe),
+        .cp0_ifu_icache_pref_en  (cp0_ifu_icache_pref_en),
+        .cp0_ifu_icache_inv_addr (cp0_ifu_icache_inv_addr),
+        .cp0_ifu_icache_inv_req  (cp0_ifu_icache_inv_req),
+        .cp0_ifu_icache_inv_type (cp0_ifu_icache_inv_type),
+        .ifu_cp0_icache_inv_done (ifu_cp0_icache_inv_done),
+
+        .cp0_ifu_bht_en          (cp0_ifu_bht_en),
+        .cp0_ifu_btb_en          (cp0_ifu_btb_en),
+        .cp0_ifu_ras_en          (cp0_ifu_ras_en),
+        .cp0_ifu_bht_inv         (cp0_ifu_bht_inv),
+        .cp0_ifu_btb_clr         (cp0_ifu_btb_clr),
+        .bht_cp0_inv_done        (bht_cp0_inv_done),
+
+        .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
+        .cp0_lsu_mm              (cp0_lsu_mm),
+        .cp0_lsu_wa              (cp0_lsu_wa),
+
+        .cp0_xx_mrvbr            (cp0_xx_mrvbr),
+
+        .mtip                    (mtip),
+        .msip                    (msip),
+        .meip                    (meip)
     );
 
     //=========================================================================

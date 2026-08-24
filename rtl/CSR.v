@@ -86,6 +86,10 @@ module CSR #(
     input  wire [63:0]              idu_cp0_ex1_src0_data, // rs1 (CSRRW/S/C only)
     input  wire [63:0]              idu_cp0_ex1_src1_data, // CSR address
     input  wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg,  // rd (old CSR value)
+    // Task 7.3: the EX1 instruction's length (1=32b,0=16b RVC; c.ebreak is
+    // 16-bit) for the CSR slice -- feeds the RTU pcgen inst_len mux
+    // (aq_rtu_dp.v:371 cp0 arm).
+    input  wire                     idu_cp0_ex1_inst_len,
 
     //=========================================================================
     // IU -> CSR : the only IU<->CP0 connection besides config (IU note
@@ -103,6 +107,9 @@ module CSR #(
     // bus (RTU note S4/S7).
     //=========================================================================
     output wire                     cp0_rtu_ex1_cmplt_dp,  // one-hot cmplt source
+    // Task 7.3: the completing CSR instruction's length, for the RTU pcgen
+    // inst_len mux (donor aq_rtu_dp.v:371 cp0 arm).
+    output wire                     cp0_rtu_ex1_inst_len,
     output wire [63:0]              cp0_rtu_ex1_wb_data,
     output wire [GPR_IDX_WIDTH-1:0] cp0_rtu_ex1_wb_preg,
     output wire                     cp0_rtu_ex1_wb_vld,
@@ -646,6 +653,10 @@ module CSR #(
     assign cp0_rtu_ex1_wb_data  = csr_rdata;
     assign cp0_rtu_ex1_wb_preg  = idu_cp0_ex1_dst0_reg;
     assign cp0_rtu_ex1_cmplt_dp = ex1_active;
+    // Task 7.3: the completing CSR instruction's length. CP0 completes in
+    // EX1 (single cycle), so the completing instruction IS the live EX1
+    // instruction -- no latching needed.
+    assign cp0_rtu_ex1_inst_len = idu_cp0_ex1_inst_len;
 
     // Synchronous exceptions CP0 itself detects: illegal instruction (any
     // CP0-dispatched op IDU already flagged illegal), ecall (M-mode only --
