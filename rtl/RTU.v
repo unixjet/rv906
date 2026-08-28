@@ -230,6 +230,11 @@ module RTU (
     //=========================================================================
     input  wire                     lsu_rtu_ex1_cmplt,
     input  wire                     lsu_rtu_ex1_cmplt_dp,
+    // Task 9.7 (class-B clone fix): the EARLY "for pcgen" LSU completion
+    // (donor aq_lsu_ag.v:1675 ag_pipe_cmplt_normal). Drives ONLY the pcgen
+    // completion OR -- NOT retire, which stays on the late `lsu_rtu_ex1_
+    // cmplt_dp`. See the rtu_iu_ex1_cmplt note below for the full rationale.
+    input  wire                     lsu_rtu_ex1_cmplt_for_pcgen,
     // Task 7.3: completing-LSU length for the pcgen inst_len mux
     // (donor aq_rtu_dp.v:367 lsu arm).
     input  wire                     lsu_rtu_ex1_inst_len,
@@ -363,15 +368,26 @@ module RTU (
     localparam [6:0] CBUS_CP0_SEL = 7'b0000010;
     localparam [6:0] CBUS_VEC_SEL = 7'b0000001;
 
-    // rtu_iu_ex1_cmplt = the pcgen completion OR (donor
-    // ctrl_ex1_cmplt_for_pcgen, aq_rtu_ctrl.v:148-156). In the donor the LSU
-    // arm uses the special `lsu_rtu_ex1_cmplt_for_pcgen` (aq_lsu_ag.v:1675
-    // ag_pipe_cmplt_normal, which excludes PC-non-advancing ops); in M2 every
-    // LSU load/store advances the PC and a faulting access redirects through
-    // the higher-priority changeflow branch in IU's pcgen, so `dp_ex1_cmplt_
-    // dp` (which ORs lsu_rtu_ex1_cmplt_dp) is an exact stand-in. Re-verify if
-    // M2 ever adds a PC-non-advancing LSU op.
-    assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_dp;
+    // The donor's pcgen trigger is NOT the retire completion: aq_rtu_ctrl.v
+    // :151-157 builds a SEPARATE `ctrl_ex1_cmplt_for_pcgen` whose LSU arm is
+    // `lsu_rtu_ex1_cmplt_for_pcgen` (aq_lsu_ag.v:1675 ag_pipe_cmplt_normal)
+    // instead of the real `lsu_rtu_ex1_cmplt` -- every OTHER arm (alu/mul/
+    // bju/div/cp0/vec) is identical to the retire OR. The distinction is
+    // about WHEN the LSU arm fires, not which ops advance the PC: a store
+    // leaves the EX1 register one cycle after entering it, but its memory op
+    // (this LSU's IDLE->DCS->FRZ/REPLY pipe) runs several cycles longer.
+    // Driving the pcgen off the late `lsu_rtu_ex1_cmplt_dp` left it one
+    // instruction (4B) behind the EX1-resident instruction, so the next
+    // auipc and the next taken-branch target both computed pc+imm from the
+    // PREVIOUS instruction's pc -- the M2 tohost loop (auipc; sw; auipc;
+    // sw; j) self-reinforced a 4-behind steady state and tohost never read
+    // the pass value. Task 9.7 fix: OR the early for-pcgen arm here.
+    wire ex1_lsu_cmplt_for_pcgen = lsu_rtu_ex1_cmplt_for_pcgen;
+    wire dp_ex1_cmplt_for_pcgen  = ex1_alu_cmplt_dp  || ex1_mul_cmplt_dp
+                                  || ex1_bju_cmplt_dp || ex1_div_cmplt_dp
+                                  || ex1_lsu_cmplt_for_pcgen || ex1_cp0_cmplt_dp
+                                  || ex1_vec_cmplt_dp;
+    assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_for_pcgen;
 
     // rtu_iu_ex1_inst_len = the COMPLETING instruction's length, muxed by
     // the completing EU (donor aq_rtu_dp.v:350-379). ALU/BJU/LSU/CP0 carry

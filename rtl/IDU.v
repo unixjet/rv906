@@ -249,6 +249,7 @@ module IDU (
     // header; not consumed by any logic below (landing pad only).
     //=========================================================================
     input  wire                     rtu_idu_flush_fe,
+    input  wire                     iu_idu_br_cancel,    // donor aq_idu_id_ctrl.v:604 (iu_yy_xx_cancel); ORs into the EX1-inst-valid cancel
     input  wire                     rtu_idu_flush_stall,
     input  wire                     rtu_idu_flush_wbt,
     input  wire                     rtu_idu_commit,
@@ -968,9 +969,18 @@ module IDU (
     // create only on a non-stalled dispatch (wbt.v:777-798's own gating --
     // no split concept in M2, contract 10, so `ctrl_wbt_dis_inst_vld` is
     // simply `ifu_idu_id_inst_vld`).
+    //
+    // Gated on `!iu_idu_br_cancel` exactly like the donor's per-entry create
+    // (aq_idu_id_wbt_entry.v:75: `create_en = (create0_en_x || create1_en_x)
+    // && !iu_yy_xx_cancel`): on a branch-mispredict redirect the ID-stage
+    // (wrong-path) instruction is cancelled from EX1 and must NOT arm a WBT
+    // busy-bit -- otherwise its busy-bit is never written back and the
+    // register reads as permanently pending (rv64ui-p-beq: a fallthrough
+    // `addi ra,ra,1` armed x1's busy-bit the cycle the taken `beqz` redirected,
+    // then parked the later `bne ra,t2`).
     wire [31:0] wbt_create0 = onehot32(dis_dst0_reg5,
-                                        dis_dst0_vld && ifu_idu_id_inst_vld && !ctrl_dis_stall);
-
+                                        dis_dst0_vld && ifu_idu_id_inst_vld && !ctrl_dis_stall
+                                        && !iu_idu_br_cancel);
     genvar gi;
     generate
         for (gi = 1; gi <= 31; gi = gi + 1) begin : g_wbt
@@ -1248,7 +1258,7 @@ module IDU (
         if (!rst_n) begin
             ex1_vld_r <= 1'b0;
             ex1_eu_r  <= {EU_WIDTH{1'b0}};
-        end else if (rtu_idu_flush_fe) begin
+        end else if (rtu_idu_flush_fe || iu_idu_br_cancel) begin
             ex1_vld_r <= 1'b0;
             ex1_eu_r  <= {EU_WIDTH{1'b0}};
         end else if (adv) begin

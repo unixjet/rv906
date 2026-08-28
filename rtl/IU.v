@@ -290,6 +290,17 @@ module IU (
     input  wire [PC_WIDTH-1:0]      ifu_iu_chgflw_pc,
 
     //=========================================================================
+    // Donor-faithful branch-mispredict cancel to the IDU. aq_iu_bju.v:783
+    // `assign iu_yy_xx_cancel = iu_ifu_tar_pc_vld`; aq_idu_id_ctrl.v:604 ORs
+    // it into the EX1-inst-valid cancel (`rtu_idu_flush_fe || iu_yy_xx_cancel`)
+    // so the ID-stage wrong-path instruction is dropped from the ID->EX1
+    // latch on the mispredict cycle. M2 has no branch predictor, so every
+    // taken branch/jump mispredicts (predicted not-taken) and this cancel is
+    // what keeps the superseded sequential instruction out of EX1.
+    //=========================================================================
+    output wire                     iu_idu_br_cancel,
+
+    //=========================================================================
     // BJU's private LSU-dependent conditional-branch forward (IU note
     // S4.4) -- consumed ONLY by BJU's 1-entry buffer, not ALU/MULT/DIV.
     //=========================================================================
@@ -741,6 +752,7 @@ module IU (
                           && (idu_iu_ex1_dst0_reg[4:0] == 5'd1);
 
     assign iu_ifu_tar_pc_vld  = bju_redirect_now;
+    assign iu_idu_br_cancel   = bju_redirect_now;   // donor aq_iu_bju.v:783 (iu_yy_xx_cancel = iu_ifu_tar_pc_vld)
     assign iu_ifu_tar_pc      = {{(64-PC_WIDTH){1'b0}}, bju_next_pc};
     assign iu_ifu_pc_mispred  = bju_resolves_now && bju_pc_reg_mispred;
     assign iu_ifu_bht_mispred = bju_cond_br_mispred;

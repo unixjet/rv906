@@ -109,6 +109,20 @@ module LSU #(
     //=========================================================================
     output wire                     lsu_rtu_ex1_cmplt,
     output wire                     lsu_rtu_ex1_cmplt_dp,
+    // Task 9.7 (class-B clone fix, donor aq_lsu_ag.v:1675): the EARLY
+    // "for pcgen" completion -- fires the cycle AG accepts the instruction
+    // (the store's address-gen is done and the DC FSM is ready to issue),
+    // NOT when the memory op's REPLY lands. The donor drives the IU pcgen
+    // off exactly this signal (`lsu_rtu_ex1_cmplt_for_pcgen =
+    // ag_pipe_cmplt_normal`), keeping the pcgen in lockstep with the EX1
+    // register: a store leaves EX1 one cycle after entering it, but its
+    // memory op (this module's IDLE->DCS->FRZ/REPLY pipe) runs several
+    // cycles longer. Advancing the pcgen on the late `lsu_rtu_ex1_cmplt_dp`
+    // instead leaves it one instruction (4B) behind the EX1-resident
+    // instruction, so the next auipc/branch computes pc+imm from the
+    // PREVIOUS instruction's pc. See the matching RTU.v note for the
+    // retire-vs-pcgen separation (donor aq_rtu_ctrl.v:151-157).
+    output wire                     lsu_rtu_ex1_cmplt_for_pcgen,
     // Task 7.3: the COMPLETING LSU instruction's length, for the RTU pcgen
     // inst_len mux (donor aq_lsu_top.v:405 / aq_rtu_dp.v:367).
     output wire                     lsu_rtu_ex1_inst_len,
@@ -991,6 +1005,12 @@ module LSU #(
 
     assign lsu_rtu_ex1_cmplt_dp   = (state == ST_REPLY) && reply_can_complete && !dc_is_drain_r;
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
+    // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
+    // ag_pipe_cmplt_normal ~ ag_pipe_inst_vld && dt_fsm_idle). In this
+    // module that is exactly `issue_real`: a real (non-drain) instruction is
+    // in AG (ag_valid) and the DC FSM is idle and about to accept it. Drains
+    // are internal, not instructions, so they never advance the pcgen.
+    assign lsu_rtu_ex1_cmplt_for_pcgen = issue_real;
     // Task 7.3: the completing LSU instruction's length (drains excluded by
     // the same !dc_is_drain_r the cmplt above already applies).
     assign lsu_rtu_ex1_inst_len   = dc_inst_len_r;

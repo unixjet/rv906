@@ -274,6 +274,7 @@ module RVProc #(
     wire [63:0]              iu_ifu_tar_pc;
     wire                     iu_ifu_pc_mispred;
     wire                     iu_ifu_bht_mispred;
+    wire                     iu_idu_br_cancel;   // branch-mispredict cancel IU->IDU (donor iu_yy_xx_cancel)
     wire                     iu_ifu_br_vld;
     wire                     iu_ifu_bht_taken;
     wire [1:0]               iu_ifu_bht_pred;
@@ -408,6 +409,7 @@ module RVProc #(
     //=========================================================================
     wire                     lsu_rtu_ex1_cmplt;
     wire                     lsu_rtu_ex1_cmplt_dp;
+    wire                     lsu_rtu_ex1_cmplt_for_pcgen;   // Task 9.7 (donor aq_lsu_ag.v:1675)
     wire                     lsu_rtu_ex1_inst_len;   // Task 7.3
     wire [63:0]              lsu_rtu_wb_data;
     wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg;
@@ -777,6 +779,7 @@ module RVProc #(
         .lsu_idu_full            (lsu_idu_full),
 
         .rtu_idu_flush_fe        (rtu_idu_flush_fe),
+        .iu_idu_br_cancel        (iu_idu_br_cancel),
         .rtu_idu_flush_stall     (rtu_idu_flush_stall),
         .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),
         .rtu_idu_commit          (rtu_idu_commit),
@@ -876,6 +879,7 @@ module RVProc #(
         .iu_ifu_ret_vld          (iu_ifu_ret_vld),
         .ifu_iu_chgflw_vld       (ifu_iu_chgflw_vld),
         .ifu_iu_chgflw_pc        (ifu_iu_chgflw_pc),
+        .iu_idu_br_cancel        (iu_idu_br_cancel),
 
         .da_xx_fwd_data          (lsu_rtu_ex2_data),
         .da_xx_fwd_dst_reg       (lsu_rtu_ex2_dest_reg),
@@ -926,6 +930,7 @@ module RVProc #(
 
         .lsu_rtu_ex1_cmplt       (lsu_rtu_ex1_cmplt),
         .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
+        .lsu_rtu_ex1_cmplt_for_pcgen (lsu_rtu_ex1_cmplt_for_pcgen),
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
@@ -1048,6 +1053,7 @@ module RVProc #(
 
         .lsu_rtu_ex1_cmplt       (lsu_rtu_ex1_cmplt),
         .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
+        .lsu_rtu_ex1_cmplt_for_pcgen (lsu_rtu_ex1_cmplt_for_pcgen),
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
