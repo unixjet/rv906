@@ -368,6 +368,7 @@ module RVProc #(
 
     wire                     iu_rtu_ex1_bju_cmplt;
     wire                     iu_rtu_ex1_bju_cmplt_dp;
+    wire                     iu_rtu_ex1_bju_cmplt_for_pcgen;
     wire [63:0]              iu_rtu_ex1_bju_data;
     wire                     iu_rtu_ex1_bju_inst_len;
     wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex1_bju_preg;
@@ -835,6 +836,7 @@ module RVProc #(
 
         .iu_rtu_ex1_bju_cmplt    (iu_rtu_ex1_bju_cmplt),
         .iu_rtu_ex1_bju_cmplt_dp (iu_rtu_ex1_bju_cmplt_dp),
+        .iu_rtu_ex1_bju_cmplt_for_pcgen (iu_rtu_ex1_bju_cmplt_for_pcgen),
         .iu_rtu_ex1_bju_data     (iu_rtu_ex1_bju_data),
         .iu_rtu_ex1_bju_inst_len (iu_rtu_ex1_bju_inst_len),
         .iu_rtu_ex1_bju_preg     (iu_rtu_ex1_bju_preg),
@@ -1017,6 +1019,7 @@ module RVProc #(
 
         .iu_rtu_ex1_bju_cmplt    (iu_rtu_ex1_bju_cmplt),
         .iu_rtu_ex1_bju_cmplt_dp (iu_rtu_ex1_bju_cmplt_dp),
+        .iu_rtu_ex1_bju_cmplt_for_pcgen (iu_rtu_ex1_bju_cmplt_for_pcgen),
         .iu_rtu_ex1_bju_data     (iu_rtu_ex1_bju_data),
         .iu_rtu_ex1_bju_inst_len (iu_rtu_ex1_bju_inst_len),
         .iu_rtu_ex1_bju_preg     (iu_rtu_ex1_bju_preg),

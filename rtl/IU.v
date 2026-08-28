@@ -206,6 +206,7 @@ module IU (
     // delayed-entry mispredict/dependent-LSU-changeflow cases (IU note S10).
     output wire                     iu_rtu_ex1_bju_cmplt,
     output wire                     iu_rtu_ex1_bju_cmplt_dp,
+    output wire                     iu_rtu_ex1_bju_cmplt_for_pcgen,
     output wire [63:0]              iu_rtu_ex1_bju_data,
     output wire                     iu_rtu_ex1_bju_inst_len,
     output wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex1_bju_preg,
@@ -743,6 +744,15 @@ module IU (
     wire bju_resolves_now = bju_entry_pop
                           || (idu_iu_ex1_bju_sel && !bju_entry_vld_r && !bju_create_entry);
 
+    // PC-gen next pc (donor aq_iu_bju.v:572-581,624-625): the pcgen tracks the
+    // EX1 register, so its non-taken fall-through is always the LIVE
+    // `bju_pcgen_pc + len` (bju_inc_pc_ext = bju_cur_pc_ext + len, cur_pc =
+    // bju_pcgen_pc), NOT the latched entry inc-pc. While a cond-branch is
+    // parked in the entry the pcgen self-increments off the live pc to stay
+    // locked to EX1; only a resolving+taken branch sends it to the target.
+    wire [PC_WIDTH-1:0] bju_pcgen_next_pc =
+        (bju_resolves_now && bju_taken) ? bju_target_pc : bju_inc_pc_rt;
+
     wire bju_redirect_now = bju_resolves_now && (bju_cond_br_mispred || bju_pc_reg_mispred);
 
     wire bju_ret_vld_raw  = bju_is_jalr_live && !bju_entry_vld_r
@@ -802,7 +812,7 @@ module IU (
         else if (ifu_iu_chgflw_vld)
             bju_pcgen_pc <= ifu_iu_chgflw_pc;
         else if (rtu_iu_ex1_cmplt && !rtu_iu_ex1_inst_split)
-            bju_pcgen_pc <= bju_next_pc;
+            bju_pcgen_pc <= bju_pcgen_next_pc;
     end
 
     // -----------------------------------------------------------------
@@ -824,6 +834,17 @@ module IU (
 
     assign iu_rtu_ex1_bju_cmplt            = bju_resolves_now;
     assign iu_rtu_ex1_bju_cmplt_dp         = bju_resolves_now;
+    // for-pcgen completion (LSU aq_lsu_ag.v:1675 / RTU aq_rtu_ctrl.v:139
+    // pattern, applied to the bju): the pcgen must advance in lockstep with
+    // the EX1 register. A cond-branch that PARKS in the entry leaves EX1 the
+    // same cycle it is created (ex1 advances to the next inst) but does not
+    // retire until it pops, so its retire cmplt (bju_resolves_now) is low at
+    // creation and would leave the pcgen frozen one inst behind -- desyncing
+    // the auipc that reads bju_pcgen_pc (rv64ui-p-lb/sd). Fire the pcgen
+    // advance whenever the bju occupies EX1 and is not yet parked
+    // (resolving-in-EX1 OR creating-the-entry); a popped parked entry does not
+    // re-advance here (the mispredict redirect moves the pcgen instead).
+    assign iu_rtu_ex1_bju_cmplt_for_pcgen  = idu_iu_ex1_bju_sel && !bju_entry_vld_r;
     assign iu_rtu_ex1_bju_data             = bju_wb_data;
     assign iu_rtu_ex1_bju_inst_len         = bju_entry_vld_r ? bju_inst_len_flop : idu_iu_ex1_inst_len; // Task 7.3 (donor aq_iu_bju.v:806)
     assign iu_rtu_ex1_bju_preg             = idu_iu_ex1_dst0_reg;

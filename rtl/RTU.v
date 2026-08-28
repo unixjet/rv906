@@ -174,6 +174,7 @@ module RTU (
 
     input  wire                     iu_rtu_ex1_bju_cmplt,
     input  wire                     iu_rtu_ex1_bju_cmplt_dp,
+    input  wire                     iu_rtu_ex1_bju_cmplt_for_pcgen,
     input  wire [63:0]              iu_rtu_ex1_bju_data,
     input  wire                     iu_rtu_ex1_bju_inst_len,
     input  wire [GPR_IDX_WIDTH-1:0] iu_rtu_ex1_bju_preg,
@@ -383,8 +384,9 @@ module RTU (
     // sw; j) self-reinforced a 4-behind steady state and tohost never read
     // the pass value. Task 9.7 fix: OR the early for-pcgen arm here.
     wire ex1_lsu_cmplt_for_pcgen = lsu_rtu_ex1_cmplt_for_pcgen;
+    wire ex1_bju_cmplt_for_pcgen = iu_rtu_ex1_bju_cmplt_for_pcgen;
     wire dp_ex1_cmplt_for_pcgen  = ex1_alu_cmplt_dp  || ex1_mul_cmplt_dp
-                                  || ex1_bju_cmplt_dp || ex1_div_cmplt_dp
+                                  || ex1_bju_cmplt_for_pcgen || ex1_div_cmplt_dp
                                   || ex1_lsu_cmplt_for_pcgen || ex1_cp0_cmplt_dp
                                   || ex1_vec_cmplt_dp;
     assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_for_pcgen;
