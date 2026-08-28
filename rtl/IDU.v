@@ -1073,8 +1073,30 @@ module IDU (
         end
     endgenerate
 
+    // Donor-faithful read-during-write (aq_idu_id_gpr_gated_reg.v:86-109, the
+    // `read_data_y = write_data` line): the read port returns the SAME-CYCLE
+    // writeback (wb0 or wb1) when it targets this register, else the stored
+    // value. This is load-bearing, not an optimization: fwd0 covers only the
+    // 1-back dependency (producer at EX1, its result not yet on wb0), while the
+    // 2-back dependency (producer at EX2, result now on wb0/wb1) is seen ONLY
+    // through this same-cycle merge -- without it a `addi a1; addi a2; add
+    // a4,a1,a2` reads a1 stale and computes the wrong sum (rv64ui-p-add test_3/
+    // test_4). The 2'b11 arm is deliberately absent: both wb0 and wb1 naming the
+    // same register -> hold the old value, exactly like gated_reg.v:93-97. x0
+    // stays hardwired to 0 (a writeback naming x0 is an architectural no-op).
     function [63:0] gpr_read(input [4:0] regnum);
-        gpr_read = (regnum == 5'd0) ? 64'd0 : gpr_r[regnum];
+        reg [1:0] wsel;
+        begin
+            wsel = {gpr_wb1_oh[regnum], gpr_wb0_oh[regnum]};
+            if (regnum == 5'd0)
+                gpr_read = 64'd0;
+            else
+                case (wsel)
+                    2'b01:   gpr_read = rtu_idu_wb0_data;
+                    2'b10:   gpr_read = rtu_idu_wb1_data;
+                    default: gpr_read = gpr_r[regnum];
+                endcase
+        end
     endfunction
 
     wire [63:0] gpr_src0_data = gpr_read(dis_src0_reg5);
