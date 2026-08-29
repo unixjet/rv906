@@ -102,6 +102,19 @@ module LSU #(
     // confirmed name, aq_idu_id_ctrl.v:634).
     //=========================================================================
     output wire                     lsu_idu_full,
+    // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1, fence.i): high
+    // when no store/miss is in flight AND the STB is empty -- FENCE/FENCE.I
+    // wait for this before completing.
+    output wire                     lsu_cp0_stb_empty,
+    // CSR -> LSU / LSU -> CSR : FENCE.I D-cache clean walk (donor
+    // aq_cp0_fence_inst.v FNC_CDCA stage): CSR holds `cp0_lsu_dcache_clean`
+    // from LSU-quiescence until `lsu_cp0_clean_done` pulses; LSU walks every
+    // set, writes back each valid+dirty line (reusing the FRZ AXI-write
+    // sub-sequence) and invalidates it via dc_inv_* (frozen ports, driven
+    // for real starting now). Required so store-hit bytes reach the backing
+    // memory the ICache refills from, before the I-side invalidate.
+    input  wire                     cp0_lsu_dcache_clean,
+    output wire                     lsu_cp0_clean_done,
 
     //=========================================================================
     // LSU -> RTU : lsu_rtu_t (design doc S4.2) -- matches RTU.v's input
@@ -431,6 +444,12 @@ module LSU #(
     reg [63:0] stb_data     [0:3] /* verilator public */;
     reg [WAYS-1:0] stb_way  [0:3];
     reg        stb_was_hit  [0:3] /* verilator public */;
+    // Store size (0=B,1=H,2=W,3=D) per STB entry. Needed so a drained entry
+    // advertises the correct AXI awsize for its direct write-back. The donor
+    // C906 STB (aq_lsu_stb.v:895-901) carries stb_entryN_size per entry and
+    // drives stb_awsize from it; our `issue_drain` path does not relatch
+    // dc_size_r, so the store's own size would be STALE by drain time.
+    reg [2:0]  stb_size     [0:3] /* verilator public */;
 
     wire [60:0] ag_dword       = ag_addr[63:3];
     wire        stb_m0_ag = stb_vld[0] && (stb_addr[0][63:3] == ag_dword);
@@ -480,9 +499,9 @@ module LSU #(
     wire [DCACHE_TAG_WIDTH-1:0] u_dc_resp_victim_tag;
     wire                        u_dc_inv_done;
 
-    // No D$-maintenance op is decoded anywhere in M2 (contract 10) -- this
-    // module never drives dc_inv_vld. dcache_tb.cpp exercises DCache.v's
-    // own invalidate mechanism directly, standalone, per plan 6.4.
+    // dc_inv_* is driven by the FENCE.I clean walk (SECTION CLEAN below);
+    // dcache_tb.cpp exercises DCache.v's own invalidate mechanism directly,
+    // standalone, per plan 6.4.
 
     DCache u_dcache (
         .clk(clk), .rst_n(rst_n),
@@ -492,7 +511,7 @@ module LSU #(
         .dc_resp_vld(u_dc_resp_vld), .dc_resp_hit_way(u_dc_resp_hit_way), .dc_resp_rdata(u_dc_resp_rdata),
         .dc_resp_way_vld(u_dc_resp_way_vld), .dc_resp_way_dirty(u_dc_resp_way_dirty),
         .dc_resp_victim_tag(u_dc_resp_victim_tag),
-        .dc_inv_vld(1'b0), .dc_inv_index({DCACHE_INDEX_W{1'b0}}), .dc_inv_way_sel({WAYS{1'b0}}),
+        .dc_inv_vld(clean_inv_fire), .dc_inv_index(clean_set), .dc_inv_way_sel(clean_way_oh),
         .dc_inv_done(u_dc_inv_done)
     );
 
@@ -502,10 +521,10 @@ module LSU #(
     // task's own "STB drains unconditionally... but must not starve the
     // main pipe" framing.
     //-------------------------------------------------------------------------
-    wire issue_real  = (state == ST_IDLE) && ag_valid;   // misaligned accesses still
+    wire issue_real  = (state == ST_IDLE) && ag_valid && !clean_active;   // misaligned accesses still
                                                            // enter the pipe (see below) --
                                                            // they just never touch the array.
-    wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want;
+    wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active;
 
     wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign)
                         : issue_drain ? stb_was_hit[drain_pick]
@@ -640,7 +659,14 @@ module LSU #(
         end
     end
 
-    assign lsu_idu_full = (state != ST_IDLE);
+    assign lsu_idu_full = (state != ST_IDLE) || clean_active;
+    // Quiescent = pipe idle AND store buffer empty AND no clean walk in
+    // flight. state==ST_IDLE implies no AG-issued op is in flight
+    // (issue_real leaves IDLE the cycle it fires) and no drain/miss/
+    // writeback transaction is pending (all of those live in non-IDLE
+    // states). any_stb_vld covers the created-but-undrained entries whose
+    // eventual writes must be globally visible before a fence.
+    assign lsu_cp0_stb_empty = (state == ST_IDLE) && !any_stb_vld && !clean_active;
 
     //-------------------------------------------------------------------------
     // SECTION FRZ -- victim-select/writeback/refill-commit (cacheable miss)
@@ -692,6 +718,7 @@ module LSU #(
     reg [63:0]  axi_w_addr_r;
     reg [511:0] axi_w_data_r;
     reg [63:0]  axi_w_strb_r;
+    reg [2:0]   axi_w_awsize_r;
 
     wire axi_w_aw_hs = axi_d_awvalid && axi_d_awready;
     wire axi_w_w_hs  = axi_d_wvalid  && axi_d_wready;
@@ -719,6 +746,7 @@ module LSU #(
             axi_w_addr_r   <= 64'd0;
             axi_w_data_r   <= 512'd0;
             axi_w_strb_r   <= 64'd0;
+            axi_w_awsize_r <= 3'd6;
             axi_r_active   <= 1'b0;
             axi_r_ar_sent  <= 1'b0;
             axi_r_addr_r   <= 64'd0;
@@ -740,14 +768,25 @@ module LSU #(
                                     axi_w_active  <= 1'b1;
                                     axi_w_aw_sent <= 1'b0;
                                     axi_w_w_sent  <= 1'b0;
-                                    // PA is PC_WIDTH bits (tag+index+6); zero-extend
-                                    // onto the wider 64-bit AXI bus (Task 7.3: full-
-                                    // stack lint, behavior unchanged).
-                                    axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
+                                    // AW address is the STORE's physical
+                                    // address (donor C906 STB uses stb_entry_pa,
+                                    // aq_lsu_stb.v:895), not the line base: the
+                                    // sub-word beat is positioned at (addr[5:0])
+                                    // inside the 64B line and the AXI memory
+                                    // model sizes the write from addr[5:0].
+                                    // dc_addr_r holds the full store PA for both
+                                    // a real store (AG) and a drained entry.
+                                    axi_w_addr_r  <= dc_addr_r;
                                     axi_w_data_r  <= ({448'b0, (dc_is_drain_r ? stb_data[dc_drain_idx_r] : dc_store_data_r)})
                                                        << ({58'b0, (dc_is_drain_r ? stb_dw_off[dc_drain_idx_r] : dc_dw_off_r)} * 64);
                                     axi_w_strb_r  <= ({56'b0, (dc_is_drain_r ? stb_byte_vld[dc_drain_idx_r] : dc_byte_mask_r)})
                                                        << ({58'b0, (dc_is_drain_r ? stb_dw_off[dc_drain_idx_r] : dc_dw_off_r)} * 8);
+                                    // AW size = store size (sb->0..sd->3); a
+                                    // drained entry uses its tracked size (the
+                                    // store's own dc_size_r is stale by drain
+                                    // time). Donor: stb_awsize = stb_entry_size
+                                    // (aq_lsu_stb.v:898).
+                                    axi_w_awsize_r <= dc_is_drain_r ? stb_size[dc_drain_idx_r] : {1'b0, dc_size_r};
                                     miss_state <= MS_DIRECT_WRITE;
                                 end else begin
                                     axi_r_active  <= 1'b1;
@@ -773,6 +812,7 @@ module LSU #(
                                 axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, dc_index_r, 6'b0};
                                 axi_w_data_r  <= u_dc_resp_rdata;
                                 axi_w_strb_r  <= 64'hFFFF_FFFF_FFFF_FFFF;
+                                axi_w_awsize_r <= 3'd6;
                                 miss_state <= MS_VB_WRITE;
                             end
                         end
@@ -826,7 +866,120 @@ module LSU #(
                     if (miss_state != MS_IDLE) miss_state <= MS_IDLE;
                 end
             endcase
+
+            // FENCE.I D-cache clean walk's AXI writeback control (this block
+            // is the single writer of axi_w_*): on the peek-response cycle,
+            // launch a full-line write of the dirty way just peeked; retire
+            // the write sub-sequence once the B response lands. Mutually
+            // exclusive with every FRZ/IDLE use above (clean only runs while
+            // state==ST_IDLE and issue_real/issue_drain are gated off).
+            if (clean_state == CL_PEEK_WAIT && u_dc_resp_vld) begin
+                axi_w_active   <= 1'b1;
+                axi_w_aw_sent  <= 1'b0;
+                axi_w_w_sent   <= 1'b0;
+                axi_w_addr_r   <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, clean_set, 6'b0};
+                axi_w_data_r   <= u_dc_resp_rdata;
+                axi_w_strb_r   <= 64'hFFFF_FFFF_FFFF_FFFF;
+                axi_w_awsize_r <= 3'd6;
+            end
+            if (clean_state == CL_WB && axi_w_done) begin
+                axi_w_active  <= 1'b0;
+                axi_w_aw_sent <= 1'b0;
+                axi_w_w_sent  <= 1'b0;
+            end
         end
+    end
+
+    //-------------------------------------------------------------------------
+    // SECTION CLEAN -- FENCE.I D-cache clean walk (donor aq_cp0_fence_inst.v
+    // FNC_CDCA stage, Task 10.1). CSR launches it (cp0_lsu_dcache_clean held
+    // high) only after fence_wait proved state==ST_IDLE && STB empty, and
+    // IDU dispatch stays stalled (cp0_idu_fencei_full) for the whole walk, so
+    // no ordinary access competes. Per set: one read returns way_vld/way_dirty;
+    // each valid+dirty way is then peeked (way-select read), written back via
+    // the shared AXI write sub-sequence (full 64B, awsize 6), and invalidated
+    // through dc_inv_* before moving on. lsu_cp0_clean_done pulses on the
+    // final invalidate's done.
+    //-------------------------------------------------------------------------
+    localparam [2:0] CL_IDLE       = 3'd0;
+    localparam [2:0] CL_SET_READ   = 3'd1;
+    localparam [2:0] CL_SET_WAIT   = 3'd2;
+    localparam [2:0] CL_PEEK_ISSUE = 3'd3;
+    localparam [2:0] CL_PEEK_WAIT  = 3'd4;
+    localparam [2:0] CL_WB         = 3'd5;
+    localparam [2:0] CL_INV        = 3'd6;
+    localparam [2:0] CL_INV_WAIT   = 3'd7;
+
+    reg  [2:0] clean_state;
+    reg  [DCACHE_INDEX_W-1:0] clean_set;
+    reg  [WAYS-1:0] clean_todo;      // ways of clean_set still to write back
+
+    wire clean_active   = (clean_state != CL_IDLE);
+    wire [1:0] clean_way_idx = clean_todo[0] ? 2'd0 : clean_todo[1] ? 2'd1
+                             : clean_todo[2] ? 2'd2 : 2'd3;
+    wire [WAYS-1:0] clean_way_oh = 4'b0001 << clean_way_idx;
+    wire clean_last_way = (clean_todo == clean_way_oh);
+
+    wire clean_issue_setrd = (clean_state == CL_SET_READ);
+    wire clean_issue_peek  = (clean_state == CL_PEEK_ISSUE);
+    wire clean_req         = clean_issue_setrd || clean_issue_peek;
+    wire clean_inv_fire    = (clean_state == CL_INV);
+
+    // Completion pulse: the walk ends on the LAST set via EITHER exit -- an
+    // empty set (CL_SET_WAIT -> CL_IDLE) or the last dirty way's invalidate
+    // (CL_INV_WAIT -> CL_IDLE). Both must pulse lsu_cp0_clean_done, else a
+    // final set with no dirty ways would never notify CSR (fence.i wedge).
+    wire clean_finish_empty_set = (clean_state == CL_SET_WAIT)
+                                && ((u_dc_resp_way_vld & u_dc_resp_way_dirty) == {WAYS{1'b0}})
+                                && (&clean_set);
+    wire clean_finish_last_inv  = (clean_state == CL_INV_WAIT) && u_dc_inv_done
+                                && clean_last_way && (&clean_set);
+    assign lsu_cp0_clean_done = clean_finish_empty_set || clean_finish_last_inv;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            clean_state <= CL_IDLE;
+            clean_set   <= {DCACHE_INDEX_W{1'b0}};
+            clean_todo  <= {WAYS{1'b0}};
+        end else case (clean_state)
+            CL_IDLE: begin
+                if (cp0_lsu_dcache_clean && (state == ST_IDLE) && !any_stb_vld) begin
+                    clean_state <= CL_SET_READ;
+                    clean_set   <= {DCACHE_INDEX_W{1'b0}};
+                end
+            end
+            CL_SET_READ: clean_state <= CL_SET_WAIT;
+            CL_SET_WAIT: begin
+                if ((u_dc_resp_way_vld & u_dc_resp_way_dirty) == {WAYS{1'b0}}) begin
+                    if (&clean_set) clean_state <= CL_IDLE;
+                    else begin
+                        clean_set   <= clean_set + {{(DCACHE_INDEX_W-1){1'b0}}, 1'b1};
+                        clean_state <= CL_SET_READ;
+                    end
+                end else begin
+                    clean_todo  <= u_dc_resp_way_vld & u_dc_resp_way_dirty;
+                    clean_state <= CL_PEEK_ISSUE;
+                end
+            end
+            CL_PEEK_ISSUE: clean_state <= CL_PEEK_WAIT;
+            CL_PEEK_WAIT:  if (u_dc_resp_vld) clean_state <= CL_WB;
+            CL_WB:         if (axi_w_done)    clean_state <= CL_INV;
+            CL_INV:        clean_state <= CL_INV_WAIT;
+            CL_INV_WAIT: begin
+                if (u_dc_inv_done) begin
+                    clean_todo <= clean_todo & ~clean_way_oh;
+                    if (!clean_last_way)
+                        clean_state <= CL_PEEK_ISSUE;
+                    else if (&clean_set)
+                        clean_state <= CL_IDLE;
+                    else begin
+                        clean_set   <= clean_set + {{(DCACHE_INDEX_W-1){1'b0}}, 1'b1};
+                        clean_state <= CL_SET_READ;
+                    end
+                end
+            end
+            default: clean_state <= CL_IDLE;
+        endcase
     end
 
     // FRZ's own DCache.v traffic (victim-peek read, refill-commit write) --
@@ -836,8 +989,9 @@ module LSU #(
     wire frz_issue_vpeek  = (state == ST_FRZ) && (miss_state == MS_VPEEK_ISSUE);
     wire frz_issue_commit = (state == ST_FRZ) && (miss_state == MS_COMMIT_ISSUE);
 
-    assign u_dc_req_vld       = touches_array || frz_issue_vpeek || frz_issue_commit;
+    assign u_dc_req_vld       = touches_array || frz_issue_vpeek || frz_issue_commit || clean_req;
     assign u_dc_req_way_sel   = frz_issue_vpeek ? victim_way_r : (frz_issue_commit ? victim_way_r
+                                : clean_issue_peek ? clean_way_oh
                                 : (issue_drain ? stb_way[drain_pick] : {WAYS{1'b0}}));
     assign u_dc_req_wr        = frz_issue_commit ? 1'b1 : (frz_issue_vpeek ? 1'b0
                                 : (issue_drain ? 1'b1 : ag_is_store));
@@ -850,6 +1004,7 @@ module LSU #(
                                 : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8)));
     assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (issue_drain ? 1'b1 : ag_is_store);
     assign u_dc_req_index      = frz_issue_vpeek || frz_issue_commit ? dc_index_r
+                                : clean_req ? clean_set
                                 : (issue_drain ? stb_index[drain_pick] : ag_dc_index);
     assign u_dc_req_tag        = frz_issue_vpeek || frz_issue_commit ? dc_tag_r
                                 : (issue_drain ? stb_tag[drain_pick] : ag_dc_tag);
@@ -868,7 +1023,12 @@ module LSU #(
     assign axi_d_awvalid = axi_w_active && !axi_w_aw_sent;
     assign axi_d_awaddr  = axi_w_addr_r;
     assign axi_d_awlen   = 8'd0;
-    assign axi_d_awsize  = 3'd6;
+    // AW size is per-transaction: a store-miss direct write / STB drain must
+    // advertise the STORE size (sb->0, sh->1, sw->2, sd->3) so the AXI memory
+    // model writes exactly the stored bytes; a victim writeback is a full
+    // 64-byte line (awsize 6). Hardcoding 6 here (the old code) made a sub-word
+    // store-miss write the whole 64-byte beat, clobbering neighbours.
+    assign axi_d_awsize  = axi_w_awsize_r;
     assign axi_d_awburst = 2'b01;
     assign axi_d_awcache = 4'd0;
     assign axi_d_awprot  = 3'd0;
@@ -906,8 +1066,19 @@ module LSU #(
     // Task 7.3 width-hygiene: dword offset -> bit offset, computed at
     // exactly 9 bits (the width this part-select's base requires; max
     // 7*64 = 448) instead of the original formally-122-bit product.
+    //
+    // Source-select on the line data: at ST_DCS (the DC stage) the line
+    // is still in the DCache's combinational response (u_dc_resp_rdata) --
+    // dc_rdata_r is only latched at the END of ST_DCS, so it is not yet
+    // this transaction's data during ST_DCS. The donor forwards the load
+    // data to the IDU at the DC stage (aq_lsu_dc.v: "LSU int data forward
+    // to IDU in DC stage"), so da_final must be computed from the live
+    // response here; at ST_REPLY (RT) the latched dc_rdata_r is used for
+    // the register writeback. Both carry the same value (dc_rdata_r is
+    // latched from u_dc_resp_rdata at the ST_DCS->ST_REPLY edge).
+    wire [511:0] dc_rdata_src = (state == ST_DCS) ? u_dc_resp_rdata : dc_rdata_r;
     wire [8:0]  dc_dword_bitoff = {6'b0, dc_dw_off_r} << 6;
-    wire [63:0] raw_dword       = dc_rdata_r[dc_dword_bitoff +: 64];
+    wire [63:0] raw_dword       = dc_rdata_src[dc_dword_bitoff +: 64];
     wire [63:0] merged_dword  = (stb_fwd_bits & stb_fwd_data) | (~stb_fwd_bits & raw_dword);
 
     // Rotate-by-byte via the double-width-shift idiom; the explicit [63:0]
@@ -979,6 +1150,11 @@ module LSU #(
                     stb_byte_vld[stb_match_idx] <= stb_byte_vld[stb_match_idx] | dc_byte_mask_r;
                     stb_way[stb_match_idx]      <= final_way;
                     stb_was_hit[stb_match_idx]  <= store_line_resident;
+                    // Merged entries keep the larger of the two store sizes
+                    // (single-store entries -- the common case -- keep their
+                    // exact size). A merged drain is an edge case; the data
+                    // was already written by each store's own direct write.
+                    stb_size[stb_match_idx]     <= (stb_size[stb_match_idx] > {1'b0, dc_size_r}) ? stb_size[stb_match_idx] : {1'b0, dc_size_r};
                 end else if (stb_any_free) begin
                     stb_vld[stb_free_idx]      <= 1'b1;
                     stb_addr[stb_free_idx]      <= dc_addr_r;
@@ -989,6 +1165,7 @@ module LSU #(
                     stb_byte_vld[stb_free_idx]  <= dc_byte_mask_r;
                     stb_way[stb_free_idx]       <= final_way;
                     stb_was_hit[stb_free_idx]   <= store_line_resident;
+                    stb_size[stb_free_idx]      <= {1'b0, dc_size_r};
                 end
             end
         end
@@ -1013,15 +1190,42 @@ module LSU #(
     assign lsu_rtu_ex1_cmplt_for_pcgen = issue_real;
     // Task 7.3: the completing LSU instruction's length (drains excluded by
     // the same !dc_is_drain_r the cmplt above already applies).
-    assign lsu_rtu_ex1_inst_len   = dc_inst_len_r;
+    // Donor aq_lsu_ag.v:1678 drives lsu_rtu_ex1_inst_len from the LIVE
+    // AG-stage length (ag_pipe_inst_len), NOT a latched dc-stage copy:
+    // lsu_rtu_ex1_cmplt_for_pcgen (= issue_real) fires on the SAME cycle
+    // dc_inst_len_r would be latched, so reading the latch returns the
+    // PREVIOUS transaction's length -- every load/store then advanced the
+    // IU pcgen tracker by the wrong amount (rv64uc-p-rvc pcgen drift,
+    // scrambled branch PCs from test 18 onward).
+    assign lsu_rtu_ex1_inst_len   = idu_lsu_ex1_inst_len;
 
     assign lsu_rtu_wb_vld  = reply_is_load && !reply_is_misalign;
     assign lsu_rtu_wb_data = da_final;
     assign lsu_rtu_wb_preg = dc_dst0_reg_r;
 
-    assign lsu_rtu_ex2_data      = lsu_rtu_wb_data;
-    assign lsu_rtu_ex2_data_vld  = lsu_rtu_wb_vld;
-    assign lsu_rtu_ex2_dest_reg  = lsu_rtu_wb_preg;
+    // DC-stage forward for a cache hit: the line is available combinationally
+    // at ST_DCS, so forward it there (one cycle before the ST_REPLY wb).
+    wire lsu_fwd2_dc_fire = (state == ST_DCS) && u_dc_resp_vld && dc_touched_array_r
+                            && dc_hit_c && !dc_is_store_r && !dc_misalign_r;
+
+    // Donor aq_lsu_dc.v:2197-2210 (comment: "LSU int data forward to IDU
+    // in DC stage"): the load data is forwarded to the IDU at the DC stage
+    // (data_vld), ONE CYCLE BEFORE the RT register writeback. This is what
+    // resolves the load->condbr RAW hazard the donor handles WITHOUT a stall
+    // (aq_idu_id_ctrl.v RAW-except term 2, producer LSU + consumer condbr +
+    // cnt in {0,1}): the consumer reads its operand at the same cycle the
+    // producer is at DC, and picks up the data via this fwd2.
+    //
+    // A cache HIT presents its line combinationally at ST_DCS (u_dc_resp_rdata),
+    // so the fwd fires there (lsu_fwd2_dc_fire). A cache MISS takes the FRZ
+    // path and only has its data at ST_REPLY (dc_rdata_r, latched after the
+    // refill); for that case the consumer is held by the pipeline (the LSU
+    // stays busy across FRZ) and the fwd2 rides the ST_REPLY writeback
+    // (lsu_rtu_wb_vld). OR-ing the two covers hit (DC-stage fwd) + miss
+    // (RT-stage fwd) exactly as the donor's data_vld does across DC->REPLY.
+    assign lsu_rtu_ex2_data      = da_final;
+    assign lsu_rtu_ex2_data_vld  = lsu_fwd2_dc_fire || lsu_rtu_wb_vld;
+    assign lsu_rtu_ex2_dest_reg  = dc_dst0_reg_r;
 
     assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
     assign lsu_rtu_expt_vec = dc_is_store_r ? 5'd6 : 5'd4;   // store/load misalign

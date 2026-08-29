@@ -99,6 +99,8 @@ static void tie_idle_inputs(void) {
     dut->rtu_cp0_epc            = 0;
     dut->rtu_cp0_tval           = 0;
     dut->ifu_cp0_icache_inv_done= 0;
+    dut->lsu_cp0_stb_empty      = 1;   // LSU quiescent so FENCE/FENCE.I complete
+    dut->lsu_cp0_clean_done     = 0;
     dut->bht_cp0_inv_done       = 0;
     dut->mtip = 0;
     dut->msip = 0;
@@ -465,23 +467,55 @@ static void test_ecall_ebreak_illegal(void) {
 }
 
 static void test_fence_no_op(void) {
+    // Plain FENCE: with LSU quiescent (tie_idle_inputs drives
+    // lsu_cp0_stb_empty=1) it completes immediately -- cmplt_dp asserted,
+    // no wb/expt/chgflw. (FENCE.I got a real serialize+clean+invalidate in
+    // Task 10 for rv64ui-p-fence_i, so it is exercised separately below.)
     DispatchResult r_fence  = dispatch(CP0_FUNC_FENCE, 0, 0, 0);
-    DispatchResult r_fencei = dispatch(CP0_FUNC_FENCEI, 0, 0, 0);
     check(!r_fence.wb_vld && !r_fence.expt_vld && !r_fence.chgflw,
           "fence: no wb/expt/chgflw (plain no-GPR-result completion)");
-    check(!r_fencei.wb_vld && !r_fencei.expt_vld && !r_fencei.chgflw,
-          "fence.i: no wb/expt/chgflw (plain no-GPR-result completion)");
     // TASK 4 FIX (rtl/CSR.v): cmplt_dp is RTU's one-hot RETIRE-heartbeat
     // leg, not a GPR-writeback-select bit -- it must fire for ANY
-    // non-flushed CP0 dispatch (ecall/ebreak/mret/fence/fence.i included),
-    // or RTU's retire register would never latch these instructions and
-    // they could never retire. Previously this file asserted the OPPOSITE
-    // (cmplt_dp==0 for fence/fence.i), encoding the bug Task 4 found and
-    // fixed (CSR.v's "TASK 4 DISCOVERED BUG" note) -- updated here to
-    // match the corrected, donor-faithful contract instead of the bug.
+    // non-flushed CP0 dispatch, or RTU's retire register would never latch
+    // these instructions and they could never retire.
     check(r_fence.cmplt_dp, "fence: cmplt_dp asserted (retire heartbeat, not gated on wb)");
-    check(r_fencei.cmplt_dp, "fence.i: cmplt_dp asserted (retire heartbeat, not gated on wb)");
-    test_result("T14 FENCE/FENCE.I: recognized dispatch, no side effects (M2 scope)");
+
+    // FENCE.I (Task 10): a real donor-faithful serialize: wait LSU quiescent
+    // (FENC), run the D-cache clean walk (CDCA), run the I-cache INV_ALL
+    // (IICA), then complete with cmplt_dp + a front-end changeflow (refetch).
+    // Drive the two handshake-done pulses and hold ex1_sel the whole time,
+    // exactly as IDU does while the fence is held in EX1.
+    dut->idu_cp0_ex1_sel       = 1;
+    dut->idu_cp0_ex1_func      = CP0_FUNC_FENCEI;
+    dut->idu_cp0_ex1_illegal   = 0;
+    dut->idu_cp0_ex1_src1_data = 0;
+    dut->idu_cp0_ex1_dst0_reg  = 0;
+    dut->idu_cp0_ex1_src0_data = 0;
+    dut->idu_cp0_ex1_opcode    = 0;
+    dut->lsu_cp0_stb_empty     = 1;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 0, "fence.i held: cmplt_dp low while serialize pending");
+    check(dut->cp0_rtu_ex1_chgflw  == 0, "fence.i held: no chgflw until FI_CMPLT");
+    tick();                                   // FI_IDLE -> FI_CLEAN
+    check(dut->cp0_lsu_dcache_clean == 1, "fence.i: D-cache clean walk requested (FI_CLEAN)");
+    dut->lsu_cp0_clean_done = 1;
+    dut->eval();
+    tick();                                   // FI_CLEAN -> FI_INV
+    dut->lsu_cp0_clean_done = 0;
+    check(dut->cp0_ifu_icache_inv_req == 1, "fence.i: I-cache INV_ALL requested (FI_INV)");
+    dut->ifu_cp0_icache_inv_done = 1;
+    dut->eval();
+    tick();                                   // FI_INV -> FI_CMPLT
+    dut->ifu_cp0_icache_inv_done = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 1, "fence.i: cmplt_dp asserted at FI_CMPLT (retire heartbeat)");
+    check(dut->cp0_rtu_ex1_chgflw  == 1, "fence.i: changeflow at FI_CMPLT (front-end refetch)");
+    check(dut->cp0_rtu_ex1_wb_vld  == 0, "fence.i: no GPR writeback");
+    check(dut->cp0_rtu_ex1_expt_vld== 0, "fence.i: no exception");
+    tick();                                   // FI_CMPLT -> FI_IDLE
+    dut->idu_cp0_ex1_sel = 0;
+    dut->idu_cp0_ex1_illegal = 0;
+    test_result("T14 FENCE/FENCE.I: fence completes; fence.i serializes clean+inv+refetch");
 }
 
 static void test_mie_mip_masking(void) {

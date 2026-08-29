@@ -244,6 +244,13 @@ module IDU (
     input  wire                     lsu_idu_full,
 
     //=========================================================================
+    // CP0 -> IDU : FENCE/FENCE.I EX1-hold backpressure (Task 10.1,
+    // rv64ui-p-fence_i): held while the fence waits for LSU quiescence;
+    // folds into ctrl_ex1_eu_full below so EX1 keeps the fence.
+    //=========================================================================
+    input  wire                     cp0_idu_fencei_full,
+
+    //=========================================================================
     // RTU -> IDU : flush/drain group (RTU note S6). `rtu_idu_pipeline_empty`
     // is a Task 5 port-list amendment closing RTU.v's Task 4 loop -- see
     // header; not consumed by any logic below (landing pad only).
@@ -306,9 +313,15 @@ module IDU (
     wire [63:0] c_addi4spn_imm = {54'b0, inst[10:7], inst[12:11], inst[5], inst[6], 2'b0};
     wire [9:0]  c_addi16sp_raw = {inst[12], inst[4:3], inst[5], inst[2], inst[6], 4'b0};
     wire [63:0] c_addi16sp_imm = {{54{c_addi16sp_raw[9]}}, c_addi16sp_raw};
-    wire [63:0] c_lw_imm       = {56'b0, inst[3:2], inst[12], inst[6:4], 2'b0};
+    // BUG FIX (rv64uc-p-rvc test 18): these two formulas were SWAPPED --
+    // c_lw_imm carried the C.LWSP (CI) encoding and c_lwsp_imm the C.LW (CL)
+    // one, so c.sw computed base+offset with offset bits drawn from the
+    // rs2'/rd' fields (store landed +0xC0 away, rv64uc-p-rvc test 18).
+    // C.LW/C.SW (CL/CS, RVC spec): offset = {inst[5], inst[12:10], inst[6], 2'b0}.
+    wire [63:0] c_lw_imm       = {57'b0, inst[5], inst[12:10], inst[6], 2'b0};
     wire [63:0] c_ld_imm       = {56'b0, inst[6:5], inst[12:10], 3'b0};
-    wire [63:0] c_lwsp_imm     = {57'b0, inst[5], inst[12:10], inst[6], 2'b0};
+    // C.LWSP (CI, RVC spec): offset = {inst[3:2], inst[12], inst[6:4], 2'b0}.
+    wire [63:0] c_lwsp_imm     = {56'b0, inst[3:2], inst[12], inst[6:4], 2'b0};
     wire [63:0] c_swsp_imm     = {56'b0, inst[8:7], inst[12:9], 2'b0};
     wire [63:0] c_ldsp_imm     = {55'b0, inst[4:2], inst[12], inst[6:5], 3'b0};
     wire [63:0] c_sdsp_imm     = {55'b0, inst[9:7], inst[12:10], 3'b0};
@@ -1227,11 +1240,13 @@ module IDU (
     reg                     ex1_inst_len_r;
 
     // EX1 issue-gate stall terms (ctrl.v:669-692, M2-simplified per header:
-    // no lsu_idu_global_full/cp0_idu_issue_stall ports exist).
+    // M2-simplified per header: no lsu_idu_global_full port exists; the CP0
+    // issue-stall is the fencei_full EX1-hold, Task 10.1).
     wire ctrl_ex1_eu_full = (ex1_eu_r[EU_BJU_SEL]  && iu_idu_bju_full)
                           || (ex1_eu_r[EU_MULT_SEL] && iu_idu_mult_full)
                           || (ex1_eu_r[EU_DIV_SEL]  && iu_idu_div_full)
-                          || (ex1_eu_r[EU_LSU_SEL]  && lsu_idu_full);
+                          || (ex1_eu_r[EU_LSU_SEL]  && lsu_idu_full)
+                          || (ex1_eu_r[EU_CP0_SEL]  && cp0_idu_fencei_full);
     wire ctrl_ex1_issue_stall    = ex1_vld_r && iu_idu_mult_issue_stall;
     wire ctrl_ex1_internal_stall = ex1_vld_r && iu_idu_bju_global_full;
     wire ctrl_ex1_stall = ctrl_ex1_eu_full || ctrl_ex1_issue_stall || ctrl_ex1_internal_stall;

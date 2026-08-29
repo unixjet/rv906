@@ -338,6 +338,10 @@ module RVProc #(
     wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg;
     wire                     idu_lsu_ex1_inst_len;   // Task 7.3
     wire                     lsu_idu_full;
+    wire                     lsu_cp0_stb_empty;   // Task 10.1 fence.i quiescence
+    wire                     cp0_lsu_dcache_clean; // Task 10.1 fence.i D-clean walk
+    wire                     lsu_cp0_clean_done;
+    wire                     cp0_idu_fencei_full; // Task 10.1 fence EX1-hold
 
     //=========================================================================
     // IDU/IU -> CSR : EX1 dispatch (CSR's slice of id_ex1_t) + BJU's PC
@@ -778,6 +782,7 @@ module RVProc #(
         .iu_idu_bju_global_full  (iu_idu_bju_global_full),
 
         .lsu_idu_full            (lsu_idu_full),
+        .cp0_idu_fencei_full     (cp0_idu_fencei_full),
 
         .rtu_idu_flush_fe        (rtu_idu_flush_fe),
         .iu_idu_br_cancel        (iu_idu_br_cancel),
@@ -929,6 +934,9 @@ module RVProc #(
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
 
         .lsu_idu_full            (lsu_idu_full),
+        .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
+        .cp0_lsu_dcache_clean    (cp0_lsu_dcache_clean),
+        .lsu_cp0_clean_done      (lsu_cp0_clean_done),
 
         .lsu_rtu_ex1_cmplt       (lsu_rtu_ex1_cmplt),
         .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
@@ -1145,6 +1153,7 @@ module RVProc #(
         .idu_cp0_ex1_src1_data   (idu_cp0_ex1_src1_data),
         .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
         .idu_cp0_ex1_inst_len    (idu_cp0_ex1_inst_len),
+        .cp0_idu_fencei_full     (cp0_idu_fencei_full),
 
         .iu_cp0_ex1_cur_pc       (iu_cp0_ex1_cur_pc),
 
@@ -1187,6 +1196,9 @@ module RVProc #(
         .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
         .cp0_lsu_mm              (cp0_lsu_mm),
         .cp0_lsu_wa              (cp0_lsu_wa),
+        .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
+        .cp0_lsu_dcache_clean    (cp0_lsu_dcache_clean),
+        .lsu_cp0_clean_done      (lsu_cp0_clean_done),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr),
 

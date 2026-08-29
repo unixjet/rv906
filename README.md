@@ -11,10 +11,28 @@ design document.
 
 ## Status
 
-**M1: front end complete, pending review.** The instruction fetch unit, the
+**M2: integer machine complete, pending review.** The integer decode +
+execute pipeline (IDU, IU, LSU, RTU/CSR) is built and green: the riscv-tests
+`rv64ui-p-*` + `rv64um-p-*` self-checking suites plus a local compressed-
+instruction test all pass with caches on (67/68 — `rv64ui-p-ma_data` is the
+one documented exception, hardware misaligned access deferred to M4; see
+`docs/08-verification.md` §8.7.1). M1's front end (fetch + predictor) sits in
+front of it unchanged.
+
+Quick start (M2):
+
+    make verisim                                  # build the simulator
+    make -C test/m2                               # build the riscv-tests ELFs
+    bin/verisim/testbench --print-result test/m2/build/rv64ui-p-add.elf
+    make -C test/m2 unit                          # (see below) unit benches
+    make -C test/m2/unit run                      # per-unit benches (all 7)
+
+(`rv64ui-p-ma_data` needs HW misaligned access, deferred to M4; run the
+caches-off sanity cross-check with `make -C test/m2 RV906_BOOT_MHCR=0`.)
+
+**M1: front end complete.** The instruction fetch unit, the
 32 KB L1 instruction cache and the full three-structure branch predictor
 (BHT + BTB + RAS) are built and green across the whole acceptance matrix.
-There is still no decode or execute stage — M2 brings those.
 
 What exists and works:
 

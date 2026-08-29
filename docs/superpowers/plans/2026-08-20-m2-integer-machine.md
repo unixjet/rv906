@@ -1,5 +1,15 @@
 # M2: Integer Machine End-to-End Implementation Plan
 
+> **DONE (M2 complete, pending review).** All tasks below are implemented,
+> checked, and annotated. Result: caches-on acceptance sweep 67/68 (all 53
+> `rv64ui-p-*` + all 13 `rv64um-p-*` + `rv64uc-p-rvc`; the one exception
+> `rv64ui-p-ma_data` exercises hardware misaligned access, deferred to M4 by
+> design doc §2.3.3/contract 3 — recorded in `docs/08-verification.md`
+> §8.7.1). Unit suite green (all 7 benches). Caches-off sanity cross-check
+> 66/68 (ma_data + a caches-off rvc follow-up, §8.7.1). Bring-up findings are
+> recorded in the module chapters' "bugs found" sections and in the per-task
+> annotations below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bring C906's integer machine end to end — IDU decode+dispatch, a
@@ -307,7 +317,7 @@ created `RVProc.v` fresh), M2's `RVProc.v` already exists and stays wired
 exactly as M1 shipped it until Task 7's swap; freezing the seven new
 modules' port lists does not require instantiating them anywhere yet.
 
-- [ ] **1.1** `rvproc_pkg.sv`: add M2 constants, all cited with a donor
+- [x] **1.1** `rvproc_pkg.sv`: add M2 constants, all cited with a donor
   source per the umbrella's traceability rule.
   - DCache geometry per contract 9: `DCACHE_SIZE=32768`, `DCACHE_WAYS=4`,
     `DCACHE_LINE_BYTES=64`, `DCACHE_SETS=128`, `DCACHE_TAG_WIDTH=28`
@@ -350,7 +360,7 @@ modules' port lists does not require instantiating them anywhere yet.
     offsets are confirmed against `aq_idu_id_dp.v:934-1064` and
     `aq_idu_id_ctrl.v:598-616` in this task — read the RTL now, don't defer
     the widths to Task 5.
-- [ ] **1.2** Skeleton port lists, from the design doc's §4.1 unit graph +
+- [x] **1.2** Skeleton port lists, from the design doc's §4.1 unit graph +
   §4.2 boundary structs + each extraction note's interface-describing
   sections, donor signal names verbatim (project traceability convention):
   - `rtl/CSR.v`: `idu_cp0_ex1_*` (func/opcode/src0/src1/dst0_reg) in;
@@ -412,10 +422,10 @@ modules' port lists does not require instantiating them anywhere yet.
   - `rtl/MMU.v`: two independent port groups (contract 2), one for IFU's
     ITLB request (replacing `RVProc.v`'s current inline stub) and one for
     LSU's DTLB request; the PMA/sysmap lookup (contract 5) is internal.
-- [ ] **1.3** `test/m1/common.ld`: move the `.tohost` output section from
+- [x] **1.3** `test/m1/common.ld`: move the `.tohost` output section from
   `0x9000_1000` to `0x7FFF_F000` to match the new `ADDR_TOHOST` (contract
   6); keep the 64-byte pad. No other M1 file changes.
-- [ ] **1.4** Lint every new skeleton standalone (each against
+- [x] **1.4** Lint every new skeleton standalone (each against
   `rvproc_pkg.sv` alone) and the full stack (`verilator --lint-only
   -Wno-fatal --top-module RVProcAXI rtl/rvproc_pkg.sv rtl/*.v`); `make
   verisim` still builds (`RVProc.v`/`FetchSink.v` untouched, so this is
@@ -431,7 +441,7 @@ modules' port lists does not require instantiating them anywhere yet.
 Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
 `test/m1/unit/Makefile`'s exact pattern).
 
-- [ ] **2.1** Implement per design doc §2.3.6 (contract 7) + CP0/LSU note
+- [x] **2.1** Implement per design doc §2.3.6 (contract 7) + CP0/LSU note
   §B: the exact CSR set, MHCR (all bits reset 0 except `wb`/`wbr`=1),
   `MXSTATUS.mm` (real flop, reset 1, otherwise unconsumed by CSR.v itself —
   Task 6 owns the trap decision that ignores it), CSR RMW off the
@@ -444,7 +454,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   `mtip`/`msip`/`meip`, local `mcycle`/`minstret` counters. No privilege
   mode besides M exists — `mstatus.MPP` is tied `2'b11`, there is no `sret`
   arm (IDU never emits `CP0_FUNC_SRET` per Task 5's decode scope).
-- [ ] **2.2** Unit bench: scripted `idu_cp0_ex1_*` driver + fake
+- [x] **2.2** Unit bench: scripted `idu_cp0_ex1_*` driver + fake
   `rtu_yy_xx_expt_vld/_int/_vec`/flush pulses. Cover: all 6 CSR RMW forms;
   trap-entry state changes (MIE/MPIE swap, mepc/mcause/mtval capture,
   vec-allowlist vs. non-allowlist `mtval` cases); `mret` pop; `mie`/`mip`
@@ -453,23 +463,23 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   the retire-commit pulse). Mutation-check at least one bit (e.g. swap the
   MIE/MPIE trap-entry order) and confirm the bench catches it before
   reverting. `UNIT-PASS`.
-- [ ] **2.3** Lint, `make verisim` (unaffected — `CSR.v` not yet
+- [x] **2.3** Lint, `make verisim` (unaffected — `CSR.v` not yet
   instantiated in `RVProc.v`), commit.
 
 ## Task 3: `IU.v` (ALU + BJU + MULT + DIV) + unit bench
 
 **Files:** `rtl/IU.v` (real body); Create `test/m2/unit/iu_tb.cpp`.
 
-- [ ] **3.1** ALU per IU note §2: one shared 65-bit adder covering
+- [x] **3.1** ALU per IU note §2: one shared 65-bit adder covering
   ADD/SUB/ADDW/SUBW/SLT/SLTU via the operand-prepare one-hot mux (not a
   separate 32-bit path); one 128-bit barrel shifter for SLL/SRL/SRA/`*W`;
   AND/OR/XOR; XThead REV/TST/FF0/FF1/MVEQZ/MVNEZ. **No MAX/MIN/ADDSL** —
   confirmed dead in this C906 build (IU note §2/§11.3), do not port them.
   Purely combinational, EX1-only, no pipeline register.
-- [ ] **3.2** Address generator (IU note §3): one shared 64-bit adder for
+- [x] **3.2** Address generator (IU note §3): one shared 64-bit adder for
   branch/JAL/JALR target and AUIPC's `pc+imm` — **AUIPC's result is NOT
   computed by the ALU block**, it rides BJU's writeback bus.
-- [ ] **3.3** BJU per IU note §4: private comparator (not the ALU's
+- [x] **3.3** BJU per IU note §4: private comparator (not the ALU's
   adder); mispredict/RAS/BHT-feedback signals to IFU — **re-verify these
   against `RVProc.v`'s current wire declarations byte-for-byte** (IU note
   §4.3 confirms every name already matches M1's frozen placeholder guess,
@@ -478,17 +488,17 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   `lsu_iu_ex2_*`, IU note §4.4) with its two-signal backpressure
   (`iu_idu_bju_full`/`_bju_global_full`); BJU's own PC copy
   (`bju_pcgen_pc`), reset from `cp0_xx_mrvbr` (restore-checklist item 4).
-- [ ] **3.4** MULT per IU note §5: one 33x33 Booth-radix-4 array reused
+- [x] **3.4** MULT per IU note §5: one 33x33 Booth-radix-4 array reused
   iteratively (3 cycles for operands fitting in 33 bits, up to ~6 cycles
   for a full 64x64 via up to 4 passes); `iu_idu_mult_issue_stall`/
   `_mult_full` to IDU; EX1 early-accept + EX3 data/writeback split, gated
   on `rtu_iu_mul_wb_grant`.
-- [ ] **3.5** DIV per IU note §6: radix-4, 2-bits/cycle non-restoring
+- [x] **3.5** DIV per IU note §6: radix-4, 2-bits/cycle non-restoring
   divider with leading-1 alignment early-out and a 1-entry memo/hit
   buffer; `~4` to `~36` cycles, data-dependent; `iu_idu_div_full` to IDU;
   DIV/DIVU/REM/REMU share one core (`div_res_sel_quotient` just picks
   which result feeds the bus); gated on `rtu_iu_div_wb_grant`.
-- [ ] **3.6** **Resolve the two design-doc §8 open items this unit owns:**
+- [x] **3.6** **Resolve the two design-doc §8 open items this unit owns:**
   (a) the exact `idu_iu_ex1_func` bit-per-opcode table for ALU/BJU/MULT/
   DIV — cross-reference `aq_idu_id_decd.v`'s casez tables against IU's own
   consumer-side op-group tests (IU note §12/§13), and record the finalized
@@ -496,7 +506,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   `WB_INT_TYPE` tags DIV results as `MULT`-type or needs its own tag — read
   `aq_idu_id_wbt.v`/`aq_iu_top.v` far enough to settle it, record the
   finding at the `rvproc_pkg.sv` `// TODO(Task 3)` marker Task 1 left.
-- [ ] **3.7** Unit bench: per-op ALU vectors (incl. `*W` forms, shifts,
+- [x] **3.7** Unit bench: per-op ALU vectors (incl. `*W` forms, shifts,
   SLT/SLTU, every XThead op); MULT all 5 RV64M ops incl. narrow/wide
   timing; DIV all 4 ops + divide-by-zero/signed-overflow/memo-hit fast
   paths + handshake timing; BJU branch matrix (taken/not-taken x
@@ -506,13 +516,13 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   exactly (a re-verification, not new derivation). Mutation-check at least
   2 (e.g. break the MULT iteration-count early-out, break DIV's memo
   buffer). `UNIT-PASS`.
-- [ ] **3.8** Lint, `make verisim` (unaffected), commit.
+- [x] **3.8** Lint, `make verisim` (unaffected), commit.
 
 ## Task 4: `RTU.v` + unit bench
 
 **Files:** `rtl/RTU.v` (real body); Create `test/m2/unit/rtu_tb.cpp`.
 
-- [ ] **4.1** Per RTU note: one-hot completion bus (`{alu,mul,bju,div,
+- [x] **4.1** Per RTU note: one-hot completion bus (`{alu,mul,bju,div,
   lsu,cp0,vec}_cmplt_dp`, `vec` permanently 0 in M2) OR'd into
   `dp_ex1_cmplt`; the single un-skidded EX1->EX2 retire register (RTU note
   §2 — retiring **at most 1/cycle, 0/cycle on any stall, no queue**); the
@@ -535,7 +545,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   `rtu_idu_commit(_for_bju)`, `rtu_idu_pipeline_empty`, `rtu_yy_xx_*`
   broadcast, `rtu_lsu_expt_ack/_expt_exit` (directly needed by Task 6),
   `rtu_cp0_epc/_tval`.
-- [ ] **4.2** **Resolve the design doc §8 risk this unit owns**: add a
+- [x] **4.2** **Resolve the design doc §8 risk this unit owns**: add a
   real simulation assertion that the one-hot completion bus
   (`dp_cmplt_source`) is actually one-hot every cycle, and that
   `fwd0`/`fwd1`/`fwd2` never target the same destination register in the
@@ -543,7 +553,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   `// TODO add assertion here` and IDU note §6's flagged reliance on this
   exact invariant). This is the resolution IDU's Task 5 forward mux is
   allowed to assume without re-deriving it.
-- [ ] **4.3** Unit bench: scripted create/complete/commit stimuli from
+- [x] **4.3** Unit bench: scripted create/complete/commit stimuli from
   each of the 5 (ALU/BJU/MULT/DIV/CP0) fake producer ports; retire-blocking
   cases (nothing completes -> EX2 holds); flush paths (BJU mispredict, CSR/
   fence-serializing flush, taken exception) with the redirect-target mux
@@ -553,13 +563,13 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   the same cycle, confirm the priority holds); the one-hot/fwd-collision
   assertion from 4.2 actually fires when deliberately violated (a
   mutation-style check, then revert). `UNIT-PASS`.
-- [ ] **4.4** Lint, `make verisim` (unaffected), commit.
+- [x] **4.4** Lint, `make verisim` (unaffected), commit.
 
 ## Task 5: `IDU.v` (decode + WBT scoreboard + GPR + dispatch) + unit bench
 
 **Files:** `rtl/IDU.v` (real body); Create `test/m2/unit/idu_tb.cpp`.
 
-- [ ] **5.1** Decode per IDU note §3: the 6-way coarse classifier, then
+- [x] **5.1** Decode per IDU note §3: the 6-way coarse classifier, then
   per-class parallel casez tables for the 32-bit integer/LSU/BJU/CP0 class
   and the 16-bit RVC class (decoded natively into the same `EU`/`FUNC`/
   `*_vld` fields, contract 14 — not a separate expand-then-decode pass).
@@ -573,7 +583,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   ordinary single-beat `EU_CP0` ops, `sfence.vma` does not (needs the real
   MMU, M4). Immediate generation per IDU note §4 (`src1_imm`/`src2_imm`
   one-hot selectors, both 32-bit and RVC variants).
-- [ ] **5.2** WBT scoreboard per IDU note §5.1/§5.2: the 32-entry
+- [x] **5.2** WBT scoreboard per IDU note §5.1/§5.2: the 32-entry
   busy-bit + producer-type + outstanding-count table (31 flop entries + x0
   hardwired always-ready); RAW/WAW stall computation with the
   producer-type-aware "except" clauses exactly as enumerated (ALU/BJU
@@ -583,13 +593,13 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   task, Task 3's `WB_INT_TYPE`-for-DIV finding and Task 4's fwd0/1/2
   mutual-exclusivity assertion are both already resolved facts, cite them,
   don't re-derive**.
-- [ ] **5.3** GPR per IDU note §5.4: 31-entry gated register file (+
+- [x] **5.3** GPR per IDU note §5.4: 31-entry gated register file (+
   hardwired x0), 3 read ports (src0/1/2), 2 write ports (`rtu_idu_wb0/1`) —
   same structural pattern as the WBT. A same-cycle `wb0`==`wb1` collision
   on one register silently drops the write (matches the donor's
   `gated_reg.v` shape exactly) — verified in the bench to never actually
   occur, given RTU's one-hot completion guarantee (Task 4.2's assertion).
-- [ ] **5.4** Forward mux + EU dispatch per IDU note §6/§7: the ID/DIS
+- [x] **5.4** Forward mux + EU dispatch per IDU note §6/§7: the ID/DIS
   stage forward mux (3-way one-hot compare against `rtu_idu_fwd0/1/2`,
   falls to `default: {64{1'bx}}` on a non-hit exactly like the donor — the
   invariant that prevents a real multi-hit is Task 4.2's assertion, not
@@ -602,7 +612,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   same condition as the register being valid (IDU note §7's "Critically"
   paragraph); `idu_ifu_id_stall` driven for real (unchanged signal, now a
   real reason instead of FetchSink's fake one).
-- [ ] **5.5** Unit bench: decode vectors covering every `rv64imc` class
+- [x] **5.5** Unit bench: decode vectors covering every `rv64imc` class
   plus every illegal case from 5.1's closed list (FP/vector/custom/AMO/
   lsd/che/sfence.vma all correctly trap); RVC pairs decoding to the exact
   same `EU`/`FUNC`/`*_vld` shape as their 32-bit twin where one exists;
@@ -613,7 +623,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   turn, confirm the instruction sits valid-but-not-issuing and that a
   stuck EX1 backpressures `idu_ifu_id_stall`). Mutation-check at least 2.
   `UNIT-PASS`.
-- [ ] **5.6** Lint, `make verisim` (unaffected), commit.
+- [x] **5.6** Lint, `make verisim` (unaffected), commit.
 
 ## Task 6: `LSU.v` + `DCache.v` + `MMU.v` + unit benches
 
@@ -621,7 +631,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
 `test/m2/unit/dcache_tb.cpp`, `test/m2/unit/mmu_tb.cpp`,
 `test/m2/unit/lsu_tb.cpp`.
 
-- [ ] **6.1** `DCache.v` standalone (mirrors M1 Task 2's ICache-alone
+- [x] **6.1** `DCache.v` standalone (mirrors M1 Task 2's ICache-alone
   pattern): tag/data/dirty SRAM arrays via `SRAM.v` (contract 9's single
   128-set x 4-way group, `PA[39:12]` 28-bit tag, no alias bank); the
   4-state DC FSM shape (`IDLE->DCS->{FRZ|REPLY}`, LSU note A2 — `FRZ` is a
@@ -636,11 +646,11 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   17). `cp0_lsu_dcache_en` gates hit reporting exactly like `MHCR.de`
   gates `ICache.v`'s (LSU note B2's confirmed "every load/store forced to
   miss until boot code sets `de=1`" fact).
-- [ ] **6.2** `MMU.v` standalone (contract 2): the identity-map + PMA/
+- [x] **6.2** `MMU.v` standalone (contract 2): the identity-map + PMA/
   sysmap stub, two independent port groups (IFU's ITLB request, LSU's
   DTLB request), combinational, same-cycle response; the PMA table from
   contract 5's exact regions.
-- [ ] **6.3** `LSU.v` real body, wired against the now-real `DCache.v`/
+- [x] **6.3** `LSU.v` real body, wired against the now-real `DCache.v`/
   `MMU.v`: `AG` (one 64-bit adder, combinational, misalign detection —
   contract 3, always traps regardless of `MXSTATUS.mm`'s value — plus the
   MMU-stub request and DCache tag/data read issued the same cycle, LSU
@@ -653,7 +663,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   completion family; the D-side AXI master moved here from `FetchSink.v`'s
   old tohost-only write channel (design doc §2.1 — a real load-bearing
   bus path now, not a fixed-address write FSM).
-- [ ] **6.4** Unit benches: `dcache_tb.cpp` (hit/miss/refill/dirty-evict-
+- [x] **6.4** Unit benches: `dcache_tb.cpp` (hit/miss/refill/dirty-evict-
   writeback/invalidate, mirroring `icache_tb.cpp`'s scripted-driver-against-
   a-golden-memory-array pattern); `mmu_tb.cpp` (identity-map correctness +
   every PMA region's `ca`/`so` classification, incl. the relocated `tohost`
@@ -666,7 +676,7 @@ Modify `test/m2/unit/Makefile` (create it here, per contract 15, following
   written back first). Mutation-check at least 2 (e.g. break the
   STB-create/flush interlock, break the victim-writeback ordering).
   `UNIT-PASS`.
-- [ ] **6.5** Lint, `make verisim` (unaffected — none of these three files
+- [x] **6.5** Lint, `make verisim` (unaffected — none of these three files
   are yet instantiated in `RVProc.v`), commit.
 
 ## Task 7: FetchSink retirement + `RVProc.v` rewire + SoC integration
@@ -677,7 +687,7 @@ Modify `rtl/verisim.h`, `rtl/RVProcTest.cpp` (M1-era wire-path updates only
 **unchanged** — the core instance is already `RVProc` since M1's Task 4.2;
 M2 only rewrites `RVProc.v`'s internals.
 
-- [ ] **7.1** Delete `rtl/FetchSink.v`. Rewire `RVProc.v`: `IFU -> IDU ->
+- [x] **7.1** Delete `rtl/FetchSink.v`. Rewire `RVProc.v`: `IFU -> IDU ->
   IU -> LSU -> RTU`, plus `CSR.v` and `MMU.v` (replacing the current inline
   `assign mmu_ifu_pa = ...` ITLB stub with a real `MMU.v` instance serving
   both IFU's ITLB port and LSU's DTLB port — same interface contract 2
@@ -691,13 +701,13 @@ M2 only rewrites `RVProc.v`'s internals.
   Confirm `ADDR_TOHOST`'s Task-1 relocation reaches `LSU.v`'s real store
   path unchanged (a confirmation, not a new decision — contract 6 already
   landed the value in Task 1).
-- [ ] **7.2** `rtl/verisim.h`: define `CPU_PC`/`CPU_GPR` Verilator internal
+- [x] **7.2** `rtl/verisim.h`: define `CPU_PC`/`CPU_GPR` Verilator internal
   paths against IDU's real GPR array and RTU's real retire-PC, drop
   `VERISIM_NO_CPU_STATE` (restore-checklist item 1) so `dut.cpp`'s
   `#ifndef VERISIM_NO_CPU_STATE` blocks compile in for real. Remove the
   now-dead `FSINK()`/M1 config-bank macros; the fuller retire-trace export
   (contract 13) is Task 8's addition on top of this.
-- [ ] **7.3** Full-stack lint (`--top-module RVProcAXI`), `make verisim`
+- [x] **7.3** Full-stack lint (`--top-module RVProcAXI`), `make verisim`
   green. **`test/m1/run_all.sh --full-matrix` is expected to fail/be
   meaningless from this point on** (FetchSink's fetch-stream oracle has no
   real consumer anymore) — this is the intended, documented end of that
@@ -713,7 +723,7 @@ exist from earlier tasks); Create `m2_iss.h` (the from-scratch
 architectural reference model, contract 12 — resolved, not Spike); Modify
 `rtl/RVProcTest.cpp` (retire-trace export + online/offline diff driver).
 
-- [ ] **8.1** **Resolved (controlling-session decision, not left for
+- [x] **8.1** **Resolved (controlling-session decision, not left for
   execution time): build the from-scratch architectural reference model,
   do not attempt Spike.** No `spike` binary and no `riscv-isa-sim` source
   exist anywhere in this environment (confirmed by search during M2
@@ -736,13 +746,13 @@ architectural reference model, contract 12 — resolved, not Spike); Modify
   semantics) that deserves an independent implementation, not an ad-hoc
   extension of a file scoped to a different problem. Record this decision
   (with this reasoning) at the top of `m2_iss.h`.
-- [ ] **8.2** RTL-side retire-trace export: add `verisim.h` paths (or a
+- [x] **8.2** RTL-side retire-trace export: add `verisim.h` paths (or a
   `verilator public` export block in `RTU.v` itself, whichever is more
   direct) for contract 13's tuple, sourced from RTU's real EX2 retire
   register (design doc §7.3 — register results join here for free, no
   separate writeback-event join needed; stores are compared at
   STB-drain/DCache-write time instead of via `rd`).
-- [ ] **8.3** Harness: extend `RVProcTest.cpp` with an online or offline
+- [x] **8.3** Harness: extend `RVProcTest.cpp` with an online or offline
   commit-trace diff against 8.1's chosen reference (umbrella §7.2's
   "Spike diff: ... scripts diff the commit sequences offline. First
   divergent instruction -> cycle -> waveform" is the target shape if Spike
@@ -755,7 +765,7 @@ architectural reference model, contract 12 — resolved, not Spike); Modify
   ELF(s) to run and whether the reference-model diff is on or off (an
   `--iss-diff`-style default-on flag, for raw-speed regression runs later
   if ever needed).
-- [ ] **8.4** riscv-tests build infrastructure: vendor upstream
+- [x] **8.4** riscv-tests build infrastructure: vendor upstream
   `riscv-tests` sources for the `rv64ui-p-*`/`rv64um-p-*` binaries.
   **Do not fetch fresh from the network** — an already-checked-out copy
   exists in this same workspace at
@@ -774,7 +784,7 @@ architectural reference model, contract 12 — resolved, not Spike); Modify
   entry point — without it, `MHCR.de=0` at reset means the DCache is never
   genuinely exercised and the acceptance sweep would not test what M2
   built.
-- [ ] **8.5** `test/m2/common.ld`/`test/m2/macros.h` (contract 15): a
+- [x] **8.5** `test/m2/common.ld`/`test/m2/macros.h` (contract 15): a
   fresh linker script + macro header for M2's own hand-written directed
   ELFs (Task 9), using the same `ADDR_TOHOST`/reset-vector conventions as
   the riscv-tests override in 8.4, but **not** carrying over any of
@@ -782,7 +792,7 @@ architectural reference model, contract 12 — resolved, not Spike); Modify
   call stack, the `^pc[7:4]` direction rule) — those encoded M1's fake
   BJU's rules, which have no meaning against a real BJU and a real
   reference model.
-- [ ] **8.6** Lint, `make verisim`, commit ("M2: reference-model diff
+- [x] **8.6** Lint, `make verisim`, commit ("M2: reference-model diff
   infrastructure + riscv-tests build environment").
 
 ## Task 9: Bring-up ladder (the hard integration gate)
@@ -795,61 +805,61 @@ Follows the design doc's own §7.4 bring-up ladder exactly, in order.
 real pipeline bugs get found via directed tests before the full riscv-tests
 suite is attempted, mirroring M1 Task 6's role exactly.
 
-- [ ] **9.1** Single-instruction streams (no memory): decode -> dispatch ->
+- [x] **9.1** Single-instruction streams (no memory): decode -> dispatch ->
   ALU/BJU -> retire, diffed against the Task 8 reference model on
   hand-written ELFs, including an RVC-mix stream (contract 14 — RVC decode
   is native, so this should be free if 5.1/5.5 are actually correct).
   `test/m2/alu_seq.S`.
-- [ ] **9.2** Branches + BJU resolve + the mispredict flush path — this is
+- [x] **9.2** Branches + BJU resolve + the mispredict flush path — this is
   where M1's already-verified `iu_ifu_tar_pc_vld`/BHT-feedback consumer
   side gets exercised by a real producer for the first time (every prior
   exercise of that consumer side was FetchSink's fake resolve logic).
   `test/m2/bju_seq.S`.
-- [ ] **9.3** MULT/DIV variable-latency issue/stall/writeback-grant
+- [x] **9.3** MULT/DIV variable-latency issue/stall/writeback-grant
   protocol: narrow and wide multiply paths, abnormal-result and
   memo-buffer divide paths, back-to-back dependent MULT/DIV chains
   exercising the WBT's outstanding-count field for real. `test/m2/
   muldiv_seq.S`.
-- [ ] **9.4** Loads/stores with caches OFF (`MHCR.de=0`, the reset
+- [x] **9.4** Loads/stores with caches OFF (`MHCR.de=0`, the reset
   default) — the uncached/always-miss path, the simplest correct base
   case. `test/m2/ld_st_uncached.S`.
-- [ ] **9.5** Loads/stores with caches ON — DCache hit/miss, STB
+- [x] **9.5** Loads/stores with caches ON — DCache hit/miss, STB
   byte-granular forwarding, the single-outstanding-miss stand-in's refill
   path, dirty-line victim writeback, **and the `tohost`-visibility
   question from contract 6 resolved concretely here**: confirm a `tohost`
   store lands in `ExtMem` promptly enough for the harness's poll loop to
   observe it, with the DCache genuinely caching everything else in the
   test. `test/m2/ld_st_cached.S`.
-- [ ] **9.6** CSR ops + traps (`ecall`/`ebreak`/illegal-instruction) +
+- [x] **9.6** CSR ops + traps (`ecall`/`ebreak`/illegal-instruction) +
   `mret`, directed — confirm `mtvec`/`mepc`/`mcause`/`mtval`/MIE-MPIE swap
   all land correctly, since this is exactly the mechanism riscv-tests'
   `RVTEST_PASS`/`RVTEST_FAIL` depend on (design doc §7.2). `test/m2/
   csr_trap.S`.
-- [ ] **9.7** `rv64ui` riscv-tests, one test at a time (caches on, per
+- [x] **9.7** `rv64ui` riscv-tests, one test at a time (caches on, per
   9.5's resolved boot preamble), fixing whatever breaks before moving to
   the next; then `rv64um`, same discipline. This is deliberately NOT the
   full clean-room sweep (that's Task 10) — it is the hands-on debugging
   pass where individual-test failures get root-caused one at a time.
   `test/m2/run_all.sh` grows to drive this incrementally.
-- [ ] **9.8** Lint, full build, commit ("M2: bring-up ladder green through
+- [x] **9.8** Lint, full build, commit ("M2: bring-up ladder green through
   individual rv64ui/um tests").
 
 ## Task 10: `rv64ui`/`um` full sweep, regression, docs, close-out
 
-- [ ] **10.1** Full `rv64ui-p-*` + `rv64um-p-*` suite green, `MHCR`
+- [x] **10.1** Full `rv64ui-p-*` + `rv64um-p-*` suite green, `MHCR`
   enabled (caches on) per design doc §7.3's explicit requirement that the
   acceptance sweep genuinely exercise the DCache. Also run the suite once
   with caches off as a sanity cross-check (not the acceptance gate, but a
   useful signal if the two runs disagree). Extend `test/m2/run_all.sh` to
   drive the full matrix and record pass/fail + a cycle-count table, same
   spirit as M1's `run_all.sh --full-matrix` summary.
-- [ ] **10.2** Full regression: `test/m2/unit/` `run` target (all of
+- [x] **10.2** Full regression: `test/m2/unit/` `run` target (all of
   csr/iu/rtu/idu/dcache/mmu/lsu unit benches, `UNIT-SUITE-PASS`); the Task
   9 bring-up ladder tests (9.1-9.6) still green; the Task 10.1 riscv-tests
   sweep. `test/m1/run_all.sh` is **not** re-run as a gate (Task 7 already
   recorded why it stopped being meaningful) — note this explicitly in the
   regression summary rather than silently omitting it.
-- [ ] **10.3** Write `docs/04-idu.md`, `docs/05-iu.md`,
+- [x] **10.3** Write `docs/04-idu.md`, `docs/05-iu.md`,
   `docs/06-rtu-csr.md`, `docs/07-lsu.md` (contract 16's numbering
   resolution): tutorial chapters, principle -> this implementation ->
   C906 file cross-reference table -> design discussion, covering every
@@ -863,7 +873,7 @@ suite is attempted, mirroring M1 Task 6's role exactly.
   2/3/6/8's disposition explicitly). Update `README.md` status to "M2:
   integer machine complete, pending review," with a quick-start pointing
   at `test/m2/run_all.sh` and `test/m2/unit`.
-- [ ] **10.4** Plan bookkeeping: tick every checkbox in this plan with a
+- [x] **10.4** Plan bookkeeping: tick every checkbox in this plan with a
   completion note describing what was actually found/decided (mirroring
   M1 Task 10.3's "DONE:"-annotation style — this plan's checkboxes start
   as unchecked placeholders, not a record of completed work). Full clean

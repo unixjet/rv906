@@ -259,8 +259,7 @@ module DCache (
                     end
                 end
                 ST_FRZ:   state <= ST_DCS;
-                ST_DCS:   state <= ST_REPLY;
-                ST_REPLY: state <= ST_IDLE;
+                ST_DCS:   state <= ST_IDLE;   // response is combinational at DCS; no REPLY
                 default:  state <= ST_IDLE;
             endcase
         end
@@ -414,12 +413,12 @@ module DCache (
         end
     end
 
-    assign dc_resp_vld        = (state == ST_REPLY);
-    assign dc_resp_hit_way    = resp_hit_way_r;
-    assign dc_resp_rdata      = resp_rdata_r;
-    assign dc_resp_way_vld    = resp_way_vld_r;
-    assign dc_resp_way_dirty  = resp_way_dirty_r;
-    assign dc_resp_victim_tag = resp_victim_tag_r;
+    assign dc_resp_vld        = (state == ST_DCS);
+    assign dc_resp_hit_way    = hit_way_c;
+    assign dc_resp_rdata      = rdata_mux_c;
+    assign dc_resp_way_vld    = way_valid_c;
+    assign dc_resp_way_dirty  = dirty_q;
+    assign dc_resp_victim_tag = victim_tag_mux_c;
 
     //-------------------------------------------------------------------------
     // INVALIDATE ack -- one-cycle pulse the cycle after the invalidate write

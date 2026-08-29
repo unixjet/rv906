@@ -205,7 +205,7 @@ static void test_alloc_then_hit(void)
     check(r.rdata_lo == 0xAAAABBBBCCCCDDDDULL, "data equals what was written",
           r.rdata_lo, 0xAAAABBBBCCCCDDDDULL);
     check((r.way_dirty & onehot(0)) == 0, "clean fill: way0 not dirty", r.way_dirty & onehot(0), 0);
-    check(r.cycles == 2, "clean hit resolves in 2 cycles (IDLE->DCS->REPLY)", (uint64_t)r.cycles, 2);
+    check(r.cycles == 1, "clean hit resolves in 1 cycle (IDLE->DCS, combinational response)", (uint64_t)r.cycles, 1);
 
     test_result("T1 alloc write -> plain read hits with correct data");
 }
@@ -338,7 +338,8 @@ static void test_invalidate_clears_valid(void)
 
 // T7: the one genuine port collision -- dc_inv_vld arriving the SAME cycle
 // as a new dc_req_vld. The FSM must take exactly one extra cycle (IDLE->
-// FRZ->DCS->REPLY, 3 cycles, vs. the clean IDLE->DCS->REPLY 2 cycles) and
+// FRZ->DCS, 2 cycles, vs. the clean IDLE->DCS 1 cycle -- the response is
+// combinational at DCS, matching the donor SRAM's 1-cycle read latency) and
 // BOTH operations must still complete correctly.
 static void test_frz_collision(void)
 {
@@ -346,10 +347,11 @@ static void test_frz_collision(void)
     invalidate(idx, 0xF);
     write_req(idx, 0x7000001, onehot(0), 0xCAFEULL, 0xFFFFFFFFFFFFFFFFULL, false, true);
 
-    // Baseline: a clean, non-colliding read takes 2 cycles.
+    // Baseline: a clean, non-colliding read takes 1 cycle (combinational
+    // response at DCS).
     DcResp baseline = read_req(idx, 0x7000001);
-    check(baseline.cycles == 2, "baseline (no collision) resolves in 2 cycles",
-          (uint64_t)baseline.cycles, 2);
+    check(baseline.cycles == 1, "baseline (no collision) resolves in 1 cycle",
+          (uint64_t)baseline.cycles, 1);
 
     // Now issue a read at idx, WHILE simultaneously invalidating a
     // DIFFERENT set (idx2) the same cycle -- a genuine port collision.
@@ -357,8 +359,8 @@ static void test_frz_collision(void)
     DcResp collided = submit(idx, 0x7000001, /*wr=*/false, 0, 0, 0, false, false,
                               /*inv_same_cycle=*/true, idx2, 0xF);
     check(collided.vld, "colliding request still eventually completes", collided.vld, 1);
-    check(collided.cycles == 3, "FRZ collision adds exactly one cycle (3 total, not 2)",
-          (uint64_t)collided.cycles, 3);
+    check(collided.cycles == 2, "FRZ collision adds exactly one cycle (2 total, not 1)",
+          (uint64_t)collided.cycles, 2);
     check(collided.hit_way == onehot(0), "colliding request's own answer is still correct",
           collided.hit_way, onehot(0));
 

@@ -261,6 +261,54 @@ needs to retire `TestMaster.v`:
    integration), not M2 — M2's scope is the integer execute/retire path,
    not interrupts.
 
+### 8.7.1 M2 close-out (per-item disposition)
+
+Contract 17 asked M2 to resolve items 1/4/5/7 and record the disposition of
+2/3/6/8. Final disposition:
+
+1. **RESOLVED.** `rtl/verisim.h` now defines `CPU_PC`/`CPU_GPR` Verilator
+   internal-signal paths against the real IDU register file
+   (`IDU.gpr_r[*]`) and retire PC (`RTU.ex2_cur_pc`), and
+   `VERISIM_NO_CPU_STATE` is removed so `dut.cpp`'s preload/mirror compiles
+   in.
+2. **NOT RESTORED (deliberate).** `TB::read_mem()` still reads straight
+   through `ExtMem`. With a real write-back DCache + STB, a host-side
+   D-cache mirror would reintroduce exactly the stale-mirror write-hazard
+   the item warns about, and the M2 tests never need host reads of cached
+   memory (they self-report over `tohost`). Deferred to whoever first needs
+   it (most likely a later debug milestone).
+3. **NOT DONE (deliberate, subsumed by item 2).** `CoreState`/`sync()` carry
+   only `gpr[]` (plus PC). No cache mirror is carried, consistent with item 2.
+4. **RESOLVED.** `RESET_VECTOR` is wired through to the core's reset PC via
+   `cp0_xx_mrvbr` (CSR.v) rather than relying on a post-reset poke; the poke
+   remains only as a convenience.
+5. **RESOLVED.** The ICache/DCache AXI masters issue single-beat 64-byte
+   bursts (`awlen`/`arlen` = 0, `awsize`/`arsize` = 6), well under MEMCTL's
+   16-beat cap, so the low-4-bit `len` truncation is harmless.
+6. **STILL UNEXERCISED (as predicted).** The UART/Converter C++ path still
+   builds but never moves a byte in M2 (no firmware runs it). Unchanged from
+   M0; first real exercise belongs to the firmware/debug milestones.
+7. **RESOLVED via option (a): RVC decode landed in the M2 core.** `IDU.v`
+   decodes RVC directly (`is32` select + 16-bit `casez`), and `rv64uc-p-rvc`
+   (a local compressed-instruction test) passes with caches on. The firmware
+   kit keeps its `-march=rv64imac` build now that the core decodes C.
+8. **DEFERRED TO M6 (as predicted).** PLIC `int_src` still tied to zero;
+   interrupt-path integration is M6, not M2.
+
+**Additional M2 acceptance notes (recorded here per contract 17's spirit):**
+
+- **`rv64ui-p-ma_data` is the one riscv-tests M2 exception.** It exercises
+  hardware misaligned load/store, which the design doc §2.3.3 (contract 3)
+  deliberately defers to M4 (M2 is trap-only for misalignment). The design
+  doc's premise that "rv64ui exercises aligned accesses only" is wrong for
+  this one test; it is documented here rather than silently skipped. All
+  other 53 `rv64ui-p-*` + all 13 `rv64um-p-*` + `rv64uc-p-rvc` pass with
+  caches on.
+- **Caches-off sanity cross-check** (Task 10.1's non-gate run): 66/68.
+  Besides `ma_data`, `rv64uc-p-rvc` fails with caches off (it passes caches
+  on). This is a caches-off-specific fetch-path discrepancy flagged for
+  follow-up, not part of the caches-on acceptance gate.
+
 ## 8.8 What "build-only" means for the firmware kit
 
 `test/` (hello/clint_test/plic_test/intr_test, plus the shared `entry.S`,
@@ -471,3 +519,52 @@ fence.i is sufficient once a store unit can trigger it for real. Those
 arrive with M2 and M4; the harness's `term()` checks in `RVProcTest.cpp` are
 written to fail loudly rather than silently pass once those assumptions
 change.
+
+## 8.11 The M2 harness
+
+M2 is the first milestone with a full execute/retire path, so its oracle
+changes kind: from "did the front end fetch the right stream" (M1) to "did
+the program compute the right architectural result." M2 uses two layers:
+
+1. **riscv-tests self-checking suites** (`test/m2/`, `make -C test/m2`): the
+   upstream `rv64ui-p-*` (53 tests) and `rv64um-p-*` (13) plus a local
+   `rv64uc-p-rvc` compressed-instruction test (68 ELFs total), built
+   `-march=rv64imc_zicsr_zifencei` against the vendored p-env
+   (`test/m2/env/`). Each test self-reports over `tohost` (`PASS`/`FAIL test
+   no. = N`). The build compiles the upstream `.S` in place from the
+   workspace riscv-tests checkout (recorded in `test/m2/Makefile`); only the
+   env (linker script + p-env header) and `rvc.S` are vendored. A boot
+   preamble (`RV906_BOOT_MHCR`, on by default) enables MHCR.ie/de so the
+   acceptance sweep genuinely exercises the DCache (design doc §7.3);
+   `make -C test/m2 RV906_BOOT_MHCR=0` builds it out for the caches-off
+   sanity cross-check.
+2. **Per-unit benches** (`test/m2/unit/`, `make -C test/m2/unit run`):
+   `csr_tb`, `iu_tb`, `rtu_tb`, `idu_tb`, `dcache_tb`, `mmu_tb`, `lsu_tb` —
+   hand-scripted single-instruction stimulus against each module in
+   isolation (the same tick()-based clocking as M1's benches), each asserting
+   the module's contract (decode values, hazard stalls, cache hit/miss/
+   invalidate timing, misalign trap, STB forward, etc.). This is the layer
+   that localizes a failure to a module when a riscv-test trips.
+
+**Bring-up ladder** (Task 9): before the full sweep, directed per-feature
+tests (alu, bju, muldiv, ld_st, csr_trap) plus incremental rv64ui/um subsets
+were used to localize the bring-up bugs (recorded in the module chapters'
+"bugs found" sections: WBT cancel gate, GPR read-during-write, `c_lw_imm`
+transpose, DIV dest latch, MULT issue-stall, sub-word store-miss sizing,
+unconditional-jump redirect).
+
+**Result, current tree:** caches-on acceptance sweep 67/68 (`rv64ui-p-ma_data`
+is the documented M2 exception, §8.7.1); unit suite `UNIT-SUITE-PASS` (all 7
+benches); caches-off sanity cross-check 66/68 (ma_data + the caches-off rvc
+follow-up, §8.7.1).
+
+## 8.12 What M2 does not cover
+
+M2 validates the integer execute/retire path and the aligned-access memory
+system. Not covered, by design-doc carve-out: hardware misaligned access
+(`rv64ui-p-ma_data`, deferred to M4, §8.7.1), S/U-mode trap delegation and
+the interrupt path (M6), debug (M7), FP/vector, and the caches-off RVC
+fetch-path discrepancy (§8.7.1, follow-up). MMU translation is an
+identity-map stub (M4). Atomics (LR/SC/AMO) are M3. Those arrive with their
+milestones; the M2 harness's self-checking suites are written so each of them
+fails loudly rather than silently passes once its feature lands.

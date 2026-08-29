@@ -694,10 +694,23 @@ module IU (
     // -----------------------------------------------------------------
     // Entry-or-live select, then the private comparator (IU note S4.1 --
     // its own comparator, never the ALU's adder).
+    //
+    // Donor aq_iu_bju.v:430-446: the LIVE-path operand is NOT the raw
+    // dispatch operand when an LSU forward hits this very cycle --
+    // bju_src0_raw = bju_lsu_wb_fwd_src0_vld ? da_xx_fwd_data : src0_tmp.
+    // Without this mux a branch dispatched the cycle its source load
+    // delivers data skips the park (bju_da_fwd_srcN_hit_now clears
+    // depend_lsu) but compares the STALE register-file value
+    // (rv64uc-p-rvc test-20 check C: bne resolved on the load's OLD
+    // destination value, one cycle before writeback).
     // -----------------------------------------------------------------
+    wire [63:0] bju_live_src0 = bju_da_fwd_src0_hit_now ? da_xx_fwd_data
+                                                          : idu_iu_ex1_src0_data;
+    wire [63:0] bju_live_src1 = bju_da_fwd_src1_hit_now ? da_xx_fwd_data
+                                                          : idu_iu_ex1_src1_data;
     wire [FUNC_WIDTH-1:0] bju_func_sel = bju_entry_vld_r ? bju_entry_func_r : idu_iu_ex1_func;
-    wire [63:0] bju_cmp_src0 = bju_entry_vld_r ? bju_entry_src0_r : idu_iu_ex1_src0_data;
-    wire [63:0] bju_cmp_src1 = bju_entry_vld_r ? bju_entry_src1_r : idu_iu_ex1_src1_data;
+    wire [63:0] bju_cmp_src0 = bju_entry_vld_r ? bju_entry_src0_r : bju_live_src0;
+    wire [63:0] bju_cmp_src1 = bju_entry_vld_r ? bju_entry_src1_r : bju_live_src1;
     wire [1:0]  bju_bht_pred_sel = bju_entry_vld_r ? bju_entry_bht_pred_r : idu_iu_ex1_bht_pred;
     wire [PC_WIDTH-1:0] bju_target_pc  = bju_entry_vld_r ? bju_entry_target_r      : bju_target_now;
     wire [PC_WIDTH-1:0] bju_inc_pc     = bju_entry_vld_r ? bju_entry_inc_pc_r      : bju_inc_pc_rt;
@@ -753,7 +766,30 @@ module IU (
     wire [PC_WIDTH-1:0] bju_pcgen_next_pc =
         (bju_resolves_now && bju_taken) ? bju_target_pc : bju_inc_pc_rt;
 
-    wire bju_redirect_now = bju_resolves_now && (bju_cond_br_mispred || bju_pc_reg_mispred);
+    // rv906 M2 bring-up fix (rv64uc-p-rvc wrong-path pcgen drift): the donor
+    // bju_tar_pc_vld formula (aq_iu_bju.v:649-653) fires only on BHT/RAS
+    // mispredict -- for unconditional jumps the donor relies on the BTB /
+    // IPACK-stage predictor redirect (aq_ifu_pred.v:725-733 pred_chgflw) to
+    // have already re-pointed the front end, so no wrong-path instruction
+    // ever completes behind a jump. With the predictors disabled (the M2
+    // rung-0/1 pass bar, MHCR.BTB/BHT/RAS = 0) there is no such early
+    // redirect for the IU's own pcgen tracker: the fall-through instruction
+    // after the jump enters EX1, completes, and advances bju_pcgen_pc by its
+    // length -- a PERMANENT drift (proven by $display tracing: c.j @0x80000000
+    // correctly loaded the tracker with target 0x80000048, then the
+    // wrong-path nop @0x80000002 completed next cycle and moved it to
+    // 0x8000004a), corrupting every later PC-relative consumer (auipc
+    // results, branch targets). Redirecting the unconditional resolve closes
+    // this: iu_idu_br_cancel squashes the wrong-path dispatch at the EX1
+    // boundary (IDU flush term beats the adv load), pcgen_ibuf_chgflw_vld
+    // flushes the fetched fall-through halfwords, and the tracker keeps the
+    // true target from the resolving jump's own bju_pcgen_next_pc update.
+    // When BTB/BHT ARE enabled this duplicates a redirect the front end has
+    // already taken -- a same-target re-flush, harmless (performance only).
+    wire bju_uncond_redirect = bju_resolves_now && bju_uncond_live && !bju_entry_vld_r;
+
+    wire bju_redirect_now = bju_resolves_now && (bju_cond_br_mispred || bju_pc_reg_mispred)
+                          || bju_uncond_redirect;
 
     wire bju_ret_vld_raw  = bju_is_jalr_live && !bju_entry_vld_r
                           && (idu_iu_ex1_src0_reg[4:0] == 5'd1)
@@ -972,7 +1008,8 @@ module IU (
     assign iu_rtu_ex3_mul_preg     = mul_ex3_preg;
 
     assign iu_idu_mult_issue_stall = idu_iu_ex1_mult_sel
-                                    && (mul_iter_start || mul_state == MUL_SPLIT0 || mul_state == MUL_SPLIT1);
+                                    && ((mul_state == MUL_IDLE && mul_iter_start)
+                                        || mul_state == MUL_SPLIT0 || mul_state == MUL_SPLIT1);
     assign iu_idu_mult_full        = mul_ex2_valid && mul_ex3_valid && !rtu_iu_mul_wb_grant;
 
     //=========================================================================
@@ -1070,9 +1107,19 @@ module IU (
     wire div_ex2_enable_wb = rtu_iu_div_wb_grant;
     wire [2:0] div_next_state;
 
+    // Fast-path entry note: for the abnormal/hit fast path the result is
+    // valid in the DIV_IDLE dispatch cycle itself. If the writeback grant is
+    // accepted THAT cycle the op is done and stays IDLE; only when the grant
+    // is blocked (another EX1-group writeback winning the rbus) does it move
+    // to WFWB to wait. Going to WFWB unconditionally (the old formula)
+    // produced a SECOND writeback pulse once WFWB got its own grant -- the
+    // WBT busy-bit counter saw one create but two writebacks, underflowed,
+    // and the destination register read as permanently pending (rv64um-p-divu
+    // wedge at test 9).
     assign div_next_state =
           (div_state == DIV_IDLE)  ? (div_iter_start ? DIV_WFI2
-                                     : div_ex1_res_vld ? DIV_WFWB : DIV_IDLE)
+                                     : (div_ex1_res_vld && !div_ex2_enable_wb) ? DIV_WFWB
+                                     : DIV_IDLE)
         : (div_state == DIV_WFI2)  ? DIV_ALIGN
         : (div_state == DIV_ALIGN) ? DIV_ITER
         : (div_state == DIV_ITER)  ? ((div_iter_left <= 7'd1) ? DIV_CMPLT : DIV_ITER)
@@ -1179,11 +1226,22 @@ module IU (
                                  ? (div_sel_quotient ? div_abnormal_quotient : div_abnormal_remainder)
                                  : (div_sel_quotient_flop ? div_quotient_final : div_remainder_final);
 
+    // BUG FIX (rv64um div/rem hang): the destination register must be
+    // latched AT DISPATCH, exactly like MUL's mul_ex2_preg (line ~983) --
+    // the iter path keeps the DIV FSM busy for several cycles after the
+    // instruction has already retired out of EX1, so at DIV_CMPLT the live
+    // idu_iu_ex1_dst0_reg names SOME LATER instruction (or a cleared EX1),
+    // and the result was written back to the wrong register while the real
+    // destination's WBT busy-bit stayed armed forever (permanent RAW stall;
+    // rv64um-p-divu wedged on test 2's `bne a4,...`).
     always @(posedge clk) begin
-        if (div_cmplt_now) begin
+        if (div_new_dispatch)
+            div_preg_reg <= idu_iu_ex1_dst0_reg;
+    end
+
+    always @(posedge clk) begin
+        if (div_cmplt_now)
             div_result_reg <= div_result_live;
-            div_preg_reg   <= idu_iu_ex1_dst0_reg;
-        end
     end
 
     wire div_wb_now = div_cmplt_now || (div_state == DIV_WFWB);
@@ -1195,7 +1253,11 @@ module IU (
     assign iu_rtu_ex1_div_inst_len = 1'b1;
     assign iu_rtu_div_wb_dp      = div_wb_now;
     assign iu_rtu_div_wb_vld     = div_wb_now;
-    assign iu_rtu_div_preg       = div_cmplt_now ? idu_iu_ex1_dst0_reg : div_preg_reg;
+    // Fast-path (abnormal/hit) completion fires in the DIV_IDLE dispatch
+    // cycle itself, where the live EX1 dst is still the div's own; every
+    // later cycle (DIV_CMPLT/DIV_WFWB of the iter path) uses the latch.
+    assign iu_rtu_div_preg       = (div_cmplt_now && div_state == DIV_IDLE)
+                                 ? idu_iu_ex1_dst0_reg : div_preg_reg;
     assign iu_rtu_div_data       = div_cmplt_now ? div_result_live : div_result_reg;
 
     assign iu_idu_div_full = ((div_state == DIV_CMPLT || div_state == DIV_WFWB) && !rtu_iu_div_wb_grant)

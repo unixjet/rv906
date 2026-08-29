@@ -90,6 +90,11 @@ module CSR #(
     // 16-bit) for the CSR slice -- feeds the RTU pcgen inst_len mux
     // (aq_rtu_dp.v:371 cp0 arm).
     input  wire                     idu_cp0_ex1_inst_len,
+    // CSR -> IDU : FENCE/FENCE.I EX1-hold backpressure (Task 10.1,
+    // rv64ui-p-fence_i): high while the fence waits for LSU quiescence;
+    // IDU folds it into ctrl_ex1_eu_full so EX1 keeps the fence until
+    // completion is allowed (SECTION DECODE note).
+    output wire                     cp0_idu_fencei_full,
 
     //=========================================================================
     // IU -> CSR : the only IU<->CP0 connection besides config (IU note
@@ -170,6 +175,17 @@ module CSR #(
     output wire                     cp0_lsu_dcache_en,
     output wire                     cp0_lsu_mm,
     output wire                     cp0_lsu_wa,
+    // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1): FENCE/FENCE.I
+    // hold in EX1 while this is low -- stores must reach their completion
+    // point before the fence's I-side invalidate (or any later observer) may
+    // proceed. (RVProc.v wires LSU's quiescent output here.)
+    input  wire                     lsu_cp0_stb_empty,
+    // CSR -> LSU / LSU -> CSR : FENCE.I D-cache clean-walk handshake
+    // (Task 10.1; donor aq_cp0_fence_inst.v FNC_CDCA stage): CSR holds
+    // cp0_lsu_dcache_clean while fencei_state==FI_CLEAN; LSU walks all
+    // dirty lines back to memory and pulses lsu_cp0_clean_done when done.
+    output wire                     cp0_lsu_dcache_clean,
+    input  wire                     lsu_cp0_clean_done,
 
     //=========================================================================
     // CSR -> XX : reset vector (already exists as an M1 port on RVProc.v,
@@ -218,12 +234,49 @@ module CSR #(
     wire is_ecall  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_ECALL);
     wire is_ebreak = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_EBREAK);
     wire is_mret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_MRET);
-    // FENCE/FENCE.I are recognized dispatch targets (this file's own header
-    // comment on `idu_cp0_ex1_sel`) but, for M2, produce none of the three
-    // completion signals below at all -- see the "MHCR / MXSTATUS FAN-OUT"
-    // section's note on why FENCE.I does not drive a real icache-invalidate
-    // handshake. No local wire is needed: they simply fall through every
-    // `is_*` check as neither illegal, ecall, ebreak, mret, nor a CSR op.
+    // FENCE/FENCE.I serialization sequence (Task 10.1, rv64ui-p-fence_i;
+    // donor aq_cp0_fence_inst.v's FNC_FENC->FNC_CDCA->FNC_IICA ordering):
+    // (1) hold in EX1 until the LSU is quiescent (`lsu_cp0_stb_empty` --
+    // store buffer drained, pipe idle), i.e. every prior store has reached
+    // its completion point; (2) FENCE.I only: the LSU walks the D-cache
+    // writing back every dirty line (SECTION CLEAN in LSU.v) so store-hit
+    // bytes reach the backing memory the ICache refills from; (3) FENCE.I
+    // only: ICache INV_ALL walk (`inv_block` stalls all fetch meanwhile);
+    // (4) complete with changeflow (mret-style: RTU's ex1_inst_chgflw ->
+    // flush_fe + refetch at PC+4), so the first post-fence fetch reads
+    // freshly invalidated state. `cp0_idu_fencei_full` stalls IDU dispatch
+    // for the whole sequence so EX1 keeps the fence. This supersedes the
+    // earlier M2 "no real invalidate handshake" scope note: fence_i IS in
+    // rv64ui's acceptance set, and the donor C906 executes fence.i with a
+    // genuine D-clean + I-invalidate.
+    wire is_fence  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_FENCE);
+    wire is_fencei = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_FENCEI);
+    wire fence_quiesce_wait = (is_fence || is_fencei) && !lsu_cp0_stb_empty;
+
+    // FENCE.I clean/invalidate sequencer: FI_CLEAN runs LSU.v's D-cache
+    // clean walk (cp0_lsu_dcache_clean held until lsu_cp0_clean_done
+    // pulses), FI_INV runs the ICache INV_ALL walk (cp0_ifu_icache_inv_req
+    // held until ifu_cp0_icache_inv_done pulses), FI_CMPLT is the single
+    // completion cycle (cmplt_dp + chgflw both fire that cycle only).
+    localparam [1:0] FI_IDLE  = 2'b00, FI_CLEAN = 2'b01,
+                     FI_INV   = 2'b10, FI_CMPLT = 2'b11;
+    reg [1:0] fencei_state;
+    wire fencei_launch = is_fencei && ex1_active && !fence_quiesce_wait
+                       && (fencei_state == FI_IDLE);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) fencei_state <= FI_IDLE;
+        else case (fencei_state)
+            FI_IDLE:  if (fencei_launch)           fencei_state <= FI_CLEAN;
+            FI_CLEAN: if (lsu_cp0_clean_done)      fencei_state <= FI_INV;
+            FI_INV:   if (ifu_cp0_icache_inv_done) fencei_state <= FI_CMPLT;
+            FI_CMPLT:                              fencei_state <= FI_IDLE;
+        endcase
+    end
+    // EX1 hold: from the launch cycle through the INV walk; released at
+    // FI_CMPLT so completion fires exactly that one cycle.
+    wire fence_hold = fence_quiesce_wait
+                    || (is_fencei && (fencei_launch || fencei_state == FI_CLEAN
+                                      || fencei_state == FI_INV));
 
     wire is_csrrw  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRW);
     wire is_csrrs  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRS);
@@ -360,8 +413,14 @@ module CSR #(
     // chgflw/chgflw_pc during its own EX1 cycle, uniform with every other
     // CP0-declared changeflow (RTU note S7: "MRET/SRET redirect is uniform
     // with every other changeflow... CP0 computes the return PC itself").
-    assign cp0_rtu_ex1_chgflw    = mret_fire;
-    assign cp0_rtu_ex1_chgflw_pc = mepc_pc;
+    assign cp0_rtu_ex1_chgflw    = mret_fire || (is_fencei && (fencei_state == FI_CMPLT));
+    assign cp0_rtu_ex1_chgflw_pc = mret_fire ? mepc_pc
+                                             : iu_cp0_ex1_cur_pc + {{(PC_WIDTH-3){1'b0}}, 3'd4};
+
+    // FENCE.I walk requests (Task 10.1): FI_CLEAN holds the LSU's D-cache
+    // clean walk, FI_INV holds the ICache INV_ALL request (ICache.v treats a
+    // held request as INV_ALL; `inv_block` stalls fetch until done).
+    assign cp0_lsu_dcache_clean   = (fencei_state == FI_CLEAN);
 
     //=========================================================================
     // SECTION MCAUSE -- real flop: interrupt bit + 5-bit cause (contract 7).
@@ -652,7 +711,12 @@ module CSR #(
     assign cp0_rtu_ex1_wb_vld   = is_csr_op;
     assign cp0_rtu_ex1_wb_data  = csr_rdata;
     assign cp0_rtu_ex1_wb_preg  = idu_cp0_ex1_dst0_reg;
-    assign cp0_rtu_ex1_cmplt_dp = ex1_active;
+    // fence_hold (above) holds a FENCE/FENCE.I in EX1 from LSU-quiescence
+    // through the clean/invalidate walks -- cmplt_dp must NOT heartbeat
+    // while held, otherwise RTU would retire the fence before its ordering
+    // guarantee is established.
+    assign cp0_rtu_ex1_cmplt_dp = ex1_active && !fence_hold;
+    assign cp0_idu_fencei_full  = fence_hold;
     // Task 7.3: the completing CSR instruction's length. CP0 completes in
     // EX1 (single cycle), so the completing instruction IS the live EX1
     // instruction -- no latching needed.
@@ -678,16 +742,15 @@ module CSR #(
     // -- cache-maintenance custom ops (icache.iva/dcache.iall/etc, the
     // donor's FUNC_ICACHE_*/FUNC_DCACHE_*) are out of M2's decode scope
     // (design doc S2.2's "che" sub-FSM note), so these stay tied to their
-    // quiescent defaults; FENCE/FENCE.I are dispatched and completed (no
-    // completion signal at all, per the DECODE section's note) but, for M2,
-    // do not drive a real icache-invalidate handshake -- a scope decision,
-    // not an oversight (flagged in the Task 2 completion report).
+    // quiescent defaults. The one exception is FENCE.I, which drives the
+    // INV_ALL request line from the fencei_state FI_INV stage (SECTION
+    // DECODE note) -- required by rv64ui-p-fence_i, faithful to the donor.
     //=========================================================================
     assign cp0_ifu_icache_en       = mhcr_ie;
     assign cp0_ifu_iwpe            = ICACHE_IWPE_DEFAULT;
     assign cp0_ifu_icache_pref_en  = 1'b0;
     assign cp0_ifu_icache_inv_addr = 64'd0;
-    assign cp0_ifu_icache_inv_req  = 1'b0;
+    assign cp0_ifu_icache_inv_req  = (fencei_state == FI_INV);
     assign cp0_ifu_icache_inv_type = 2'd0;
     assign cp0_ifu_bht_en          = mhcr_bpe;
     assign cp0_ifu_btb_en          = mhcr_btbe;
@@ -701,12 +764,11 @@ module CSR #(
 
     assign cp0_xx_mrvbr = RESET_VECTOR[PC_WIDTH-1:0];
 
-    // `ifu_cp0_icache_inv_done`/`bht_cp0_inv_done` (handshake-done inputs)
-    // and `iu_cp0_ex1_cur_pc` have no consumer in M2's minimal CSR set --
-    // no invalidate request is ever issued (immediately above), and no CSR
-    // this task implements needs the current-PC passthrough (this file's
-    // own header note on that port: added only to give IU.v's output a
-    // landing pad, semantics unresolved). Left genuinely unused rather than
-    // fake-wired to something; flagged in the Task 2 completion report.
+    // `bht_cp0_inv_done` (handshake-done input) has no consumer in M2's
+    // minimal CSR set -- no BHT invalidate request is ever issued (tied 0 in
+    // the MHCR fan-out above). `ifu_cp0_icache_inv_done` IS consumed: it
+    // advances the FENCE.I fencei_state sequencer (SECTION DECODE note).
+    // `iu_cp0_ex1_cur_pc` feeds the FENCE.I changeflow PC (PC+4) in addition
+    // to its original trap-context role.
 
 endmodule
