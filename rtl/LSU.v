@@ -150,6 +150,9 @@ module LSU #(
     output wire [63:0]              lsu_rtu_tval,
     output wire                     lsu_rtu_async_expt_vld,
     output wire                     lsu_rtu_async_ld_inst,
+    // M3 Task 1: LR.W / SC.W foundation outputs
+    output wire                     lsu_rtu_lr_vld,
+    output wire [4:0]               lsu_rtu_sc_res,   // 0=success(commit), 1=fail
 
     //=========================================================================
     // RTU -> LSU : "point of no return" acks (RTU note S6) -- also the
@@ -424,6 +427,27 @@ module LSU #(
     reg            frz_is_direct_r /* verilator public */;
 
     //-------------------------------------------------------------------------
+    // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
+    //-------------------------------------------------------------------------
+    reg [55:0] lr_addr_r;         // last LR physical address (PA[55:0])
+    reg [31:0] lr_data_r;         // latched loaded data from LR.W
+    reg        lr_valid_r;        // set when LR completes, cleared by SC or intervening access
+    wire [31:0] lr_data_out      = lr_valid_r ? lr_data_r : 32'd0;
+
+    // Exclusion detection on any store/load while lr_valid_r is held
+    wire lr_exclude_on_store = lr_valid_r && dc_is_store_r && !dc_misalign_r;
+    wire lr_exclude_on_load  = lr_valid_r && !dc_is_store_r && dc_hit_c && !dc_misalign_r;
+
+    // SC.W address match check against last LR address
+    wire sc_addr_match = lr_valid_r && (dc_addr_r == lr_addr_r);
+
+    // Update LR buffer state: clear on exclusion or SC success
+    always @(posedge clk) begin
+        if (lr_exclude_on_store || lr_exclude_on_load)
+            lr_valid_r <= 1'b0;
+    end
+
+    //-------------------------------------------------------------------------
     // SECTION STB (LSU note A4) -- 4 entries, one per distinct 8-byte-
     // aligned doubleword (contract 3's trap-on-misalign guarantee means an
     // aligned access of size <=8B never straddles a doubleword, so a single
@@ -658,6 +682,48 @@ module LSU #(
             endcase
         end
     end
+    // M3 Task 1: LR.W / SC.W foundation
+    // M3 Task 1: LR.W / SC.W foundation
+    // Latch opcode at issue time since idu_lsu_ex1_func gets cleared after
+    reg        lr_addr_set;
+    reg [FUNC_WIDTH-1:0] lr_func_r;  // latched opcode
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            lr_valid_r <= 1'b0;
+            lr_addr_set <= 1'b0;
+            lr_func_r <= 20'd0;
+        end else begin
+            // Latch opcode and addr on issue_real (IDLE->DCS transition)
+            // Use ag_addr (virtual address) for LR/SC comparison
+            if (issue_real && idu_lsu_ex1_func == LSU_FUNC_LR) begin
+                lr_func_r <= idu_lsu_ex1_func;
+                lr_addr_r <= ag_addr[55:0];
+                lr_data_r <= 32'd0;
+                lr_addr_set <= 1'b1;
+            end
+
+            // Capture data when cache responds OR miss refill completes
+            if ((u_dc_resp_vld || miss_done) && lr_addr_set && !lr_valid_r) begin
+                lr_data_r <= u_dc_resp_vld ? u_dc_resp_rdata[31:0] : frz_rdata_r[31:0];
+            end
+
+            // When cmplt_dp fires for this LR op, set valid
+            if (lsu_rtu_ex1_cmplt_dp && lr_addr_set && !lr_valid_r) begin
+                lr_valid_r <= 1'b1;
+            end
+
+            // Clear on exclusion
+            if (lr_exclude_on_store || lr_exclude_on_load) begin
+                lr_valid_r <= 1'b0;
+                lr_addr_set <= 1'b0;
+                lr_func_r <= 20'd0;
+            end
+        end
+    end
+
+    // Make lr_vld a wire that tracks cmplt_dp for LR operations
+    assign lsu_rtu_lr_vld = lsu_rtu_ex1_cmplt_dp && lr_addr_set;
 
     assign lsu_idu_full = (state != ST_IDLE) || clean_active;
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
@@ -1134,6 +1200,39 @@ module LSU #(
     wire reply_is_load      = reply_fire && !dc_is_store_r;
     wire reply_is_store      = reply_fire && dc_is_store_r;
     wire reply_is_misalign  = reply_fire && dc_misalign_r;
+    // M3 Task 1: LR.W detection (F_LR opcode at AG stage)
+    wire lr_issue_fire      = (idu_lsu_ex1_func == LSU_FUNC_LR) && issue_real;
+
+    // M3 Task 1: SC.W detection - latch addr at ST_DCS when dc_addr_r is stable
+    reg        sc_addr_set;
+    reg [63:0] sc_addr_r;
+    reg [FUNC_WIDTH-1:0] sc_func_r;  // latched SC opcode
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            sc_addr_set <= 1'b0;
+            sc_func_r <= 20'd0;
+        end else begin
+            // Latch opcode at issue_real
+            if (issue_real && idu_lsu_ex1_func == LSU_FUNC_SC) begin
+                sc_func_r <= idu_lsu_ex1_func;
+            end
+            // Latch addr at ST_DCS entry (when dc_addr_r is stable)
+            if (state == ST_DCS && sc_func_r == LSU_FUNC_SC && !sc_addr_set) begin
+                sc_addr_r <= dc_addr_r;
+                sc_addr_set <= 1'b1;
+            end
+            // Clear after completion
+            if (lsu_rtu_ex1_cmplt_dp && sc_addr_set) begin
+                sc_addr_set <= 1'b0;
+                sc_func_r <= 20'd0;
+            end
+        end
+    end
+
+    // SC result: 0=success(commit), 1=fail - based on address match with last LR
+    // Use lr_addr_r directly (not lr_valid_r which gets cleared by exclusion logic)
+    wire sc_addr_match_now = sc_addr_set && (sc_addr_r[55:0] == lr_addr_r);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -1226,6 +1325,10 @@ module LSU #(
     assign lsu_rtu_ex2_data      = da_final;
     assign lsu_rtu_ex2_data_vld  = lsu_fwd2_dc_fire || lsu_rtu_wb_vld;
     assign lsu_rtu_ex2_dest_reg  = dc_dst0_reg_r;
+
+    // M3 Task 1: LR.W / SC.W foundation outputs
+    // SC result based on latched address match with last LR
+    assign lsu_rtu_sc_res     = sc_addr_set ? (sc_addr_match_now ? 5'd0 : 5'd1) : 5'd0;  // 0=success, 1=fail
 
     assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
     assign lsu_rtu_expt_vec = dc_is_store_r ? 5'd6 : 5'd4;   // store/load misalign

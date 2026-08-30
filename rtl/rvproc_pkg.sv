@@ -586,6 +586,10 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_LD  = 20'h0030e;  // cfig.h:506
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LBU = 20'h00300;  // cfig.h:507
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LHU = 20'h00304;  // cfig.h:508
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LWU = 20'h00308;  // cfig.h:509
+// M3 Task 1: LR.W / SC.W - must have func[0]=0 to avoid being treated as STORE
+// (LSU v's ag_is_store = idu_lsu_ex1_func[0])
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_LR = 20'h00b08;  // LR.W (func[0]=0 -> load-like)
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_SC  = 20'h00b0c;  // SC.W (func[0]=0 -> load-like)
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SB  = 20'h00301;  // cfig.h:513
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SH  = 20'h00305;  // cfig.h:514
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SW  = 20'h00309;  // cfig.h:515
