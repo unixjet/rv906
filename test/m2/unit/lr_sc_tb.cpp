@@ -36,10 +36,11 @@ static const uint32_t F_SW  = 0x00309;
 static const uint32_t F_SD  = 0x0030d;
 
 //-----------------------------------------------------------------------------
-// Dummy opcode constants for LR/SC stubs (to be wired properly in LSU.v fix)
+// LR/SC func encodings (rvproc_pkg.sv): all load-like (func[0]=0);
+// func[3:2]=size, func[1]=sign-ext. LR.W = 0x00b0a, SC.W = 0x00b08.
 //-----------------------------------------------------------------------------
-static const uint32_t F_LR  = 0x00b08;  // M3 Task 1: LR.W (func[0]=0 -> load-like)
-static const uint32_t F_SC  = 0x00b0c;  // M3 Task 1: SC.W (func[0]=0 -> load-like)
+static const uint32_t F_LR  = 0x00b0a;  // LSU_FUNC_LR_W
+static const uint32_t F_SC  = 0x00b08;  // LSU_FUNC_SC_W
 
 //-----------------------------------------------------------------------------
 // DUT plumbing
@@ -312,8 +313,10 @@ static void test_lr_w_basic(void)
     // Initialize memory at A with known pattern (little-endian layout)
     for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(0xAA + i));
 
-    // Expected loaded value: bytes [AA, AB, AC, AD] -> 0xADACABAA LE
-    const uint64_t EXPECT_DATA = 0xADACABAAULL;
+    // Expected loaded value: bytes [AA, AB, AC, AD] -> 0xADACABAA LE,
+    // SIGN-EXTENDED (LR.W behaves like LW per the A spec; the LR_W func
+    // carries sign-ext=1, so bit31=1 fills the upper word).
+    const uint64_t EXPECT_DATA = 0xFFFFFFFFADACABAAULL;
 
     // Issue LR.W
     LsuResult lr = do_op(F_LR, A, 0, 0, 5);
@@ -578,6 +581,206 @@ static void test_amo_immediately_after_store(void)
 }
 
 //=============================================================================
+// M3 Task 8: LR/SC stress tests
+//=============================================================================
+
+// T9: warm-cache LR/SC retry loop. The line is pre-loaded (so the LR HITS),
+// then 32 iterations of {LR; SC} with idle gaps between ops. Every SC must
+// succeed on the first try and commit. Regression guard for the stale
+// exclusion bug: in ST_IDLE the DCache response bus holds the previous
+// transaction's hit-way, and an unqualified exclusion check cleared a fresh
+// reservation during the idle gap (rv64ua-p-lrsc hung in its retry loop).
+static void test_lr_sc_warm_loop(void)
+{
+    const uint64_t A = 0x00000000800A0000ULL;
+    const uint32_t INIT_VAL = 0x00000005;
+    const int ITERS = 32;
+
+    // Seed memory and warm the line via a load through the DUT.
+    for (int i = 0; i < 4; i++) mem_wr(A + i, (uint8_t)(INIT_VAL >> (i * 8)));
+    do_op(F_LW, A, 0, 0, 5);
+    settle(10);
+
+    uint32_t expect = INIT_VAL;
+    bool all_first_try = true;
+    for (int i = 0; i < ITERS; i++) {
+        LsuResult lr = do_op(F_LR, A, 0, 0, 5);
+        if (!lr.cmplt || lr.lr_vld != 1) { all_first_try = false; break; }
+        settle(2);   // idle gap where the stale-exclusion bug fired
+        uint32_t newv = (uint32_t)lr.wb_data + 1;
+        LsuResult sc = do_op(F_SC, A, 0, newv, 6);
+        settle(2);
+        if (!sc.cmplt || sc.sc_res != 0) { all_first_try = false; break; }
+        expect = newv;
+    }
+    check(all_first_try, "all 32 warm-cache LR/SC pairs succeed first try",
+          all_first_try, 1);
+
+    // Final memory value must equal the accumulated result (every SC commit
+    // actually reached memory/cache).
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == expect,
+          "loop final value committed", ld.wb_data & 0xFFFFFFFF, expect);
+
+    test_result("T9 warm-cache LR/SC retry loop (32 iters)");
+}
+
+// T10: an intervening store to the reserved dword kills the reservation, and
+// a FAILED SC must not commit its store data.
+static void test_sc_fail_no_commit(void)
+{
+    const uint64_t A = 0x00000000800B0000ULL;
+    const uint32_t BASE = 0x11111111;
+    const uint32_t STORE_V = 0x22222222;
+    const uint32_t SC_V = 0x33333333;
+
+    for (int i = 0; i < 4; i++) mem_wr(A + i, (uint8_t)(BASE >> (i * 8)));
+    do_op(F_LW, A, 0, 0, 5);   // warm the line
+    settle(10);
+
+    do_op(F_LR, A, 0, 0, 5);
+    settle(4);
+    do_op(F_SW, A, 0, STORE_V, 0);   // intervening store -> reservation lost
+    settle(4);
+    LsuResult sc = do_op(F_SC, A, 0, SC_V, 6);
+    settle(10);
+
+    check(sc.sc_res == 1, "SC after intervening store fails", sc.sc_res, 1);
+
+    // The failed SC must NOT have written SC_V; memory holds STORE_V.
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == STORE_V,
+          "failed SC did not commit its data", ld.wb_data & 0xFFFFFFFF, STORE_V);
+
+    test_result("T10 intervening store kills reservation, failed SC no-commit");
+}
+
+// T11: reservation-consumption semantics (rv64ua-p-lrsc test 6): SC after a
+// SUCCESSFUL SC fails, and SC after a FAILED SC fails too.
+static void test_sc_consumes_reservation(void)
+{
+    const uint64_t A = 0x00000000800C0000ULL;
+
+    for (int i = 0; i < 4; i++) mem_wr(A + i, 0x00);
+    do_op(F_LW, A, 0, 0, 5);   // warm
+    settle(10);
+
+    // Phase 1: LR -> SC success -> SC again must fail.
+    do_op(F_LR, A, 0, 0, 5);
+    settle(4);
+    LsuResult sc1 = do_op(F_SC, A, 0, 0xA5A5A5A5, 6);
+    settle(4);
+    LsuResult sc2 = do_op(F_SC, A, 0, 0x5A5A5A5A, 6);
+    settle(10);
+    check(sc1.sc_res == 0, "first SC succeeds", sc1.sc_res, 0);
+    check(sc2.sc_res == 1, "SC after successful SC fails", sc2.sc_res, 1);
+
+    // Phase 2: LR -> intervening store -> SC fail -> SC again must fail.
+    do_op(F_LR, A, 0, 0, 5);
+    settle(4);
+    do_op(F_SW, A, 0, 0x12345678, 0);
+    settle(4);
+    LsuResult sc3 = do_op(F_SC, A, 0, 0xDEADBEEF, 6);
+    settle(4);
+    LsuResult sc4 = do_op(F_SC, A, 0, 0xFEEDFACE, 6);
+    settle(10);
+    check(sc3.sc_res == 1, "SC after intervening store fails", sc3.sc_res, 1);
+    check(sc4.sc_res == 1, "SC after failed SC fails", sc4.sc_res, 1);
+
+    // Phase 1's successful SC committed 0xA5A5A5A5; phase 2's intervening
+    // store then legitimately overwrote it, and both failed SCs added nothing.
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == 0x12345678,
+          "failed SCs committed nothing over the store", ld.wb_data & 0xFFFFFFFF, 0x12345678);
+
+    test_result("T11 SC consumes reservation (success and failure)");
+}
+
+// T12: W-width AMO at byte_off=4 (upper word of the dword). Regression guard
+// for the STB-positioning bug: the AMO writeback must position its data and
+// byte mask by byte_off, leaving the lower word untouched.
+static void test_amo_w_unaligned_dword(void)
+{
+    const uint64_t A = 0x00000000800D0000ULL;   // dword base
+    const uint32_t LO = 0x11111111, HI = 0x22222222;
+    const uint32_t F_AMOADD_W = 0x01008;
+
+    do_op(F_SW, A,     0, LO, 0);
+    do_op(F_SW, A + 4, 0, HI, 0);
+    settle(30);
+
+    LsuResult amo = do_op(F_AMOADD_W, A + 4, 0, 0x01010101, 5);
+    settle(30);
+
+    check(amo.wb_data == (uint64_t)(int64_t)(int32_t)HI,
+          "AMOADD.W@off4 returns sign-ext OLD of upper word", amo.wb_data,
+          (uint64_t)(int64_t)(int32_t)HI);
+
+    LsuResult ldhi = do_op(F_LW, A + 4, 0, 0, 5);
+    check((ldhi.wb_data & 0xFFFFFFFF) == HI + 0x01010101,
+          "upper word updated", ldhi.wb_data & 0xFFFFFFFF, HI + 0x01010101);
+    LsuResult ldlo = do_op(F_LW, A, 0, 0, 5);
+    check((ldlo.wb_data & 0xFFFFFFFF) == LO,
+          "lower word untouched", ldlo.wb_data & 0xFFFFFFFF, LO);
+
+    test_result("T12 AMOADD.W at byte_off=4 (positioned writeback)");
+}
+
+// T13: SC.W at byte_off=4 -- the committed store must land in the upper word
+// only (SC rides the ordinary positioned store-data path).
+static void test_sc_w_upper_word(void)
+{
+    const uint64_t A = 0x00000000800E0000ULL;
+    const uint32_t LO = 0xAAAAAAAA, HI = 0xBBBBBBBB;
+
+    do_op(F_SW, A,     0, LO, 0);
+    do_op(F_SW, A + 4, 0, HI, 0);
+    settle(30);
+
+    do_op(F_LR, A + 4, 0, 0, 5);
+    settle(4);
+    LsuResult sc = do_op(F_SC, A + 4, 0, 0xCCCCCCCC, 6);
+    settle(20);
+    check(sc.sc_res == 0, "SC.W@off4 succeeds", sc.sc_res, 0);
+
+    LsuResult ldhi = do_op(F_LW, A + 4, 0, 0, 5);
+    check((ldhi.wb_data & 0xFFFFFFFF) == 0xCCCCCCCC,
+          "upper word committed", ldhi.wb_data & 0xFFFFFFFF, 0xCCCCCCCC);
+    LsuResult ldlo = do_op(F_LW, A, 0, 0, 5);
+    check((ldlo.wb_data & 0xFFFFFFFF) == LO,
+          "lower word untouched", ldlo.wb_data & 0xFFFFFFFF, LO);
+
+    test_result("T13 SC.W at byte_off=4 (positioned commit)");
+}
+
+// T14: LR.D / SC.D (64-bit) basic flow with the D-width func encodings.
+static void test_lr_sc_d(void)
+{
+    const uint64_t A = 0x00000000800F0000ULL;
+    const uint64_t INIT = 0x0F1E2D3C4B5A6978ULL;
+    const uint64_t NEWV = 0x89ABCDEF01234567ULL;
+    const uint32_t F_LR_D = 0x00b0c;   // LSU_FUNC_LR_D
+    const uint32_t F_SC_D = 0x00b0e;   // LSU_FUNC_SC_D
+
+    for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(INIT >> (i * 8)));
+
+    LsuResult lr = do_op(F_LR_D, A, 0, 0, 5);
+    settle(4);
+    check(lr.cmplt && lr.wb_data == INIT, "LR.D returns full 64-bit value",
+          lr.wb_data, INIT);
+    check(lr.lr_vld == 1, "LR.D asserts lr_vld", lr.lr_vld, 1);
+
+    LsuResult sc = do_op(F_SC_D, A, 0, NEWV, 6);
+    settle(20);
+    check(sc.sc_res == 0, "SC.D succeeds", sc.sc_res, 0);
+
+    LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+    check(ld.wb_data == NEWV, "SC.D committed 8 bytes", ld.wb_data, NEWV);
+
+    test_result("T14 LR.D / SC.D basic flow");
+}
+
+//=============================================================================
 // main
 //=============================================================================
 int main(int argc, char **argv)
@@ -595,6 +798,12 @@ int main(int argc, char **argv)
     test_amo_d_ops();
     test_amo_after_store();
     test_amo_immediately_after_store();
+    test_lr_sc_warm_loop();
+    test_sc_fail_no_commit();
+    test_sc_consumes_reservation();
+    test_amo_w_unaligned_dword();
+    test_sc_w_upper_word();
+    test_lr_sc_d();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
