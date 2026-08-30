@@ -1167,6 +1167,77 @@ module LSU #(
     end
 
     //-------------------------------------------------------------------------
+    // SECTION AMO ALU (M3 Task 4) -- combinational read-modify-write compute,
+    // cloned from donor aq_lsu_amo_alu.v. src0 = register operand (the value
+    // to combine), src1 = memory operand (the value read from memory). The
+    // result is the NEW value to store back; the OLD value (src1) is what
+    // gets written to the destination register.
+    //-------------------------------------------------------------------------
+    // Decode AMO op from the latched func (bits[8:4] carry the funct5).
+    wire [4:0] amo_op   = idu_lsu_ex1_func[8:4];
+    wire       amo_wd   = (idu_lsu_ex1_func[1:0] == 2'b00);  // .W
+    wire       amo_dw   = (idu_lsu_ex1_func[1:0] == 2'b11);  // .D
+    wire       amo_is_amo = (idu_lsu_ex1_func[19:12] == 8'h01);  // AMO func prefix
+
+    wire amo_add  = (amo_op == 5'b00000);
+    wire amo_swap = (amo_op == 5'b00001);
+    wire amo_xor  = (amo_op == 5'b00100);
+    wire amo_and  = (amo_op == 5'b01100);
+    wire amo_or   = (amo_op == 5'b01000);
+    wire amo_min  = (amo_op == 5'b10000);
+    wire amo_minu = (amo_op == 5'b11000);
+    wire amo_max  = (amo_op == 5'b10100);
+    wire amo_maxu = (amo_op == 5'b11100);
+
+    // AMO ALU compute (donor aq_lsu_amo_alu.v semantics):
+    // src0 = idu_lsu_ex1_src2_data (register operand), src1 = memory read data.
+    // For W-width, operands are sign/zero-extended to 64b for min/max compare.
+    function automatic [63:0] amo_alu_compute(
+        input [63:0] src0,      // register operand
+        input [63:0] src1,      // memory operand
+        input [4:0]  op,
+        input        is_dw      // 1=D-width, 0=W-width
+    );
+        reg signed [64:0] s0_ext, s1_ext;
+        reg        adder_cin;
+        reg [63:0] add_rst, logic_rst, sel_rst;
+        reg        use_add, use_logic, use_sel;
+        reg        src0_sel;
+        begin
+            // Sign/zero extend for W-width min/max (donor's unsign_ext logic)
+            if (is_dw) begin
+                s0_ext = {src0[63], src0};
+                s1_ext = {src1[63], src1};
+            end else begin
+                s0_ext = {{33{src0[31]}}, src0[31:0]};
+                s1_ext = {{33{src1[31]}}, src1[31:0]};
+            end
+            // Adder: used for add and min/max comparison
+            add_rst = src0 + src1;
+            // Compare for min/max via subtraction borrow
+            adder_cin = (s0_ext >= s1_ext);  // src0 >= src1
+            src0_sel  = ((op[4:0] == 5'b10100 || op[4:0] == 5'b11100) ^ adder_cin)
+                        && (op[4:0] != 5'b00001);  // max/maxu select, not swap
+            sel_rst   = src0_sel ? src0 : src1;
+            // Logic ops
+            case (op[4:0])
+                5'b01100: logic_rst = src0 & src1;   // and
+                5'b00100: logic_rst = src0 ^ src1;   // xor
+                5'b01000: logic_rst = src0 | src1;   // or
+                default:  logic_rst = 64'd0;
+            endcase
+            use_add    = (op[4:0] == 5'b00000);                          // add
+            use_logic  = (op[4:0] == 5'b01100 || op[4:0] == 5'b00100 || op[4:0] == 5'b01000);
+            use_sel    = (op[4:0] == 5'b00001 || op[4:0] == 5'b10000 ||
+                          op[4:0] == 5'b11000 || op[4:0] == 5'b10100 || op[4:0] == 5'b11100);
+            if (use_add)         amo_alu_compute = add_rst;
+            else if (use_logic)  amo_alu_compute = logic_rst;
+            else if (use_sel)    amo_alu_compute = sel_rst;
+            else                 amo_alu_compute = 64'd0;
+        end
+    endfunction
+
+    //-------------------------------------------------------------------------
     // SECTION REPLY completion -- STB create-or-merge for a completing
     // store; the RTU completion/writeback/exception bus.
     //-------------------------------------------------------------------------

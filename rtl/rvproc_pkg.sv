@@ -590,6 +590,30 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_LWU = 20'h00308;  // cfig.h:509
 // (LSU v's ag_is_store = idu_lsu_ex1_func[0])
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LR = 20'h00b08;  // LR.W (func[0]=0 -> load-like)
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SC  = 20'h00b0c;  // SC.W (func[0]=0 -> load-like)
+// M3 Task 4: AMO opcodes (func[0]=0 -> load-like for the initial read phase).
+// Encoding: upper bits select AMO op (matching donor aq_lsu_amo_alu.v funct5),
+// bit[1:0] select width. These drive the AMO FSM read-modify-write sequence.
+// AMO funct5 (donor aq_lsu_amo_alu.v:142-150):
+//   add=00000, swap=00001, xor=00100, and=01100, or=01000,
+//   min=10000, minu=11000, max=10100, maxu=11100
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOADD_W  = 20'h01008;  // AMOADD.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOSWAP_W = 20'h01018;  // AMOSWAP.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOXOR_W  = 20'h01048;  // AMOXOR.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOAND_W  = 20'h010c8;  // AMOAND.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOOR_W   = 20'h01088;  // AMOOR.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMIN_W  = 20'h01108;  // AMOMIN.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMINU_W = 20'h01188;  // AMOMINU.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAX_W  = 20'h01148;  // AMOMAX.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAXU_W = 20'h011c8;  // AMOMAXU.W
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOADD_D  = 20'h0100c;  // AMOADD.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOSWAP_D = 20'h0101c;  // AMOSWAP.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOXOR_D  = 20'h0104c;  // AMOXOR.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOAND_D  = 20'h010cc;  // AMOAND.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOOR_D   = 20'h0108c;  // AMOOR.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMIN_D  = 20'h0110c;  // AMOMIN.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMINU_D = 20'h0118c;  // AMOMINU.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAX_D  = 20'h0114c;  // AMOMAX.D
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAXU_D = 20'h011cc;  // AMOMAXU.D
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SB  = 20'h00301;  // cfig.h:513
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SH  = 20'h00305;  // cfig.h:514
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SW  = 20'h00309;  // cfig.h:515
