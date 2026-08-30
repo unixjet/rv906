@@ -725,6 +725,52 @@ module LSU #(
     // Make lr_vld a wire that tracks cmplt_dp for LR operations
     assign lsu_rtu_lr_vld = lsu_rtu_ex1_cmplt_dp && lr_addr_set;
 
+    //-------------------------------------------------------------------------
+    // SECTION AMO (M3 Task 5) -- read-modify-write flow. Detect AMO at
+    // issue_real, latch operands; the read phase reuses the load path; at
+    // ST_REPLY compute NEW value and write OLD to the register file, then
+    // create an STB entry holding NEW so it drains to memory.
+    //-------------------------------------------------------------------------
+    reg        amo_active;         // AMO in flight (read phase or writeback)
+    reg [63:0] amo_src0_r;         // register operand (latched at issue)
+    reg [4:0]  amo_op_r;           // AMO funct5 (latched at issue)
+    reg        amo_is_dw_r;        // 1=D-width, 0=W-width
+    reg [63:0] amo_old_data;       // OLD value read from memory
+    reg        amo_wb_pending;     // writeback of NEW value pending
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            amo_active   <= 1'b0;
+            amo_src0_r   <= 64'd0;
+            amo_op_r     <= 5'd0;
+            amo_is_dw_r  <= 1'b0;
+            amo_old_data <= 64'd0;
+            amo_wb_pending <= 1'b0;
+        end else begin
+            // Latch AMO operands at issue_real
+            if (issue_real && amo_is_amo) begin
+                amo_active  <= 1'b1;
+                amo_src0_r  <= idu_lsu_ex1_src2_data;
+                amo_op_r    <= amo_op;
+                amo_is_dw_r <= amo_dw;
+            end
+            // Capture OLD value when read completes (ST_REPLY for a load)
+            if (amo_active && (state == ST_REPLY) && reply_can_complete
+                && !dc_is_drain_r && !dc_misalign_r) begin
+                amo_old_data <= da_final;
+                amo_wb_pending <= 1'b1;
+                amo_active <= 1'b0;
+            end
+            // Clear writeback pending once STB entry is created (handled below)
+            if (amo_wb_pending && reply_fire) begin
+                amo_wb_pending <= 1'b0;
+            end
+        end
+    end
+
+    // Compute NEW value from OLD + register operand
+    wire [63:0] amo_new_data = amo_alu_compute(amo_src0_r, amo_old_data, amo_op_r, amo_is_dw_r);
+
     assign lsu_idu_full = (state != ST_IDLE) || clean_active;
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
     // flight. state==ST_IDLE implies no AG-issued op is in flight
