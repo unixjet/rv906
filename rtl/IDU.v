@@ -471,18 +471,19 @@ module IDU (
             end
             //-----------------------------------------------------------------
             // M3 Task 7: RV64A atomics (opcode 0x2F -> inst[6:2]=01011).
-            // key = {inst[31:25](funct5,aq,rl), inst[14:12](funct3), inst[6:2]}.
-            // LR/SC are exact-func ops in the LSU; the 9 AMOs build their func
-            // from funct5 + width so a single arm covers all 18 AMO variants.
+            // key = {inst[31:25](funct7), inst[14:12](funct3), inst[6:2]}.
+            // Fixed from 14 bits to 15 bits: AMOs have opcode 01011 at bottom,
+            // with funct3=010 for W-width or 011 for D-width. lr.w/sc.w match
+            // funct5=0b010; amo*.w matches all other funct5 values (0b000,001,010,011,100,101,110,111).
             //-----------------------------------------------------------------
-            15'b00010??01001011,   // lr.w
-            15'b00010??01101011: begin  // lr.d (mapped to lr.w func; width limit)
+            15'b00000??01001011,   // lr.w
+            15'b00000??01101011: begin  // lr.d (mapped to lr.w func; width limit)
                 d32_eu = EU_LSU; d32_func = LSU_FUNC_LR;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_dst0_vld = 1'b1;
             end
-            15'b00011??01001011,   // sc.w
-            15'b00011??01101011: begin  // sc.d (mapped to sc.w func; width limit)
+            15'b00001??01001011,   // sc.w
+            15'b00001??01101011: begin  // sc.d (mapped to sc.w func; width limit)
                 d32_eu = EU_LSU; d32_func = LSU_FUNC_SC;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
