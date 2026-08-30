@@ -784,8 +784,11 @@ module LSU #(
         end
     end
 
-    // Compute NEW value from OLD + register operand
-    wire [63:0] amo_new_data = amo_alu_compute(amo_src0_r, amo_old_data, amo_op_r, amo_is_dw_r);
+    // Compute NEW value from OLD + register operand.
+    // Donor operand mapping (aq_lsu_amo_alu.v): src0_data = da_amo_alu_src0
+    // (the MEMORY/OLD value), src1_data = stb_amo_alu_src1 (the REGISTER/rs1
+    // value). AMOSWAP returns src1 (rs1); AMOADD returns src0+src1 (OLD+rs1).
+    wire [63:0] amo_new_data = amo_alu_compute(amo_old_data, amo_src0_r, amo_op_r, amo_is_dw_r);
 
     assign lsu_idu_full = (state != ST_IDLE) || clean_active;
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
@@ -1252,11 +1255,12 @@ module LSU #(
     wire amo_maxu = (amo_op == 5'b11100);
 
     // AMO ALU compute (donor aq_lsu_amo_alu.v semantics):
-    // src0 = idu_lsu_ex1_src2_data (register operand), src1 = memory read data.
-    // For W-width, operands are sign/zero-extended to 64b for min/max compare.
+    // src0 = MEMORY operand (OLD value read from memory), src1 = REGISTER
+    // operand (rs1, the value to combine). The result is the NEW value to
+    // store back; the OLD value (src0) is what gets written to the dest reg.
     function automatic [63:0] amo_alu_compute(
-        input [63:0] src0,      // register operand
-        input [63:0] src1,      // memory operand
+        input [63:0] src0,      // memory operand (OLD value)
+        input [63:0] src1,      // register operand (rs1)
         input [4:0]  op,
         input        is_dw      // 1=D-width, 0=W-width
     );
