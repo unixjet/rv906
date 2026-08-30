@@ -498,12 +498,24 @@ module IDU (
             end
             15'b???????01001011,   // amo*.w (funct5 != lr/sc matched above)
             15'b???????01101011: begin  // amo*.d
-                d32_eu = EU_LSU;
-                // func = {AMO prefix 0x01, 3'b000, funct5, width, 2'b00};
-                // width = funct3[1:0] (10=W, 11=D) lands in func[3:2].
-                d32_func = {8'h01, 3'b000, inst[31:27], inst[13:12], 2'b00};
-                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
-                d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
+                // M3 audit: only the NINE defined AMO funct5s decode here.
+                // The donor's decode table lists exactly these (aq_idu_id_
+                // decd.v:2028-2052); reserved funct5 values fall through to
+                // illegal there. rv906's catch-all previously accepted them
+                // and amo_alu_compute returned 0 -- executing a reserved
+                // encoding as "store zero". Trap as illegal instead.
+                casez (inst[31:27])
+                    5'b00000, 5'b00001, 5'b00100, 5'b01000, 5'b01100,
+                    5'b10000, 5'b10100, 5'b11000, 5'b11100: begin
+                        d32_eu = EU_LSU;
+                        // func = {AMO prefix 0x01, 3'b000, funct5, width, 2'b00};
+                        // width = funct3[1:0] (10=W, 11=D) lands in func[3:2].
+                        d32_func = {8'h01, 3'b000, inst[31:27], inst[13:12], 2'b00};
+                        d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                        d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
+                    end
+                    default: d32_illegal = 1'b1;
+                endcase
             end
             15'b???????00000100: begin  // addi
                 d32_eu = EU_ALU; d32_func = ALU_FUNC_ADD;
@@ -985,13 +997,18 @@ module IDU (
     // resolved dp_wb_dst0_type OR-mux -- ALU/BJU/MULT/LSU only, DIV/CP0/
     // illegal fall to OTHER, cited not re-derived per the task text).
     //
-    // M3 Task 7 FIX: AMO/LR/SC are tagged WB_INT_TYPE_OTHER, not LSU. The
-    // donor's load->condbr RAW exemption (raw0_except term 3) assumes an LSU
-    // producer forwards its result within cnt 0/1, which is true for a plain
-    // load but NOT for an AMO/LR/SC: those hold the LSU through a read-modify-
-    // write (AMO) or a store-conditional sequence, so the register writeback
-    // lands many cycles after dispatch. Tagging them OTHER removes the
-    // condbr exemption and forces consumers to stall until the real writeback.
+    // M3 Task 7 FIX: AMO/LR/SC are tagged WB_INT_TYPE_OTHER, not LSU. NOTE
+    // the DONOR tags them WB_INT_TYPE_LSU (its producer-type is purely the
+    // EU select, aq_idu_id_dp.v:566-570) and gets away with it because its
+    // pipelined LSU writes AMO/LR/SC results back at LOAD latency (SC result
+    // generated at DC, aq_lsu_dc.v:1744,1941; AMO/LR rd at DA, 2417-2419), so
+    // the load->condbr RAW exemption (raw0_except term 3) is safe there.
+    // THIS clone's LSU is different: it is late-writeback -- an AMO/LR/SC
+    // holds the LSU through a read-modify-write (AMO) or a store-conditional
+    // sequence, so the register writeback lands many cycles after dispatch.
+    // Tagging them OTHER removes the condbr exemption and forces consumers
+    // to stall until the real writeback. Deliberate, documented adaptation
+    // (docs/08-verification.md §8.13), not a donor transcription.
     wire dis_is_amo_lrsc = (dis_eu_raw == EU_LSU) &&
                            (dis_func[19:12] == 8'h01 || dis_func == LSU_FUNC_LR_W
                             || dis_func == LSU_FUNC_LR_D || dis_func == LSU_FUNC_SC_W

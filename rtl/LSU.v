@@ -307,14 +307,16 @@ module LSU #(
     // cycle flush produces) and confirms zero side effects result --
     // verified cycle-by-cycle, not assumed, per this task's own instruction.
     // `rtu_lsu_expt_ack`/`_expt_exit` (RTU's later, FLUSH_BE-cycle "point of
-    // no return" pulses) are received but likewise have no live consumer
-    // here: by the time either could fire for THIS instruction's own
-    // exception, LSU has already fully resolved it (single-issue, single-
-    // outstanding -- there is no younger, still-speculative LSU state left
-    // to roll back), and `rtu_idu_flush_stall`'s own stall of IDU's ID/DIS
-    // stage (not a port on this file) already prevents any wrong-path
-    // instruction from ever reaching `idu_lsu_ex1_sel` during the drain
-    // window. Flagged here, not silently guessed.
+    // no return" pulses) need no PIPELINE-state consumer here: by the time
+    // either could fire for THIS instruction's own exception, LSU has already
+    // fully resolved it (single-issue, single-outstanding -- there is no
+    // younger, still-speculative LSU state left to roll back), and
+    // `rtu_idu_flush_stall`'s own stall of IDU's ID/DIS stage (not a port on
+    // this file) already prevents any wrong-path instruction from ever
+    // reaching `idu_lsu_ex1_sel` during the drain window. They DO have one
+    // live consumer since the M3 audit: the LR/SC reservation clear (donor
+    // aq_lsu_lm.v:135 kills the reservation on expt_ack | expt_exit).
+    // Flagged here, not silently guessed.
     //=========================================================================
 
     localparam WAYS = DCACHE_WAYS;
@@ -430,20 +432,38 @@ module LSU #(
     // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
     //-------------------------------------------------------------------------
     reg [55:0] lr_addr_r;         // last LR physical address (PA[55:0])
+    reg [1:0]  lr_size_r;         // reservation access size (donor lm_size,
+                                  // aq_lsu_lm.v:159-161 -- SC must match it)
     reg        lr_valid_r;        // set when LR completes, cleared by SC or intervening access
+    reg        dc_is_lr_r;        // in-flight transaction is an LR (issue latch)
 
     // Exclusion detection on any store/load while lr_valid_r is held.
     // (lr_valid_r itself has exactly ONE writer: the LR-buffer always block
     // below -- a second clear-only block here raced it and was removed.)
-    // MUST be qualified to a real in-DCS response: in ST_IDLE the DCache
-    // response bus HOLDS the previous transaction's hit-way, so an
-    // unqualified dc_hit_c/dc_is_store_r reads stale and would clear a
-    // fresh reservation on any idle cycle (rv64ua-p-lrsc: the loop's SC
-    // then always failed, spinning the retry loop forever).
-    wire lr_exclude_on_store = lr_valid_r && (state == ST_DCS) && u_dc_resp_vld
-                               && dc_is_store_r && !dc_misalign_r;
-    wire lr_exclude_on_load  = lr_valid_r && (state == ST_DCS) && u_dc_resp_vld
-                               && !dc_is_store_r && dc_hit_c && !dc_misalign_r;
+    //
+    // lr_txn_event qualifies to a REAL transaction event: in ST_IDLE the
+    // DCache response bus HOLDS the previous transaction's hit-way, so an
+    // unqualified dc_hit_c/dc_is_store_r reads stale and cleared a fresh
+    // reservation on any idle cycle (rv64ua-p-lrsc hung in its retry loop).
+    // Cached transactions fire on their DCS response; UNCACHED transactions
+    // never get one (fire on the DCS pass itself). M3 audit coverage: an
+    // AMO is a store to the reservation even though load-like on this pipe
+    // (the donor clears its lock monitor on SC *and AMO*, aq_lsu_dc.v:1620)
+    // -- a MISSED AMO to the reserved line and uncached stores/AMOs used to
+    // slip through; and any completing LOAD can evict the reserved line via
+    // refill, so hit-or-miss both clear (conservative, spec-legal).
+    //
+    // An LR is EXCEPTED: LR-over-LR re-keys the reservation (donor lm_set
+    // overwrites addr/size in EXCL state, aq_lsu_lm.v:145-157). Without the
+    // exception, LR#2's own DCS response cleared lr_addr_set before the
+    // completion set-term could fire, leaving NO reservation (LR;LR;SC
+    // failed here; succeeds on the donor).
+    wire lr_txn_event        = (state == ST_DCS) && !dc_misalign_r
+                             && (u_dc_resp_vld || !dc_touched_array_r);
+    wire lr_exclude_on_store = lr_valid_r && lr_txn_event
+                               && (dc_is_store_r || amo_active);
+    wire lr_exclude_on_load  = lr_valid_r && lr_txn_event
+                               && !dc_is_store_r && !amo_active && !dc_is_lr_r;
 
     //-------------------------------------------------------------------------
     // SECTION STB (LSU note A4) -- 4 entries, one per distinct 8-byte-
@@ -497,6 +517,39 @@ module LSU #(
     //-------------------------------------------------------------------------
     wire any_stb_vld = stb_vld[0] || stb_vld[1] || stb_vld[2] || stb_vld[3];
     wire [1:0] drain_pick = stb_vld[0] ? 2'd0 : stb_vld[1] ? 2'd1 : stb_vld[2] ? 2'd2 : 2'd3;
+    // M3 audit fix -- STB-full admission control. Store/SC/AMO entries are
+    // created at REPLY; if the STB is full and the completion cannot merge,
+    // REPLY would stall waiting for a free slot -- but drains start only
+    // from ST_IDLE, so the FSM would never reach IDLE again: DEADLOCK (a
+    // 5th consecutive distinct-dword store hung the machine; the donor
+    // retries in DCS on stb-full instead, aq_lsu_dc.v:1697-1708 /
+    // aq_lsu_stb.v:538-549).
+    //
+    // Mechanism: `lsu_idu_full` (below) gains a combinational term
+    // `stb_full && ag_needs_slot_c`. It is built ONLY from registers
+    // (ex1_func/data reach this module as plain wires off IDU's EX1 flops;
+    // stb_vld/stb_addr are flops here), so there is no loop through
+    // idu_lsu_ex1_sel even though that sel is gated by lsu_idu_full. When
+    // the term asserts: idu_lsu_ex1_sel drops (ag_valid=0), so issue_real
+    // is 0 and drain_want's !ag_valid term is 1 -- drains get the FSM and
+    // run until a slot frees, at which point the term drops, sel returns,
+    // and the held op issues. The IDU side holds EX1 exactly as it does
+    // for any lsu_idu_full cycle (ctrl_ex1_eu_full keys off ex1_eu_r[LSU]
+    // && lsu_idu_full), and a mid-hold branch cancel is harmless: ex1_eu_r
+    // clears, masking the full at the IDU, and the term dies with stb_full.
+    //
+    // Single-FSM guarantee: between admission and REPLY no other
+    // transaction can CREATE an entry and no drain runs, so the slot/match
+    // observed at admission still holds at REPLY (reply_can_complete
+    // remains as defense-in-depth). ag_needs_slot_c deliberately reads the
+    // ungated EX1 fields: when EX1 holds no LSU op they may be stale, but
+    // then issue_real is 0 anyway (ag_valid=0) and the IDU masks the full.
+    wire stb_full          = !stb_any_free;
+    wire ag_stb_match_c    = stb_m0_ag || stb_m1_ag || stb_m2_ag || stb_m3_ag;
+    wire ag_needs_slot_c   = (ag_is_store || amo_is_amo
+                              || idu_lsu_ex1_func == LSU_FUNC_SC_W
+                              || idu_lsu_ex1_func == LSU_FUNC_SC_D)
+                             && !ag_misalign && !ag_stb_match_c;
     wire drain_want = !ag_valid && any_stb_vld && (state == ST_IDLE);
 
     //-------------------------------------------------------------------------
@@ -688,17 +741,28 @@ module LSU #(
         if (!rst_n) begin
             lr_valid_r <= 1'b0;
             lr_addr_set <= 1'b0;
+            lr_size_r <= 2'b0;
+            dc_is_lr_r <= 1'b0;
         end else begin
-            // Latch the LR address on issue_real (IDLE->DCS transition).
-            // Use ag_addr (virtual address) for LR/SC comparison.
+            // Latch the LR address/size on issue_real (IDLE->DCS transition).
+            // Use ag_addr (virtual address) for LR/SC comparison. A
+            // MISALIGNED LR traps and must install NO reservation (donor
+            // gates lm_set on !expt_ack/!expt_exit, aq_lsu_lm.v:129).
             if (issue_real && (idu_lsu_ex1_func == LSU_FUNC_LR_W
                                || idu_lsu_ex1_func == LSU_FUNC_LR_D)) begin
-                lr_addr_r <= ag_addr[55:0];
-                lr_addr_set <= 1'b1;
+                if (!ag_misalign) begin
+                    lr_addr_r <= ag_addr[55:0];
+                    lr_size_r <= ag_size;
+                    lr_addr_set <= 1'b1;
+                end
+                dc_is_lr_r <= !ag_misalign;
+            end else if (lsu_rtu_ex1_cmplt_dp || issue_real) begin
+                // tag tracks the in-flight transaction (drains never set it)
+                dc_is_lr_r <= 1'b0;
             end
 
             // Fire cmplt_dp for this LR op, set valid
-            if (lsu_rtu_ex1_cmplt_dp && lr_addr_set && !lr_valid_r) begin
+            if (lsu_rtu_ex1_cmplt_dp && lr_addr_set && !lr_valid_r && dc_is_lr_r) begin
                 lr_valid_r <= 1'b1;
             end
 
@@ -712,37 +776,42 @@ module LSU #(
             // (rv64ua-p-lrsc test 6: sc-after-successful-sc AND sc-after-
             // failed-sc must both fail). The exclude terms above already
             // clear it for a HIT SC (load-like access); this term covers a
-            // MISALIGNED or MISSED SC, which never asserts dc_hit_c.
+            // MISALIGNED or MISSED SC.
             if (reply_fire && sc_addr_set) begin
+                lr_valid_r <= 1'b0;
+                lr_addr_set <= 1'b0;
+            end
+
+            // Exception ack/exit kills the reservation (donor aq_lsu_lm.v:135
+            // clears on expt_ack | expt_exit). An exception between LR and SC
+            // -- including interrupts once M6 lands -- must not leave a live
+            // reservation behind.
+            if (rtu_lsu_expt_ack || rtu_lsu_expt_exit) begin
                 lr_valid_r <= 1'b0;
                 lr_addr_set <= 1'b0;
             end
         end
     end
 
-    // Make lr_vld a wire that tracks cmplt_dp for LR operations
-    assign lsu_rtu_lr_vld = lsu_rtu_ex1_cmplt_dp && lr_addr_set;
+    // lr_vld pulses on the completion of an LR (and only an LR: dc_is_lr_r).
+    assign lsu_rtu_lr_vld = lsu_rtu_ex1_cmplt_dp && lr_addr_set && dc_is_lr_r;
 
     //-------------------------------------------------------------------------
     // SECTION AMO (M3 Task 5) -- read-modify-write flow. Detect AMO at
     // issue_real, latch operands; the read phase reuses the load path; at
-    // ST_REPLY compute NEW value and write OLD to the register file, then
-    // create an STB entry holding NEW so it drains to memory.
+    // ST_REPLY write OLD to the register file AND create the STB entry
+    // holding NEW in that SAME cycle (reply_is_amo_commit in the REPLY
+    // section), so the write is visible to fence/STB-empty the moment the
+    // AMO completes. The donor creates the AMO's STB entry at its DC stage
+    // (aq_lsu_stb.v:654); same-cycle creation here gives the same
+    // guarantee, and unlike a deferred next-cycle flag it cannot be dropped
+    // on a busy STB (full-STB backpressure comes from the admission control
+    // at SECTION drain-vs-issue + reply_can_complete).
     //-------------------------------------------------------------------------
-    reg        amo_active;         // AMO in flight (read phase or writeback)
+    reg        amo_active;         // AMO in flight (read phase)
     reg [63:0] amo_src0_r;         // register operand (latched at issue)
     reg [4:0]  amo_op_r;           // AMO funct5 (latched at issue)
     reg        amo_is_dw_r;        // 1=D-width, 0=W-width
-    reg [63:0] amo_old_data;       // OLD value read from memory
-    reg        amo_wb_pending;     // writeback of NEW value pending
-    // Latched address/index/tag for the writeback (dc_* regs may be reused)
-    reg [63:0] amo_addr_r;
-    reg [DCACHE_INDEX_W-1:0] amo_index_r;
-    reg [DCACHE_TAG_WIDTH-1:0] amo_tag_r;
-    reg [2:0]  amo_dw_off_r;
-    reg [2:0]  amo_byte_off_r;    // byte offset within the dword (positioning)
-    reg [WAYS-1:0] amo_way_r;      // cache way the read-phase line lives in
-    reg        amo_line_resident_r; // line is in the array (hit or refilled miss)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -750,15 +819,6 @@ module LSU #(
             amo_src0_r   <= 64'd0;
             amo_op_r     <= 5'd0;
             amo_is_dw_r  <= 1'b0;
-            amo_old_data <= 64'd0;
-            amo_wb_pending <= 1'b0;
-            amo_addr_r   <= 64'd0;
-            amo_index_r  <= {DCACHE_INDEX_W{1'b0}};
-            amo_tag_r    <= {DCACHE_TAG_WIDTH{1'b0}};
-            amo_dw_off_r <= 3'd0;
-            amo_byte_off_r <= 3'd0;
-            amo_way_r    <= {WAYS{1'b0}};
-            amo_line_resident_r <= 1'b0;
         end else begin
             // Latch AMO operands at issue_real
             if (issue_real && amo_is_amo) begin
@@ -767,45 +827,28 @@ module LSU #(
                 amo_op_r    <= amo_op;
                 amo_is_dw_r <= amo_dw;
             end
-            // Capture OLD value + address info when read completes (ST_REPLY)
+            // Clear at the AMO's OWN REPLY -- INCLUDING a misaligned AMO:
+            // the trap must not leave amo_active asserted. A stuck flag
+            // made the NEXT completing LSU op be mistaken for the AMO read
+            // completion: its writeback was corrupted (W-width sign-extend
+            // mux path) and a bogus ALU store was issued to its address.
             if (amo_active && (state == ST_REPLY) && reply_can_complete
-                && !dc_is_drain_r && !dc_misalign_r) begin
-                // W-width AMOs return the OLD value sign-extended per the
-                // RISC-V A spec (da_final arrives zero-extended because the
-                // AMO func leaves the sign bit clear); D-width returns as-is.
-                amo_old_data <= amo_is_dw_r ? da_final
-                                            : {{32{da_final[31]}}, da_final[31:0]};
-                amo_addr_r   <= dc_addr_r;
-                amo_index_r  <= dc_index_r;
-                amo_tag_r    <= dc_tag_r;
-                amo_dw_off_r <= dc_dw_off_r;
-                amo_byte_off_r <= dc_byte_off_r;
-                amo_way_r    <= final_way;
-                // The read phase is a load: a cacheable load either hits (line
-                // resident) or misses-and-refills (line NOW resident). So for a
-                // cacheable AMO the line is in the array and the writeback must
-                // update it there (not bypass to AXI leaving a stale line).
-                amo_line_resident_r <= dc_ca_r;
-                amo_wb_pending <= 1'b1;
+                && !dc_is_drain_r)
                 amo_active <= 1'b0;
-            end
-            // Clear writeback pending once the STB entry is created (the
-            // STB-create logic in the main FSM always block reads
-            // amo_wb_pending this same cycle; both non-blocking updates
-            // land at end of timestep, so the STB sees wb_pending=1).
-            if (amo_wb_pending && (state == ST_IDLE)) begin
-                amo_wb_pending <= 1'b0;
-            end
         end
     end
 
-    // Compute NEW value from OLD + register operand.
-    // Donor operand mapping (aq_lsu_amo_alu.v): src0_data = da_amo_alu_src0
-    // (the MEMORY/OLD value), src1_data = stb_amo_alu_src1 (the REGISTER/rs1
-    // value). AMOSWAP returns src1 (rs1); AMOADD returns src0+src1 (OLD+rs1).
-    wire [63:0] amo_new_data = amo_alu_compute(amo_old_data, amo_src0_r, amo_op_r, amo_is_dw_r);
+    // NEW value, computed combinationally at REPLY from the live read data
+    // (da_final) and the latched register operand. Donor operand mapping
+    // (aq_lsu_amo_alu.v:128-129): src0 = memory/OLD, src1 = register/rs1.
+    // W-width OLD is sign-extended first (A spec: W AMOs return OLD sign-
+    // extended; the ALU's min/max compares also key off bit 31 for W).
+    wire [63:0] amo_old_c = amo_is_dw_r ? da_final
+                                        : {{32{da_final[31]}}, da_final[31:0]};
+    wire [63:0] amo_new_c = amo_alu_compute(amo_old_c, amo_src0_r, amo_op_r, amo_is_dw_r);
 
-    assign lsu_idu_full = (state != ST_IDLE) || clean_active;
+    assign lsu_idu_full = (state != ST_IDLE) || clean_active
+                          || (stb_full && ag_needs_slot_c);
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
     // flight. state==ST_IDLE implies no AG-issued op is in flight
     // (issue_real leaves IDLE the cycle it fires) and no drain/miss/
@@ -1346,10 +1389,19 @@ module LSU #(
     wire reply_is_completing_sc = (state == ST_REPLY) && !dc_is_drain_r
                                   && sc_addr_set && sc_match_r && !dc_misalign_r;
     wire reply_sc_needs_new_slot = reply_is_completing_sc && !stb_match_here;
+    // M3 audit: same backpressure for the AMO writeback (now also created
+    // at REPLY, see reply_is_amo_commit below). With the STB-full admission
+    // control at SECTION drain-vs-issue a slot-needing op is held in EX1
+    // until a slot (or merge target) exists, so these REPLY holds are
+    // defense-in-depth -- but they keep the guarantee local.
+    wire reply_is_completing_amo = (state == ST_REPLY) && !dc_is_drain_r
+                                   && amo_active && !dc_misalign_r;
+    wire reply_amo_needs_new_slot = reply_is_completing_amo && !stb_match_here;
     // A genuinely full STB (no match, no free slot) stalls the completing
-    // store/SC in REPLY until a drain frees a slot -- contract 4's DEPTH=4
-    // backpressure, not a cancellation.
-    wire reply_can_complete = !((reply_store_needs_new_slot || reply_sc_needs_new_slot) && !stb_any_free);
+    // store/SC/AMO in REPLY until a drain frees a slot -- contract 4's
+    // DEPTH=4 backpressure, not a cancellation.
+    wire reply_can_complete = !((reply_store_needs_new_slot || reply_sc_needs_new_slot
+                                 || reply_amo_needs_new_slot) && !stb_any_free);
 
     wire [WAYS-1:0] final_way = dc_hit_r ? dc_hit_way_r : victim_way_r;
 
@@ -1373,6 +1425,21 @@ module LSU #(
     // reply_fire carries reply_can_complete, so a full STB holds the SC
     // here (no entry is created until a drain frees a slot).
     wire reply_is_sc_commit = reply_fire && sc_addr_set && sc_match_r && !dc_misalign_r;
+    // M3 audit: the AMO writeback commits at REPLY too (previously a
+    // deferred next-cycle flag, which a full STB silently dropped).
+    wire reply_is_amo_commit = reply_fire && amo_active && !dc_misalign_r;
+    // Commit payload mux (store / SC use the positioned store-data path;
+    // the AMO brings its computed NEW value, positioned here -- the AMO ALU
+    // works in the extracted value domain, the STB holds positioned data):
+    wire [63:0] commit_data = reply_is_amo_commit
+                              ? (amo_new_c << ({61'b0, dc_byte_off_r} * 8))
+                              : dc_store_data_r;
+    wire [7:0]  commit_mask = reply_is_amo_commit
+                              ? (amo_is_dw_r ? 8'hFF : (8'h0F << dc_byte_off_r))
+                              : dc_byte_mask_r;
+    wire [2:0]  commit_size = reply_is_amo_commit
+                              ? (amo_is_dw_r ? 3'd3 : 3'd2)
+                              : {1'b0, dc_size_r};
     // M3: SC detection -- latch the reservation match at ST_DCS entry
     // (dc_addr_r stable). A successful SC commits its store via the STB
     // (REPLY section below); rd gets 0=committed / 1=failed.
@@ -1387,7 +1454,10 @@ module LSU #(
     // latch samples that same cycle (sc_addr_set itself is an NBA, so it
     // is still 0 during the first DCS cycle). The DC-stage forward below
     // needs the result THIS cycle, one cycle before sc_match_r exists.
-    wire sc_match_c    = lr_valid_r && (dc_addr_r == lr_addr_r);
+    // Donor aq_lsu_lm.v:159-161 matches on address AND access size
+    // (lm_size == lm_req_size), so a LR.W;SC.D to one address fails.
+    wire sc_match_c    = lr_valid_r && (dc_addr_r == lr_addr_r)
+                         && (dc_size_r == lr_size_r);
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -1427,66 +1497,50 @@ module LSU #(
             if ((state == ST_REPLY) && dc_is_drain_r && (!frz_is_direct_r || miss_done_latched))
                 stb_vld[dc_drain_idx_r] <= 1'b0;
             // store completion: merge into an existing entry, or allocate.
-            // M3: a successful SC (reply_is_sc_commit) commits here too --
-            // it is load-like on the pipe, so without this term the SC's
-            // store data would never reach memory (rv64ua-p-lrsc test 5).
-            if ((reply_is_store && !reply_is_misalign) || reply_is_sc_commit) begin
+            // M3: a successful SC (reply_is_sc_commit) and an AMO
+            // (reply_is_amo_commit) commit here too -- both are load-like
+            // on the pipe, so without these terms their store data would
+            // never reach memory (rv64ua-p-lrsc test 5). Commit payload is
+            // muxed per op (commit_data/commit_mask/commit_size above).
+            //
+            // MERGE is required for all three (not just stores): the STB's
+            // invariant is at-most-one-entry-per-doubleword. M3 audit: an
+            // allocate-only AMO create broke it -- an older pending store
+            // for the same dword at a higher index then drained AFTER the
+            // AMO entry (drain_pick is lowest-first) and overwrote the AMO
+            // result; while two entries shared the dword, the DA forward
+            // also merged only the lowest-index entry's mask (stale reads).
+            if ((reply_is_store && !reply_is_misalign) || reply_is_sc_commit
+                || reply_is_amo_commit) begin
                 if (stb_match_here) begin
-                    stb_data[stb_match_idx]     <= (expand_byte_mask(dc_byte_mask_r) & dc_store_data_r)
-                                                  | (~expand_byte_mask(dc_byte_mask_r) & stb_data[stb_match_idx]);
-                    stb_byte_vld[stb_match_idx] <= stb_byte_vld[stb_match_idx] | dc_byte_mask_r;
+                    stb_data[stb_match_idx]     <= (expand_byte_mask(commit_mask) & commit_data)
+                                                  | (~expand_byte_mask(commit_mask) & stb_data[stb_match_idx]);
+                    stb_byte_vld[stb_match_idx] <= stb_byte_vld[stb_match_idx] | commit_mask;
                     stb_way[stb_match_idx]      <= final_way;
-                    stb_was_hit[stb_match_idx]  <= reply_is_sc_commit ? dc_ca_r : store_line_resident;
+                    // SC/AMO are load-like: a cacheable SC/AMO miss REFILLS
+                    // (line resident afterwards, in victim_way_r), unlike a
+                    // wa=0 store-miss which bypasses. dc_ca_r covers
+                    // hit+refill exactly.
+                    stb_was_hit[stb_match_idx]  <= (reply_is_sc_commit || reply_is_amo_commit)
+                                                   ? dc_ca_r : store_line_resident;
                     // Merged entries keep the larger of the two store sizes
                     // (single-store entries -- the common case -- keep their
                     // exact size). A merged drain is an edge case; the data
                     // was already written by each store's own direct write.
-                    stb_size[stb_match_idx]     <= (stb_size[stb_match_idx] > {1'b0, dc_size_r}) ? stb_size[stb_match_idx] : {1'b0, dc_size_r};
+                    stb_size[stb_match_idx]     <= (stb_size[stb_match_idx] > commit_size) ? stb_size[stb_match_idx] : commit_size;
                 end else if (stb_any_free) begin
                     stb_vld[stb_free_idx]      <= 1'b1;
                     stb_addr[stb_free_idx]      <= dc_addr_r;
                     stb_index[stb_free_idx]     <= dc_index_r;
                     stb_tag[stb_free_idx]       <= dc_tag_r;
                     stb_dw_off[stb_free_idx]    <= dc_dw_off_r;
-                    stb_data[stb_free_idx]      <= dc_store_data_r & expand_byte_mask(dc_byte_mask_r);
-                    stb_byte_vld[stb_free_idx]  <= dc_byte_mask_r;
+                    stb_data[stb_free_idx]      <= commit_data & expand_byte_mask(commit_mask);
+                    stb_byte_vld[stb_free_idx]  <= commit_mask;
                     stb_way[stb_free_idx]       <= final_way;
-                    // SC is load-like: a cacheable SC-miss REFILLS (the line
-                    // is resident afterwards, in victim_way_r), unlike a wa=0
-                    // store-miss which bypasses. dc_ca_r covers hit+refill
-                    // exactly (same reasoning as amo_line_resident_r above).
-                    stb_was_hit[stb_free_idx]   <= reply_is_sc_commit ? dc_ca_r : store_line_resident;
-                    stb_size[stb_free_idx]      <= {1'b0, dc_size_r};
+                    stb_was_hit[stb_free_idx]   <= (reply_is_sc_commit || reply_is_amo_commit)
+                                                   ? dc_ca_r : store_line_resident;
+                    stb_size[stb_free_idx]      <= commit_size;
                 end
-            end
-            // M3 Task 5: AMO writeback -- after the read phase captured the
-            // OLD value (amo_old_data, latched this same cycle via the AMO
-            // always block above), create an STB entry holding the computed
-            // NEW value so the existing drain path writes it. For a cacheable
-            // AMO the read-phase line is resident (hit or refilled miss), so
-            // was_hit=1 and the drain updates that cache way (keeping the
-            // array coherent); for uncached it bypasses to AXI.
-            // This fires the cycle AFTER the read completes (amo_wb_pending
-            // is a registered flag set at ST_REPLY). Uses latched amo_* regs
-            // since dc_* regs may be reused.
-            if (amo_wb_pending && stb_any_free) begin
-                stb_vld[stb_free_idx]      <= 1'b1;
-                stb_addr[stb_free_idx]      <= amo_addr_r;
-                stb_index[stb_free_idx]     <= amo_index_r;
-                stb_tag[stb_free_idx]       <= amo_tag_r;
-                stb_dw_off[stb_free_idx]    <= amo_dw_off_r;
-                // amo_new_data is in the VALUE domain (the AMO ALU works on
-                // the rotated/extracted read value); the STB holds POSITIONED
-                // data exactly like an ordinary store (ag_store_data_positioned),
-                // and the byte mask is positioned too. A W-AMO at byte_off!=0
-                // (rv64ua-p-lrsc's barrier amoadd.w x0,... lives at offset 4
-                // of its dword) must land its lanes there, not in [31:0] --
-                // unpositioned, the drain wrote zeros into the correct lanes.
-                stb_data[stb_free_idx]      <= amo_new_data << ({61'b0, amo_byte_off_r} * 8);
-                stb_byte_vld[stb_free_idx]  <= (amo_is_dw_r) ? 8'hFF : (8'h0F << amo_byte_off_r);
-                stb_way[stb_free_idx]       <= amo_way_r;
-                stb_was_hit[stb_free_idx]   <= amo_line_resident_r;
-                stb_size[stb_free_idx]      <= amo_is_dw_r ? 3'd3 : 3'd2;
             end
         end
     end
@@ -1575,10 +1629,11 @@ module LSU #(
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
     assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
-    // Misaligned SC takes the STORE-misalign vector: SC is a store per the
-    // A spec even though it rides the load-like path in this LSU
-    // (sc_addr_set is latched at ST_DCS, still set at the SC's REPLY).
-    assign lsu_rtu_expt_vec = (dc_is_store_r || sc_addr_set) ? 5'd6 : 5'd4;
+    // Misaligned SC/AMO take the STORE-misalign vector (cause 6 is
+    // "Store/AMO address misaligned"): both are stores per the A spec even
+    // though they ride the load-like path in this LSU (sc_addr_set is
+    // latched at ST_DCS, amo_active spans the AMO's REPLY).
+    assign lsu_rtu_expt_vec = (dc_is_store_r || sc_addr_set || amo_active) ? 5'd6 : 5'd4;
     assign lsu_rtu_tval     = dc_addr_r;
 
     // No async bus-error path is modeled for M2 (the behavioral AXI slave
@@ -1588,8 +1643,7 @@ module LSU #(
     assign lsu_rtu_async_expt_vld = 1'b0;
     assign lsu_rtu_async_ld_inst  = 1'b0;
 
-    // rtu_lsu_expt_ack/_expt_exit: received, no live consumer -- see header.
-    wire _rtu_ack_unused  = rtu_lsu_expt_ack;
-    wire _rtu_exit_unused = rtu_lsu_expt_exit;
+    // rtu_lsu_expt_ack/_expt_exit are consumed by the LR/SC reservation
+    // clear (SECTION LR buffer, donor aq_lsu_lm.v:135).
 
 endmodule

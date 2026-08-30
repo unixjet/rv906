@@ -589,11 +589,13 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_LWU = 20'h00308;  // cfig.h:509
 // M3: LR/SC opcodes. All four keep func[0]=0 (load-like) so the read phase
 // rides the load path; the field layout follows the regular-load convention
 // (func[1]=sign-extend, func[3:2]=size), so LR.W sign-extends exactly like
-// LW. Donor cross-ref (aq_idu_cfig.h:520-523): FUNC_LR_W=12'b..0010_1010 and
-// FUNC_LR_D=12'b..0010_1100 -- identical low-12 patterns; the donor's SC_W/D
-// (...1001 / ...1101) are store-like (func[0]=1), a documented deviation:
-// in this clone SC commits its store via an explicit STB-create at reply
-// (gated on the reservation match) instead of through the store pipeline.
+// LW. Donor cross-ref (aq_idu_cfig.h:520-523): FUNC_LR_W=12'b..0010_1010,
+// FUNC_LR_D=12'b..0010_1100 -- the functionally-active low-4 bits (load/
+// sign/size) match bit-for-bit; the prefix bits differ (donor 0x02x class
+// tag vs this clone's 0xB0x). The donor's SC_W/D (...1001 / ...1101) are
+// store-like (func[0]=1), a documented deviation: in this clone SC commits
+// its store via an explicit STB-create at reply (gated on the reservation
+// match) instead of through the store pipeline.
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LR_W = 20'h00b0a;  // load-like, sign-ext, W
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_LR_D = 20'h00b0c;  // load-like, D
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SC_W = 20'h00b08;  // load-like, W (read value discarded)
