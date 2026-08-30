@@ -568,3 +568,67 @@ fetch-path discrepancy (§8.7.1, follow-up). MMU translation is an
 identity-map stub (M4). Atomics (LR/SC/AMO) are M3. Those arrive with their
 milestones; the M2 harness's self-checking suites are written so each of them
 fails loudly rather than silently passes once its feature lands.
+
+## 8.13 M3 acceptance: atomics (rv64ua)
+
+M3 adds the A extension (LR/SC + AMO, W and D widths) on top of the M2
+integer machine. The oracle layers are the M2 ones, extended:
+
+1. **riscv-tests `rv64ua-p-*`** (19 ELFs: 18 AMO + `lrsc`), built
+   `-march=rv64ima_zicsr_zifencei` and appended to the same caches-on sweep
+   (`test/m2/Makefile`'s `RV64UA_TESTS`).
+2. **`lr_sc_tb`** in `test/m2/unit/` (14 tests): LR/SC basic paths, all
+   W/D AMO ops, store→AMO tight-forward timing, and the M3 stress set —
+   warm-cache LR/SC retry loop, intervening-store reservation loss,
+   reservation-consumption semantics (SC after successful AND after failed
+   SC), byte_off=4 positioned AMO/SC writeback, and LR.D/SC.D.
+
+**Result, current tree:** all 19 `rv64ua-p-*` PASS, including `lrsc`
+(the 1024-iteration LR/SC accumulation loop, the barrier AMO, and the
+sc-after-sc cases). Full caches-on sweep is 86/87 — the one failure remains
+the documented `rv64ui-p-ma_data` carve-out (§8.7.1); misaligned AMO/LR/SC
+trap under the same contract-3 rule (a misaligned SC reports the
+store-misalign vector, since SC is a store per the A spec). Unit suite
+`UNIT-SUITE-PASS`.
+
+**What lrsc exposed (four bugs, all fixed in M3 close-out):**
+
+- *Stale reservation exclusion.* The LR-buffer exclusion sampled `dc_hit_c`
+  / `dc_is_store_r` unqualified, but in `ST_IDLE` the DCache response bus
+  holds the previous transaction's hit-way — any idle cycle after a hit
+  cleared a fresh reservation, so the loop's SC always failed and the test
+  hung in its retry loop. Exclusion is now qualified to a real in-DCS
+  response.
+- *Successful SC never committed.* SC rides the load-like path
+  (`func[0]=0`), so no STB entry was ever created for it; the accumulation
+  loop spun on memory that never changed. A successful SC now commits
+  through the ordinary STB create-or-merge path (with full-STB
+  backpressure), `was_hit=dc_ca_r` since a cacheable SC-miss refills.
+- *Stale SC forward at ST_DCS.* On the SC's first DCS cycle the ex2 forward
+  carried `da_final` (memory) instead of the SC result, and the RAW-exempt
+  forward let the consumer branch dispatch with the stale value (test 2).
+  The SC result is now resolved combinationally at ST_DCS and forwarded.
+- *Unpositioned AMO writeback.* The AMO STB entry stored its computed value
+  in the extracted (value) domain with a dw_off-based mask; the STB holds
+  positioned data. A W-AMO at byte_off≠0 (lrsc's barrier `amoadd.w` lives at
+  offset 4 of its dword) drained zeros into the correct lanes. AMO data and
+  byte mask are now positioned by the latched byte offset.
+
+**Documented deviations / model limits (M3):**
+
+- **SC is load-like in this clone** (`LSU_FUNC_SC_W/D` keep `func[0]=0`);
+  the donor's `FUNC_SC_W/D` are store-like (`aq_idu_cfig.h:520-523`; the
+  donor LR encodings' low-12 patterns match this clone's exactly). The
+  deviation is contained: SC commits via an explicit STB-create at reply
+  gated on the reservation match, and takes the store-misalign vector.
+- **Reservation model:** one entry, exact-address match on PA[55:0], with
+  conservative exclusion (any store, or any hit load, while a reservation is
+  held clears it; every completed SC consumes it, success or failure). The
+  spec permits spurious SC failure, and single-issue in-order execution with
+  no other-hart traffic makes forward progress structural (no timeout
+  counter needed).
+- **LR.W sign-extends** exactly like LW (`func[1]=1`, matching the donor's
+  `FUNC_LR_W` pattern).
+- The M2 STB residual risk (a later miss's victim-pick overwriting an
+  undrained entry's way, documented in `LSU.v` §STB) applies equally to
+  AMO/SC STB entries.
