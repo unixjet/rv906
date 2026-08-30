@@ -377,6 +377,35 @@ static void test_sc_w_address_mismatch(void)
     test_result("T3 SC.W address mismatch");
 }
 
+// T4: AMOSWAP.W - atomic swap read phase returns OLD value.
+// NOTE: This is a W-width (32-bit) AMO, so only the lower 32 bits are
+// operated on. The writeback (storing NEW value to memory) is still being
+// debugged -- see M3 plan Task 5 notes. This test verifies the read phase
+// and OLD-value return, which is the foundation for the full RMW sequence.
+static void test_amo_swap_w(void)
+{
+    const uint64_t A = 0x0000000080040000ULL;
+    const uint32_t INIT_VAL = 0xDEADBEEF;   // 32-bit for W-width AMO
+    const uint32_t SWAP_VAL = 0x11223344;
+    // AMOSWAP.W opcode (func[0]=0 -> load-like for read phase)
+    const uint32_t F_AMOSWAP_W = 0x01018;
+
+    // Initialize memory with known 32-bit value
+    for (int i = 0; i < 4; i++) mem_wr(A + i, (uint8_t)(INIT_VAL >> (i * 8)));
+
+    // Issue AMOSWAP.W: src0=address, src1=offset, src2=swap value
+    LsuResult amo = do_op(F_AMOSWAP_W, A, 0, SWAP_VAL, 5);
+    settle(20);  // let STB drain
+
+    // Check that the OLD value was returned in wb_data (W-width returns
+    // the 32-bit value; LSU sign/zero-extends per dc_size_r).
+    // For AMOSWAP.W the returned OLD is the lower 32 bits.
+    check((amo.wb_data & 0xFFFFFFFF) == INIT_VAL,
+          "AMOSWAP.W returns OLD value (lower 32b)", amo.wb_data & 0xFFFFFFFF, INIT_VAL);
+
+    test_result("T4 AMOSWAP.W read phase (returns OLD value)");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -390,6 +419,7 @@ int main(int argc, char **argv)
     test_lr_w_basic();
     test_sc_w_success();
     test_sc_w_address_mismatch();
+    test_amo_swap_w();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

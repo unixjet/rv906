@@ -737,6 +737,11 @@ module LSU #(
     reg        amo_is_dw_r;        // 1=D-width, 0=W-width
     reg [63:0] amo_old_data;       // OLD value read from memory
     reg        amo_wb_pending;     // writeback of NEW value pending
+    // Latched address/index/tag for the writeback (dc_* regs may be reused)
+    reg [63:0] amo_addr_r;
+    reg [DCACHE_INDEX_W-1:0] amo_index_r;
+    reg [DCACHE_TAG_WIDTH-1:0] amo_tag_r;
+    reg [2:0]  amo_dw_off_r;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -746,6 +751,10 @@ module LSU #(
             amo_is_dw_r  <= 1'b0;
             amo_old_data <= 64'd0;
             amo_wb_pending <= 1'b0;
+            amo_addr_r   <= 64'd0;
+            amo_index_r  <= {DCACHE_INDEX_W{1'b0}};
+            amo_tag_r    <= {DCACHE_TAG_WIDTH{1'b0}};
+            amo_dw_off_r <= 3'd0;
         end else begin
             // Latch AMO operands at issue_real
             if (issue_real && amo_is_amo) begin
@@ -754,15 +763,22 @@ module LSU #(
                 amo_op_r    <= amo_op;
                 amo_is_dw_r <= amo_dw;
             end
-            // Capture OLD value when read completes (ST_REPLY for a load)
+            // Capture OLD value + address info when read completes (ST_REPLY)
             if (amo_active && (state == ST_REPLY) && reply_can_complete
                 && !dc_is_drain_r && !dc_misalign_r) begin
                 amo_old_data <= da_final;
+                amo_addr_r   <= dc_addr_r;
+                amo_index_r  <= dc_index_r;
+                amo_tag_r    <= dc_tag_r;
+                amo_dw_off_r <= dc_dw_off_r;
                 amo_wb_pending <= 1'b1;
                 amo_active <= 1'b0;
             end
-            // Clear writeback pending once STB entry is created (handled below)
-            if (amo_wb_pending && reply_fire) begin
+            // Clear writeback pending once the STB entry is created (the
+            // STB-create logic in the main FSM always block reads
+            // amo_wb_pending this same cycle; both non-blocking updates
+            // land at end of timestep, so the STB sees wb_pending=1).
+            if (amo_wb_pending && (state == ST_IDLE)) begin
                 amo_wb_pending <= 1'b0;
             end
         end
@@ -1383,6 +1399,25 @@ module LSU #(
                     stb_was_hit[stb_free_idx]   <= store_line_resident;
                     stb_size[stb_free_idx]      <= {1'b0, dc_size_r};
                 end
+            end
+            // M3 Task 5: AMO writeback -- after the read phase captured the
+            // OLD value (amo_old_data, latched this same cycle via the AMO
+            // always block above), create an STB entry holding the computed
+            // NEW value so the existing drain path writes it to memory.
+            // This fires the cycle AFTER the read completes (amo_wb_pending
+            // is a registered flag set at ST_REPLY). Uses latched amo_addr_r/
+            // amo_index_r/amo_tag_r since dc_* regs may be reused.
+            if (amo_wb_pending && stb_any_free) begin
+                stb_vld[stb_free_idx]      <= 1'b1;
+                stb_addr[stb_free_idx]      <= amo_addr_r;
+                stb_index[stb_free_idx]     <= amo_index_r;
+                stb_tag[stb_free_idx]       <= amo_tag_r;
+                stb_dw_off[stb_free_idx]    <= amo_dw_off_r;
+                stb_data[stb_free_idx]      <= amo_new_data;
+                stb_byte_vld[stb_free_idx]  <= (amo_is_dw_r) ? 8'hFF : (8'h0F << amo_dw_off_r);
+                stb_way[stb_free_idx]       <= final_way;
+                stb_was_hit[stb_free_idx]   <= store_line_resident;
+                stb_size[stb_free_idx]      <= amo_is_dw_r ? 3'd3 : 3'd2;
             end
         end
     end
