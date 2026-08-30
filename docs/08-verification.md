@@ -577,11 +577,14 @@ integer machine. The oracle layers are the M2 ones, extended:
 1. **riscv-tests `rv64ua-p-*`** (19 ELFs: 18 AMO + `lrsc`), built
    `-march=rv64ima_zicsr_zifencei` and appended to the same caches-on sweep
    (`test/m2/Makefile`'s `RV64UA_TESTS`).
-2. **`lr_sc_tb`** in `test/m2/unit/` (14 tests): LR/SC basic paths, all
-   W/D AMO ops, store→AMO tight-forward timing, and the M3 stress set —
+2. **`lr_sc_tb`** in `test/m2/unit/` (18 tests): LR/SC basic paths, all
+   W/D AMO ops, store→AMO tight-forward timing, the M3 stress set —
    warm-cache LR/SC retry loop, intervening-store reservation loss,
    reservation-consumption semantics (SC after successful AND after failed
-   SC), byte_off=4 positioned AMO/SC writeback, and LR.D/SC.D.
+   SC), byte_off=4 positioned AMO/SC writeback, LR.D/SC.D — plus the four
+   audit regressions (T15-T18): STB-full store admission, STB-full AMO
+   commit, misaligned-AMO recovery, and LR;LR;SC re-key. `idu_tb` T10 also
+   checks that a reserved AMO funct5 decodes illegal.
 
 **Result, current tree:** all 19 `rv64ua-p-*` PASS, including `lrsc`
 (the 1024-iteration LR/SC accumulation loop, the barrier AMO, and the
@@ -614,21 +617,79 @@ store-misalign vector, since SC is a store per the A spec). Unit suite
   offset 4 of its dword) drained zeros into the correct lanes. AMO data and
   byte mask are now positioned by the latched byte offset.
 
+**What the post-close-out audit exposed (all confirmed, all fixed; each has a
+regression test):**
+
+- *Full-STB REPLY deadlock (HIGH; the store form predates M3, SC inherited
+  it).* A completing store/SC/AMO whose completion needs a NEW STB slot
+  stalled in `ST_REPLY` when all 4 slots were occupied — but drains start
+  only from `ST_IDLE`, which the FSM never reaches while held: deadlock (a
+  5th consecutive distinct-dword store hung the machine). Fix: STB-full
+  *admission control* — `lsu_idu_full` now includes `stb_full &&
+  ag_needs_slot_c`, holding a slot-needing op in EX1 (the IDU keeps it the
+  same way it honors any `lsu_idu_full`) while drains free a slot; the
+  REPLY-hold remains as defense-in-depth (T15).
+- *AMO writeback dropped on a full STB (HIGH).* The AMO's STB entry was
+  created the cycle AFTER read completion via a pending flag that was
+  cleared regardless of whether a slot existed — a saturated STB silently
+  lost the write. Fix: the AMO entry is created in the REPLY cycle itself
+  (same create-or-merge path as store/SC, with the same backpressure and
+  `was_hit=dc_ca_r`), so it can neither be dropped nor miss the fence/
+  STB-empty quiescence window (T16). The donor creates its AMO entry at DC
+  (`aq_lsu_stb.v:654`); same-cycle creation here provides the same
+  guarantee.
+- *Stuck `amo_active` after a trapped AMO (HIGH).* A misaligned AMO traps,
+  but `amo_active` was only cleared inside the read-completion capture
+  (which the trap skips) — every later completing LSU op was then mistaken
+  for the AMO's read completion: its writeback ran through the W-width AMO
+  sign-extend mux and a bogus ALU store was issued to its address. Fix:
+  `amo_active` clears at the AMO's own REPLY, trap or not (T17).
+- *AMO STB-create never merged (HIGH).* The AMO create only allocated,
+  breaking the at-most-one-entry-per-dword invariant: an older same-dword
+  store at a higher index drained after the AMO entry (drain is
+  lowest-index-first) and overwrote the AMO result; the DA forward also
+  merged only the lowest entry's mask while two entries shared a dword.
+  Fix: the AMO create shares the store/SC merge branch.
+- *Reservation gaps (MEDIUM, donor cross-check).* Exclusion now also fires
+  for an AMO (the donor's lock monitor clears on SC *and AMO*,
+  `aq_lsu_dc.v:1620`) including a missed or uncached one, and for any
+  completing load (its refill may evict the reserved line — conservative,
+  spec-legal). SC match now also requires the donor's size match
+  (`lm_size == lm_req_size`, `aq_lsu_lm.v:159-161`). A trapped (misaligned)
+  LR installs no reservation, and `rtu_lsu_expt_ack/exit` kill the
+  reservation (donor `aq_lsu_lm.v:129,135` — matters once M6 interrupts
+  land). LR-over-LR re-keys instead of destroying the reservation (donor
+  `lm_set` overwrites in EXCL state) — previously LR#2's own DCS exclusion
+  cleared `lr_addr_set` before the set-term fired (T18).
+- *Reserved AMO funct5 executed as "store zero" (MEDIUM).* The IDU AMO
+  catch-all accepted all funct5s and `amo_alu_compute` defaulted to 0. The
+  donor's decode lists exactly the nine defined funct5s
+  (`aq_idu_id_decd.v:2028-2052`); reserved values now decode illegal
+  (`idu_tb` T10). Misaligned AMOs also report vector 6 (store/AMO address
+  misaligned), same as SC.
+
 **Documented deviations / model limits (M3):**
 
 - **SC is load-like in this clone** (`LSU_FUNC_SC_W/D` keep `func[0]=0`);
   the donor's `FUNC_SC_W/D` are store-like (`aq_idu_cfig.h:520-523`; the
-  donor LR encodings' low-12 patterns match this clone's exactly). The
-  deviation is contained: SC commits via an explicit STB-create at reply
-  gated on the reservation match, and takes the store-misalign vector.
-- **Reservation model:** one entry, exact-address match on PA[55:0], with
-  conservative exclusion (any store, or any hit load, while a reservation is
-  held clears it; every completed SC consumes it, success or failure). The
-  spec permits spurious SC failure, and single-issue in-order execution with
-  no other-hart traffic makes forward progress structural (no timeout
-  counter needed).
+  donor LR encodings match this clone's in the functionally-active low-4
+  func bits — load/sign/size — while the prefix bits differ). The deviation
+  is contained: SC commits via an explicit STB-create at reply gated on the
+  reservation match, and takes the store-misalign vector.
+- **Reservation model:** one entry, exact-address match on PA[55:0] plus
+  access-size match (donor-faithful), with conservative exclusion (any
+  store, AMO, or completing load while a reservation is held clears it;
+  every completed SC consumes it, success or failure; exception ack/exit
+  clears it). The spec permits spurious SC failure, and single-issue
+  in-order execution with no other-hart traffic makes forward progress
+  structural (no timeout counter needed).
+- **aq/rl bits are ignored.** Decode treats `inst[26:25]` as don't-care;
+  the donor's split unit inserts `fence iorw,iorw` before `.rl` and after
+  `.aq` atomics (`aq_idu_id_split.v:367-428`). Benign for a single-hart
+  in-order core (and rv64ua uses plain atomics), but unbuilt and flagged
+  here for any future SMP work.
 - **LR.W sign-extends** exactly like LW (`func[1]=1`, matching the donor's
-  `FUNC_LR_W` pattern).
+  `FUNC_LR_W` low-4 pattern).
 - The M2 STB residual risk (a later miss's victim-pick overwriting an
   undrained entry's way, documented in `LSU.v` §STB) applies equally to
   AMO/SC STB entries.
