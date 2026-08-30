@@ -430,22 +430,20 @@ module LSU #(
     // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
     //-------------------------------------------------------------------------
     reg [55:0] lr_addr_r;         // last LR physical address (PA[55:0])
-    reg [31:0] lr_data_r;         // latched loaded data from LR.W
     reg        lr_valid_r;        // set when LR completes, cleared by SC or intervening access
-    wire [31:0] lr_data_out      = lr_valid_r ? lr_data_r : 32'd0;
 
-    // Exclusion detection on any store/load while lr_valid_r is held
-    wire lr_exclude_on_store = lr_valid_r && dc_is_store_r && !dc_misalign_r;
-    wire lr_exclude_on_load  = lr_valid_r && !dc_is_store_r && dc_hit_c && !dc_misalign_r;
-
-    // SC.W address match check against last LR address
-    wire sc_addr_match = lr_valid_r && (dc_addr_r == lr_addr_r);
-
-    // Update LR buffer state: clear on exclusion or SC success
-    always @(posedge clk) begin
-        if (lr_exclude_on_store || lr_exclude_on_load)
-            lr_valid_r <= 1'b0;
-    end
+    // Exclusion detection on any store/load while lr_valid_r is held.
+    // (lr_valid_r itself has exactly ONE writer: the LR-buffer always block
+    // below -- a second clear-only block here raced it and was removed.)
+    // MUST be qualified to a real in-DCS response: in ST_IDLE the DCache
+    // response bus HOLDS the previous transaction's hit-way, so an
+    // unqualified dc_hit_c/dc_is_store_r reads stale and would clear a
+    // fresh reservation on any idle cycle (rv64ua-p-lrsc: the loop's SC
+    // then always failed, spinning the retry loop forever).
+    wire lr_exclude_on_store = lr_valid_r && (state == ST_DCS) && u_dc_resp_vld
+                               && dc_is_store_r && !dc_misalign_r;
+    wire lr_exclude_on_load  = lr_valid_r && (state == ST_DCS) && u_dc_resp_vld
+                               && !dc_is_store_r && dc_hit_c && !dc_misalign_r;
 
     //-------------------------------------------------------------------------
     // SECTION STB (LSU note A4) -- 4 entries, one per distinct 8-byte-
@@ -683,32 +681,23 @@ module LSU #(
         end
     end
     // M3 Task 1: LR.W / SC.W foundation
-    // M3 Task 1: LR.W / SC.W foundation
-    // Latch opcode at issue time since idu_lsu_ex1_func gets cleared after
+    // Latch the address at issue time since idu_lsu_ex1_func gets cleared after
     reg        lr_addr_set;
-    reg [FUNC_WIDTH-1:0] lr_func_r;  // latched opcode
 
     always @(posedge clk) begin
         if (!rst_n) begin
             lr_valid_r <= 1'b0;
             lr_addr_set <= 1'b0;
-            lr_func_r <= 20'd0;
         end else begin
-            // Latch opcode and addr on issue_real (IDLE->DCS transition)
-            // Use ag_addr (virtual address) for LR/SC comparison
-            if (issue_real && idu_lsu_ex1_func == LSU_FUNC_LR) begin
-                lr_func_r <= idu_lsu_ex1_func;
+            // Latch the LR address on issue_real (IDLE->DCS transition).
+            // Use ag_addr (virtual address) for LR/SC comparison.
+            if (issue_real && (idu_lsu_ex1_func == LSU_FUNC_LR_W
+                               || idu_lsu_ex1_func == LSU_FUNC_LR_D)) begin
                 lr_addr_r <= ag_addr[55:0];
-                lr_data_r <= 32'd0;
                 lr_addr_set <= 1'b1;
             end
 
-            // Capture data when cache responds OR miss refill completes
-            if ((u_dc_resp_vld || miss_done) && lr_addr_set && !lr_valid_r) begin
-                lr_data_r <= u_dc_resp_vld ? u_dc_resp_rdata[31:0] : frz_rdata_r[31:0];
-            end
-
-            // When cmplt_dp fires for this LR op, set valid
+            // Fire cmplt_dp for this LR op, set valid
             if (lsu_rtu_ex1_cmplt_dp && lr_addr_set && !lr_valid_r) begin
                 lr_valid_r <= 1'b1;
             end
@@ -717,7 +706,16 @@ module LSU #(
             if (lr_exclude_on_store || lr_exclude_on_load) begin
                 lr_valid_r <= 1'b0;
                 lr_addr_set <= 1'b0;
-                lr_func_r <= 20'd0;
+            end
+
+            // Any completed SC consumes the reservation, success or failure
+            // (rv64ua-p-lrsc test 6: sc-after-successful-sc AND sc-after-
+            // failed-sc must both fail). The exclude terms above already
+            // clear it for a HIT SC (load-like access); this term covers a
+            // MISALIGNED or MISSED SC, which never asserts dc_hit_c.
+            if (reply_fire && sc_addr_set) begin
+                lr_valid_r <= 1'b0;
+                lr_addr_set <= 1'b0;
             end
         end
     end
@@ -742,6 +740,7 @@ module LSU #(
     reg [DCACHE_INDEX_W-1:0] amo_index_r;
     reg [DCACHE_TAG_WIDTH-1:0] amo_tag_r;
     reg [2:0]  amo_dw_off_r;
+    reg [2:0]  amo_byte_off_r;    // byte offset within the dword (positioning)
     reg [WAYS-1:0] amo_way_r;      // cache way the read-phase line lives in
     reg        amo_line_resident_r; // line is in the array (hit or refilled miss)
 
@@ -757,6 +756,7 @@ module LSU #(
             amo_index_r  <= {DCACHE_INDEX_W{1'b0}};
             amo_tag_r    <= {DCACHE_TAG_WIDTH{1'b0}};
             amo_dw_off_r <= 3'd0;
+            amo_byte_off_r <= 3'd0;
             amo_way_r    <= {WAYS{1'b0}};
             amo_line_resident_r <= 1'b0;
         end else begin
@@ -779,6 +779,7 @@ module LSU #(
                 amo_index_r  <= dc_index_r;
                 amo_tag_r    <= dc_tag_r;
                 amo_dw_off_r <= dc_dw_off_r;
+                amo_byte_off_r <= dc_byte_off_r;
                 amo_way_r    <= final_way;
                 // The read phase is a load: a cacheable load either hits (line
                 // resident) or misses-and-refills (line NOW resident). So for a
@@ -1336,10 +1337,19 @@ module LSU #(
 
     wire reply_is_completing_store = (state == ST_REPLY) && !dc_is_drain_r && dc_is_store_r && !dc_misalign_r;
     wire reply_store_needs_new_slot = reply_is_completing_store && !stb_match_here;
+    // M3: a SUCCESSFUL SC commits its store data through the STB exactly
+    // like an ordinary store completion. SC is load-like (func[0]=0) so
+    // reply_is_store never sees it; give it a parallel term here (and in
+    // the STB create-or-merge below). Needs-a-slot backpressure included:
+    // a full STB holds the SC in REPLY until a drain frees a slot, same
+    // contract-4 behavior as a store.
+    wire reply_is_completing_sc = (state == ST_REPLY) && !dc_is_drain_r
+                                  && sc_addr_set && sc_match_r && !dc_misalign_r;
+    wire reply_sc_needs_new_slot = reply_is_completing_sc && !stb_match_here;
     // A genuinely full STB (no match, no free slot) stalls the completing
-    // store in REPLY until a drain frees a slot -- contract 4's DEPTH=4
+    // store/SC in REPLY until a drain frees a slot -- contract 4's DEPTH=4
     // backpressure, not a cancellation.
-    wire reply_can_complete = !(reply_store_needs_new_slot && !stb_any_free);
+    wire reply_can_complete = !((reply_store_needs_new_slot || reply_sc_needs_new_slot) && !stb_any_free);
 
     wire [WAYS-1:0] final_way = dc_hit_r ? dc_hit_way_r : victim_way_r;
 
@@ -1359,14 +1369,25 @@ module LSU #(
     wire reply_is_load      = reply_fire && !dc_is_store_r;
     wire reply_is_store      = reply_fire && dc_is_store_r;
     wire reply_is_misalign  = reply_fire && dc_misalign_r;
-    // M3 Task 1: LR.W detection (F_LR opcode at AG stage)
-    wire lr_issue_fire      = (idu_lsu_ex1_func == LSU_FUNC_LR) && issue_real;
-
-    // M3 Task 1: SC.W detection - latch addr at ST_DCS when dc_addr_r is stable
+    // M3: successful SC at REPLY -- gates the STB store-commit below.
+    // reply_fire carries reply_can_complete, so a full STB holds the SC
+    // here (no entry is created until a drain frees a slot).
+    wire reply_is_sc_commit = reply_fire && sc_addr_set && sc_match_r && !dc_misalign_r;
+    // M3: SC detection -- latch the reservation match at ST_DCS entry
+    // (dc_addr_r stable). A successful SC commits its store via the STB
+    // (REPLY section below); rd gets 0=committed / 1=failed.
     reg        sc_addr_set;
-    reg [63:0] sc_addr_r;
     reg [FUNC_WIDTH-1:0] sc_func_r;  // latched SC opcode
     reg        sc_match_r;           // SC success latched at ST_DCS
+
+    wire sc_func_is_sc = (sc_func_r == LSU_FUNC_SC_W) || (sc_func_r == LSU_FUNC_SC_D);
+    wire sc_issue      = issue_real && ((idu_lsu_ex1_func == LSU_FUNC_SC_W)
+                                        || (idu_lsu_ex1_func == LSU_FUNC_SC_D));
+    // Combinational match at ST_DCS -- built from exactly the inputs the
+    // latch samples that same cycle (sc_addr_set itself is an NBA, so it
+    // is still 0 during the first DCS cycle). The DC-stage forward below
+    // needs the result THIS cycle, one cycle before sc_match_r exists.
+    wire sc_match_c    = lr_valid_r && (dc_addr_r == lr_addr_r);
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -1375,17 +1396,16 @@ module LSU #(
             sc_match_r <= 1'b0;
         end else begin
             // Latch opcode at issue_real
-            if (issue_real && idu_lsu_ex1_func == LSU_FUNC_SC) begin
+            if (sc_issue) begin
                 sc_func_r <= idu_lsu_ex1_func;
             end
-            // Latch addr + reservation match at ST_DCS entry (dc_addr_r stable).
-            // SC succeeds only if there is a VALID reservation (lr_valid_r) AND
-            // the SC address matches the reserved address. Without a reservation
-            // (lr_valid_r=0) the SC must FAIL (return 1).
-            if (state == ST_DCS && sc_func_r == LSU_FUNC_SC && !sc_addr_set) begin
-                sc_addr_r <= dc_addr_r;
+            // Latch the reservation match at ST_DCS entry. SC succeeds only
+            // if there is a VALID reservation (lr_valid_r) AND the SC address
+            // matches the reserved address. Without a reservation (lr_valid_r=0)
+            // the SC must FAIL (return 1) -- rv64ua-p-lrsc test 2.
+            if (state == ST_DCS && sc_func_is_sc && !sc_addr_set) begin
                 sc_addr_set <= 1'b1;
-                sc_match_r <= lr_valid_r && (dc_addr_r == lr_addr_r);
+                sc_match_r  <= sc_match_c;
             end
             // Clear after completion
             if (lsu_rtu_ex1_cmplt_dp && sc_addr_set) begin
@@ -1407,13 +1427,16 @@ module LSU #(
             if ((state == ST_REPLY) && dc_is_drain_r && (!frz_is_direct_r || miss_done_latched))
                 stb_vld[dc_drain_idx_r] <= 1'b0;
             // store completion: merge into an existing entry, or allocate.
-            if (reply_is_store && !reply_is_misalign) begin
+            // M3: a successful SC (reply_is_sc_commit) commits here too --
+            // it is load-like on the pipe, so without this term the SC's
+            // store data would never reach memory (rv64ua-p-lrsc test 5).
+            if ((reply_is_store && !reply_is_misalign) || reply_is_sc_commit) begin
                 if (stb_match_here) begin
                     stb_data[stb_match_idx]     <= (expand_byte_mask(dc_byte_mask_r) & dc_store_data_r)
                                                   | (~expand_byte_mask(dc_byte_mask_r) & stb_data[stb_match_idx]);
                     stb_byte_vld[stb_match_idx] <= stb_byte_vld[stb_match_idx] | dc_byte_mask_r;
                     stb_way[stb_match_idx]      <= final_way;
-                    stb_was_hit[stb_match_idx]  <= store_line_resident;
+                    stb_was_hit[stb_match_idx]  <= reply_is_sc_commit ? dc_ca_r : store_line_resident;
                     // Merged entries keep the larger of the two store sizes
                     // (single-store entries -- the common case -- keep their
                     // exact size). A merged drain is an edge case; the data
@@ -1428,7 +1451,11 @@ module LSU #(
                     stb_data[stb_free_idx]      <= dc_store_data_r & expand_byte_mask(dc_byte_mask_r);
                     stb_byte_vld[stb_free_idx]  <= dc_byte_mask_r;
                     stb_way[stb_free_idx]       <= final_way;
-                    stb_was_hit[stb_free_idx]   <= store_line_resident;
+                    // SC is load-like: a cacheable SC-miss REFILLS (the line
+                    // is resident afterwards, in victim_way_r), unlike a wa=0
+                    // store-miss which bypasses. dc_ca_r covers hit+refill
+                    // exactly (same reasoning as amo_line_resident_r above).
+                    stb_was_hit[stb_free_idx]   <= reply_is_sc_commit ? dc_ca_r : store_line_resident;
                     stb_size[stb_free_idx]      <= {1'b0, dc_size_r};
                 end
             end
@@ -1448,8 +1475,15 @@ module LSU #(
                 stb_index[stb_free_idx]     <= amo_index_r;
                 stb_tag[stb_free_idx]       <= amo_tag_r;
                 stb_dw_off[stb_free_idx]    <= amo_dw_off_r;
-                stb_data[stb_free_idx]      <= amo_new_data;
-                stb_byte_vld[stb_free_idx]  <= (amo_is_dw_r) ? 8'hFF : (8'h0F << amo_dw_off_r);
+                // amo_new_data is in the VALUE domain (the AMO ALU works on
+                // the rotated/extracted read value); the STB holds POSITIONED
+                // data exactly like an ordinary store (ag_store_data_positioned),
+                // and the byte mask is positioned too. A W-AMO at byte_off!=0
+                // (rv64ua-p-lrsc's barrier amoadd.w x0,... lives at offset 4
+                // of its dword) must land its lanes there, not in [31:0] --
+                // unpositioned, the drain wrote zeros into the correct lanes.
+                stb_data[stb_free_idx]      <= amo_new_data << ({61'b0, amo_byte_off_r} * 8);
+                stb_byte_vld[stb_free_idx]  <= (amo_is_dw_r) ? 8'hFF : (8'h0F << amo_byte_off_r);
                 stb_way[stb_free_idx]       <= amo_way_r;
                 stb_was_hit[stb_free_idx]   <= amo_line_resident_r;
                 stb_size[stb_free_idx]      <= amo_is_dw_r ? 3'd3 : 3'd2;
@@ -1521,8 +1555,15 @@ module LSU #(
     // M3 Task 7: the ex2 forward must carry the SAME sign-extended value as
     // the writeback for W-width AMOs (the consumer condbr reads via this
     // forward, not the GPR, when it dispatches the cycle the AMO writes back).
-    // For SC.W the forward carries the SC result (0/1), not the memory read.
+    // For SC the forward carries the SC result (0/1), not the memory read.
+    // At the SC's FIRST ST_DCS cycle sc_addr_set is still 0 (NBA), but the
+    // result is already resolvable combinationally (sc_match_c) -- forward it
+    // here, otherwise a consumer dispatching this cycle would take da_final,
+    // the stale memory value (rv64ua-p-lrsc test 2).
+    wire sc_dcs_fire = (state == ST_DCS) && sc_func_is_sc && u_dc_resp_vld
+                       && dc_touched_array_r && dc_hit_c && !dc_misalign_r;
     assign lsu_rtu_ex2_data      = sc_addr_set ? lsu_rtu_sc_res[4:0]
+                                 : sc_dcs_fire ? (sc_match_c ? 5'd0 : 5'd1)
                                  : (amo_active
                                     ? (amo_is_dw_r ? da_final
                                                    : {{32{da_final[31]}}, da_final[31:0]})
@@ -1534,7 +1575,10 @@ module LSU #(
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
     assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
-    assign lsu_rtu_expt_vec = dc_is_store_r ? 5'd6 : 5'd4;   // store/load misalign
+    // Misaligned SC takes the STORE-misalign vector: SC is a store per the
+    // A spec even though it rides the load-like path in this LSU
+    // (sc_addr_set is latched at ST_DCS, still set at the SC's REPLY).
+    assign lsu_rtu_expt_vec = (dc_is_store_r || sc_addr_set) ? 5'd6 : 5'd4;
     assign lsu_rtu_tval     = dc_addr_r;
 
     // No async bus-error path is modeled for M2 (the behavioral AXI slave

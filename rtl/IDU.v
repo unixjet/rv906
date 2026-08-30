@@ -476,15 +476,23 @@ module IDU (
             // with funct3=010 for W-width or 011 for D-width. LR funct5=00010,
             // SC funct5=00011; the amo* catch-all below covers the rest.
             //-----------------------------------------------------------------
-            15'b00010??01001011,   // lr.w (funct5=00010)
-            15'b00010??01101011: begin  // lr.d (mapped to lr.w func; width limit)
-                d32_eu = EU_LSU; d32_func = LSU_FUNC_LR;
+            15'b00010??01001011: begin  // lr.w (funct5=00010, funct3=010)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_LR_W;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_dst0_vld = 1'b1;
             end
-            15'b00011??01001011,   // sc.w (funct5=00011)
-            15'b00011??01101011: begin  // sc.d (mapped to sc.w func; width limit)
-                d32_eu = EU_LSU; d32_func = LSU_FUNC_SC;
+            15'b00010??01101011: begin  // lr.d (funct3=011)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_LR_D;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                d32_dst0_vld = 1'b1;
+            end
+            15'b00011??01001011: begin  // sc.w (funct5=00011, funct3=010)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_SC_W;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
+            end
+            15'b00011??01101011: begin  // sc.d (funct3=011)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_SC_D;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
             end
@@ -985,8 +993,9 @@ module IDU (
     // lands many cycles after dispatch. Tagging them OTHER removes the
     // condbr exemption and forces consumers to stall until the real writeback.
     wire dis_is_amo_lrsc = (dis_eu_raw == EU_LSU) &&
-                           (dis_func[19:12] == 8'h01 || dis_func == LSU_FUNC_LR
-                            || dis_func == LSU_FUNC_SC);
+                           (dis_func[19:12] == 8'h01 || dis_func == LSU_FUNC_LR_W
+                            || dis_func == LSU_FUNC_LR_D || dis_func == LSU_FUNC_SC_W
+                            || dis_func == LSU_FUNC_SC_D);
     wire [2:0] dis_dst0_type = (dis_eu_final == EU_ALU)  ? WB_INT_TYPE_ALU  :
                                (dis_eu_final == EU_BJU)  ? WB_INT_TYPE_BJU  :
                                (dis_eu_final == EU_MULT) ? WB_INT_TYPE_MULT :
