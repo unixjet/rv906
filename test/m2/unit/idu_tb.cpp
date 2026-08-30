@@ -339,7 +339,8 @@ static void test_illegal_closed_list(void) {
     check(dut->idu_cp0_ex1_illegal == 1, "custom-0 (cache/perf): illegal");
 
     present(famo_add_w()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "amoadd.w: illegal (AMO out of M2 scope)");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_lsu_ex1_sel == 1,
+          "amoadd.w: legal, dispatches to LSU (M3 AMO decode)");
 
     present(sfence_vma_()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "sfence.vma: illegal (needs real MMU, M4)");
@@ -356,7 +357,7 @@ static void test_illegal_closed_list(void) {
     // reserved-encoding malformed ecall (rs1 != 0)
     present(enc_i(0, 5, 0x0, 0, OP_SYSTEM)); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "ecall with rs1!=0: illegal (malformed)");
-    test_result("T10 illegal decode closed list: FP/vector/custom/AMO/sfence.vma/sret/wfi/dret all trap");
+    test_result("T10 illegal decode closed list: FP/vector/custom/sfence.vma/sret/wfi/dret trap (AMO now legal, M3)");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----

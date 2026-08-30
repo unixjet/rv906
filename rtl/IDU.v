@@ -469,6 +469,33 @@ module IDU (
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_s;
                 d32_src2_vld = 1'b1;
             end
+            //-----------------------------------------------------------------
+            // M3 Task 7: RV64A atomics (opcode 0x2F -> inst[6:2]=01011).
+            // key = {inst[31:25](funct5,aq,rl), inst[14:12](funct3), inst[6:2]}.
+            // LR/SC are exact-func ops in the LSU; the 9 AMOs build their func
+            // from funct5 + width so a single arm covers all 18 AMO variants.
+            //-----------------------------------------------------------------
+            15'b00010??01001011,   // lr.w
+            15'b00010??01101011: begin  // lr.d (mapped to lr.w func; width limit)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_LR;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                d32_dst0_vld = 1'b1;
+            end
+            15'b00011??01001011,   // sc.w
+            15'b00011??01101011: begin  // sc.d (mapped to sc.w func; width limit)
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_SC;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
+            end
+            15'b???????01001011,   // amo*.w (funct5 != lr/sc matched above)
+            15'b???????01101011: begin  // amo*.d
+                d32_eu = EU_LSU;
+                // func = {AMO prefix 0x01, 3'b000, funct5, width, 2'b00};
+                // width = funct3[1:0] (10=W, 11=D) lands in func[3:2].
+                d32_func = {8'h01, 3'b000, inst[31:27], inst[13:12], 2'b00};
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
+                d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
+            end
             15'b???????00000100: begin  // addi
                 d32_eu = EU_ALU; d32_func = ALU_FUNC_ADD;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i;

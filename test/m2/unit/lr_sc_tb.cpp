@@ -522,6 +522,61 @@ static void test_amo_d_ops(void)
     test_result("T6 AMO.D ops (swap/add/and, 64-bit)");
 }
 
+// T7: AMO after a store to the same address (reproduces the riscv-test
+// amoadd_w scenario: memory initialized via a store, not a direct write).
+static void test_amo_after_store(void)
+{
+    const uint64_t A = 0x0000000080080000ULL;
+    const uint32_t INIT_VAL  = 0x80000000;   // bit31 set -> needs sign-ext
+    const uint32_t SWAP_VAL  = 0x11223344;
+    const uint32_t F_AMOSWAP_W = 0x01018;
+
+    // Store INIT_VAL to memory (like riscv-test's `sw a0, 0(a3)`)
+    do_op(F_SW, A, 0, INIT_VAL, 0);
+    settle(30);
+
+    // AMO reads the value the store wrote
+    LsuResult amo = do_op(F_AMOSWAP_W, A, 0, SWAP_VAL, 5);
+    settle(30);
+
+    check(amo.wb_data == 0xffffffff80000000ULL,
+          "AMO after store returns sign-extended OLD", amo.wb_data, 0xffffffff80000000ULL);
+
+    // Read back the NEW value via a load through the DUT
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == SWAP_VAL,
+          "AMO after store stored NEW value", ld.wb_data & 0xFFFFFFFF, SWAP_VAL);
+
+    test_result("T7 AMO after store (store-initialized memory)");
+}
+
+// T8: AMO immediately after a store to the same address, NO settle between.
+// This is the exact riscv-test amoadd_w timing: the store's data may still
+// be in the STB when the AMO reads, so the AMO must forward from the STB.
+static void test_amo_immediately_after_store(void)
+{
+    const uint64_t A = 0x0000000080090000ULL;
+    const uint32_t INIT_VAL  = 0x80000000;
+    const uint32_t SWAP_VAL  = 0x11223344;
+    const uint32_t F_AMOSWAP_W = 0x01018;
+
+    // Store then AMO back-to-back (do_op waits for completion but NOT for
+    // the STB entry to drain -- mimics the SoC pipeline).
+    do_op(F_SW, A, 0, INIT_VAL, 0);
+    LsuResult amo = do_op(F_AMOSWAP_W, A, 0, SWAP_VAL, 5);
+    settle(30);
+
+    check(amo.wb_data == 0xffffffff80000000ULL,
+          "AMO right after store forwards STB data (sign-ext OLD)",
+          amo.wb_data, 0xffffffff80000000ULL);
+
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == SWAP_VAL,
+          "AMO right after store stored NEW value", ld.wb_data & 0xFFFFFFFF, SWAP_VAL);
+
+    test_result("T8 AMO immediately after store (tight STB forward)");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -538,6 +593,8 @@ int main(int argc, char **argv)
     test_amo_swap_w();
     test_amo_w_ops();
     test_amo_d_ops();
+    test_amo_after_store();
+    test_amo_immediately_after_store();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

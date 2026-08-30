@@ -770,7 +770,11 @@ module LSU #(
             // Capture OLD value + address info when read completes (ST_REPLY)
             if (amo_active && (state == ST_REPLY) && reply_can_complete
                 && !dc_is_drain_r && !dc_misalign_r) begin
-                amo_old_data <= da_final;
+                // W-width AMOs return the OLD value sign-extended per the
+                // RISC-V A spec (da_final arrives zero-extended because the
+                // AMO func leaves the sign bit clear); D-width returns as-is.
+                amo_old_data <= amo_is_dw_r ? da_final
+                                            : {{32{da_final[31]}}, da_final[31:0]};
                 amo_addr_r   <= dc_addr_r;
                 amo_index_r  <= dc_index_r;
                 amo_tag_r    <= dc_tag_r;
@@ -1476,7 +1480,13 @@ module LSU #(
     assign lsu_rtu_ex1_inst_len   = idu_lsu_ex1_inst_len;
 
     assign lsu_rtu_wb_vld  = reply_is_load && !reply_is_misalign;
-    assign lsu_rtu_wb_data = da_final;
+    // W-width AMOs write back the OLD value sign-extended (da_final arrives
+    // zero-extended since the AMO func leaves the sign bit clear); amo_active
+    // is still asserted this ST_REPLY cycle (cleared by NBA at the edge).
+    assign lsu_rtu_wb_data = amo_active
+                           ? (amo_is_dw_r ? da_final
+                                          : {{32{da_final[31]}}, da_final[31:0]})
+                           : da_final;
     assign lsu_rtu_wb_preg = dc_dst0_reg_r;
 
     // DC-stage forward for a cache hit: the line is available combinationally

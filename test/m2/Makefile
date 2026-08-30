@@ -97,10 +97,25 @@ RV64UM_TESTS = \
 # though the source is ours. 67 + 1 = 68.
 RV64UC_TESTS = rvc
 
+# M3 Task 7: RV64A atomics (AMO + LR/SC). From isa/rv64ua/Makefrag's
+# rv64ua_sc_tests. These need the `a` extension in -march (MARCH_A below).
+RV64UA_TESTS = \
+	amoadd_w amoadd_d \
+	amoand_w amoand_d \
+	amomax_w amomax_d \
+	amomaxu_w amomaxu_d \
+	amomin_w amomin_d \
+	amominu_w amominu_d \
+	amoor_w amoor_d \
+	amoswap_w amoswap_d \
+	amoxor_w amoxor_d \
+	lrsc
+
 RV64UI_ELFS = $(addprefix $(BUILD_DIR)/rv64ui-p-,$(addsuffix .elf,$(RV64UI_TESTS)))
 RV64UM_ELFS = $(addprefix $(BUILD_DIR)/rv64um-p-,$(addsuffix .elf,$(RV64UM_TESTS)))
 RV64UC_ELFS = $(addprefix $(BUILD_DIR)/rv64uc-p-,$(addsuffix .elf,$(RV64UC_TESTS)))
-ELFS        = $(RV64UI_ELFS) $(RV64UM_ELFS) $(RV64UC_ELFS)
+RV64UA_ELFS = $(addprefix $(BUILD_DIR)/rv64ua-p-,$(addsuffix .elf,$(RV64UA_TESTS)))
+ELFS        = $(RV64UI_ELFS) $(RV64UM_ELFS) $(RV64UC_ELFS) $(RV64UA_ELFS)
 
 #-----------------------------------------------------------------------------
 # Compile line
@@ -139,6 +154,7 @@ ELFS        = $(RV64UI_ELFS) $(RV64UM_ELFS) $(RV64UC_ELFS)
 # ELF loader write .tohost at all. Nothing else in the build is silenced.
 MARCH     = rv64im_zicsr_zifencei
 MARCH_RVC = rv64imc_zicsr_zifencei
+MARCH_A   = rv64ima_zicsr_zifencei
 
 CFLAGS = -mabi=lp64 -static -mcmodel=medany \
          -fvisibility=hidden -nostdlib -nostartfiles \
@@ -176,6 +192,10 @@ $(BUILD_DIR)/rv64um-p-%.elf: $(RISCV_TESTS)/isa/rv64um/%.S $(DEPS) | $(BUILD_DIR
 # built with the C extension.
 $(BUILD_DIR)/rv64uc-p-%.elf: $(M2_DIR)%.S $(DEPS) | $(BUILD_DIR)
 	$(CC) -march=$(MARCH_RVC) $(CFLAGS) -T $(LDSCRIPT) $< -o $@
+
+# M3 Task 7: RV64A atomics. Only -march differs (adds the `a` extension).
+$(BUILD_DIR)/rv64ua-p-%.elf: $(RISCV_TESTS)/isa/rv64ua/%.S $(DEPS) | $(BUILD_DIR)
+	$(CC) -march=$(MARCH_A) $(CFLAGS) -T $(LDSCRIPT) $< -o $@
 
 # Disassembly of every ELF, for debugging a failing test.
 dump: $(ELFS)
