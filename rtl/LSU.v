@@ -1250,8 +1250,10 @@ module LSU #(
     //-------------------------------------------------------------------------
     // Decode AMO op from the latched func (bits[8:4] carry the funct5).
     wire [4:0] amo_op   = idu_lsu_ex1_func[8:4];
-    wire       amo_wd   = (idu_lsu_ex1_func[1:0] == 2'b00);  // .W
-    wire       amo_dw   = (idu_lsu_ex1_func[1:0] == 2'b11);  // .D
+    // Width lives in func[3:2] (same field ag_size uses for the read-phase
+    // access size): 10=W, 11=D.
+    wire       amo_wd   = (idu_lsu_ex1_func[3:2] == 2'b10);  // .W
+    wire       amo_dw   = (idu_lsu_ex1_func[3:2] == 2'b11);  // .D
     wire       amo_is_amo = (idu_lsu_ex1_func[19:12] == 8'h01);  // AMO func prefix
 
     wire amo_add  = (amo_op == 5'b00000);

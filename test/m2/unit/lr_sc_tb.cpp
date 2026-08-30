@@ -477,6 +477,51 @@ static void test_amo_w_ops(void)
     test_result("T5 AMO.W ops (add/xor/and/or/min/max/minu/maxu)");
 }
 
+// T6: D-width (64-bit) AMO operations
+static void test_amo_d_ops(void)
+{
+    const uint32_t F_AMOADD_D  = 0x0100c;
+    const uint32_t F_AMOSWAP_D = 0x0101c;
+    const uint32_t F_AMOAND_D  = 0x010cc;
+    const uint64_t BASE = 0x0000000080070000ULL;
+
+    // AMOSWAP.D: NEW = rs1 (full 64-bit)
+    {
+        const uint64_t A = BASE + 0x000;
+        const uint64_t INIT = 0xDEADBEEFCAFEBABEULL, RS1 = 0x1122334455667788ULL;
+        for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(INIT >> (i * 8)));
+        LsuResult amo = do_op(F_AMOSWAP_D, A, 0, RS1, 5);
+        settle(30);
+        LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+        check(amo.wb_data == INIT, "AMOSWAP.D returns OLD (64b)", amo.wb_data, INIT);
+        check(ld.wb_data == RS1,  "AMOSWAP.D stores NEW (64b)", ld.wb_data, RS1);
+    }
+    // AMOADD.D: NEW = OLD + rs1 (full 64-bit)
+    {
+        const uint64_t A = BASE + 0x040;
+        const uint64_t INIT = 0x1000000000000000ULL, RS1 = 0x023456789ABCDEF0ULL;
+        for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(INIT >> (i * 8)));
+        LsuResult amo = do_op(F_AMOADD_D, A, 0, RS1, 5);
+        settle(30);
+        LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+        check(amo.wb_data == INIT, "AMOADD.D returns OLD (64b)", amo.wb_data, INIT);
+        check(ld.wb_data == (INIT + RS1), "AMOADD.D stores NEW (64b)", ld.wb_data, INIT + RS1);
+    }
+    // AMOAND.D: NEW = OLD & rs1
+    {
+        const uint64_t A = BASE + 0x080;
+        const uint64_t INIT = 0xFF00FF00FF00FF00ULL, RS1 = 0x0F0F0F0F0F0F0F0FULL;
+        for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(INIT >> (i * 8)));
+        LsuResult amo = do_op(F_AMOAND_D, A, 0, RS1, 5);
+        settle(30);
+        LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+        check(amo.wb_data == INIT, "AMOAND.D returns OLD (64b)", amo.wb_data, INIT);
+        check(ld.wb_data == (INIT & RS1), "AMOAND.D stores NEW (64b)", ld.wb_data, INIT & RS1);
+    }
+
+    test_result("T6 AMO.D ops (swap/add/and, 64-bit)");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -492,6 +537,7 @@ int main(int argc, char **argv)
     test_sc_w_address_mismatch();
     test_amo_swap_w();
     test_amo_w_ops();
+    test_amo_d_ops();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

@@ -605,7 +605,9 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMIN_W  = 20'h01108;  // AMOMIN.W
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMINU_W = 20'h01188;  // AMOMINU.W
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAX_W  = 20'h01148;  // AMOMAX.W
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOMAXU_W = 20'h011c8;  // AMOMAXU.W
-parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOADD_D  = 20'h0100c;  // AMOADD.D
+// D-width AMOs: bits[3:2]=11 selects D (matches ag_size=func[3:2] used for
+// the read-phase access size), bits[1:0] stay 00.
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOADD_D  = 20'h0100c;  // AMOADD.D  (bits[3:2]=11)
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOSWAP_D = 20'h0101c;  // AMOSWAP.D
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOXOR_D  = 20'h0104c;  // AMOXOR.D
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_AMOAND_D  = 20'h010cc;  // AMOAND.D
