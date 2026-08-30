@@ -473,17 +473,17 @@ module IDU (
             // M3 Task 7: RV64A atomics (opcode 0x2F -> inst[6:2]=01011).
             // key = {inst[31:25](funct7), inst[14:12](funct3), inst[6:2]}.
             // Fixed from 14 bits to 15 bits: AMOs have opcode 01011 at bottom,
-            // with funct3=010 for W-width or 011 for D-width. lr.w/sc.w match
-            // funct5=0b010; amo*.w matches all other funct5 values (0b000,001,010,011,100,101,110,111).
+            // with funct3=010 for W-width or 011 for D-width. LR funct5=00010,
+            // SC funct5=00011; the amo* catch-all below covers the rest.
             //-----------------------------------------------------------------
-            15'b00000??01001011,   // lr.w
-            15'b00000??01101011: begin  // lr.d (mapped to lr.w func; width limit)
+            15'b00010??01001011,   // lr.w (funct5=00010)
+            15'b00010??01101011: begin  // lr.d (mapped to lr.w func; width limit)
                 d32_eu = EU_LSU; d32_func = LSU_FUNC_LR;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_dst0_vld = 1'b1;
             end
-            15'b00001??01001011,   // sc.w
-            15'b00001??01101011: begin  // sc.d (mapped to sc.w func; width limit)
+            15'b00011??01001011,   // sc.w (funct5=00011)
+            15'b00011??01101011: begin  // sc.d (mapped to sc.w func; width limit)
                 d32_eu = EU_LSU; d32_func = LSU_FUNC_SC;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = 64'd0;
                 d32_src2_vld = 1'b1; d32_dst0_vld = 1'b1;
@@ -976,10 +976,22 @@ module IDU (
     // the WAW-except "new producer type" comparison (rvproc_pkg.sv's
     // resolved dp_wb_dst0_type OR-mux -- ALU/BJU/MULT/LSU only, DIV/CP0/
     // illegal fall to OTHER, cited not re-derived per the task text).
+    //
+    // M3 Task 7 FIX: AMO/LR/SC are tagged WB_INT_TYPE_OTHER, not LSU. The
+    // donor's load->condbr RAW exemption (raw0_except term 3) assumes an LSU
+    // producer forwards its result within cnt 0/1, which is true for a plain
+    // load but NOT for an AMO/LR/SC: those hold the LSU through a read-modify-
+    // write (AMO) or a store-conditional sequence, so the register writeback
+    // lands many cycles after dispatch. Tagging them OTHER removes the
+    // condbr exemption and forces consumers to stall until the real writeback.
+    wire dis_is_amo_lrsc = (dis_eu_raw == EU_LSU) &&
+                           (dis_func[19:12] == 8'h01 || dis_func == LSU_FUNC_LR
+                            || dis_func == LSU_FUNC_SC);
     wire [2:0] dis_dst0_type = (dis_eu_final == EU_ALU)  ? WB_INT_TYPE_ALU  :
                                (dis_eu_final == EU_BJU)  ? WB_INT_TYPE_BJU  :
                                (dis_eu_final == EU_MULT) ? WB_INT_TYPE_MULT :
-                               (dis_eu_final == EU_LSU)  ? WB_INT_TYPE_LSU  :
+                               (dis_eu_final == EU_LSU)  ? (dis_is_amo_lrsc ? WB_INT_TYPE_OTHER
+                                                                            : WB_INT_TYPE_LSU) :
                                                             WB_INT_TYPE_OTHER;
 
     // producer-type-aware except flags this instruction's OWN class needs

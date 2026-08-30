@@ -1366,32 +1366,38 @@ module LSU #(
     reg        sc_addr_set;
     reg [63:0] sc_addr_r;
     reg [FUNC_WIDTH-1:0] sc_func_r;  // latched SC opcode
+    reg        sc_match_r;           // SC success latched at ST_DCS
 
     always @(posedge clk) begin
         if (!rst_n) begin
             sc_addr_set <= 1'b0;
             sc_func_r <= 20'd0;
+            sc_match_r <= 1'b0;
         end else begin
             // Latch opcode at issue_real
             if (issue_real && idu_lsu_ex1_func == LSU_FUNC_SC) begin
                 sc_func_r <= idu_lsu_ex1_func;
             end
-            // Latch addr at ST_DCS entry (when dc_addr_r is stable)
+            // Latch addr + reservation match at ST_DCS entry (dc_addr_r stable).
+            // SC succeeds only if there is a VALID reservation (lr_valid_r) AND
+            // the SC address matches the reserved address. Without a reservation
+            // (lr_valid_r=0) the SC must FAIL (return 1).
             if (state == ST_DCS && sc_func_r == LSU_FUNC_SC && !sc_addr_set) begin
                 sc_addr_r <= dc_addr_r;
                 sc_addr_set <= 1'b1;
+                sc_match_r <= lr_valid_r && (dc_addr_r == lr_addr_r);
             end
             // Clear after completion
             if (lsu_rtu_ex1_cmplt_dp && sc_addr_set) begin
                 sc_addr_set <= 1'b0;
                 sc_func_r <= 20'd0;
+                sc_match_r <= 1'b0;
             end
         end
     end
 
-    // SC result: 0=success(commit), 1=fail - based on address match with last LR
-    // Use lr_addr_r directly (not lr_valid_r which gets cleared by exclusion logic)
-    wire sc_addr_match_now = sc_addr_set && (sc_addr_r[55:0] == lr_addr_r);
+    // SC result: 0=success(commit), 1=fail - latched at ST_DCS (sc_match_r).
+    assign lsu_rtu_sc_res     = sc_addr_set ? (sc_match_r ? 5'd0 : 5'd1) : 5'd1;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -1483,10 +1489,13 @@ module LSU #(
     // W-width AMOs write back the OLD value sign-extended (da_final arrives
     // zero-extended since the AMO func leaves the sign bit clear); amo_active
     // is still asserted this ST_REPLY cycle (cleared by NBA at the edge).
-    assign lsu_rtu_wb_data = amo_active
-                           ? (amo_is_dw_r ? da_final
-                                          : {{32{da_final[31]}}, da_final[31:0]})
-                           : da_final;
+    // For SC.W: the "load" result is actually the SC result (0=success, 1=fail).
+    // Use sc_addr_set (not idu_lsu_ex1_func which may have moved on by ST_REPLY).
+    assign lsu_rtu_wb_data = sc_addr_set ? lsu_rtu_sc_res[4:0]
+                                 : (amo_active
+                                    ? (amo_is_dw_r ? da_final
+                                                   : {{32{da_final[31]}}, da_final[31:0]})
+                                    : da_final);
     assign lsu_rtu_wb_preg = dc_dst0_reg_r;
 
     // DC-stage forward for a cache hit: the line is available combinationally
@@ -1509,13 +1518,20 @@ module LSU #(
     // stays busy across FRZ) and the fwd2 rides the ST_REPLY writeback
     // (lsu_rtu_wb_vld). OR-ing the two covers hit (DC-stage fwd) + miss
     // (RT-stage fwd) exactly as the donor's data_vld does across DC->REPLY.
-    assign lsu_rtu_ex2_data      = da_final;
+    // M3 Task 7: the ex2 forward must carry the SAME sign-extended value as
+    // the writeback for W-width AMOs (the consumer condbr reads via this
+    // forward, not the GPR, when it dispatches the cycle the AMO writes back).
+    // For SC.W the forward carries the SC result (0/1), not the memory read.
+    assign lsu_rtu_ex2_data      = sc_addr_set ? lsu_rtu_sc_res[4:0]
+                                 : (amo_active
+                                    ? (amo_is_dw_r ? da_final
+                                                   : {{32{da_final[31]}}, da_final[31:0]})
+                                    : da_final);
     assign lsu_rtu_ex2_data_vld  = lsu_fwd2_dc_fire || lsu_rtu_wb_vld;
     assign lsu_rtu_ex2_dest_reg  = dc_dst0_reg_r;
 
     // M3 Task 1: LR.W / SC.W foundation outputs
-    // SC result based on latched address match with last LR
-    assign lsu_rtu_sc_res     = sc_addr_set ? (sc_addr_match_now ? 5'd0 : 5'd1) : 5'd0;  // 0=success, 1=fail
+    // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
     assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
     assign lsu_rtu_expt_vec = dc_is_store_r ? 5'd6 : 5'd4;   // store/load misalign
