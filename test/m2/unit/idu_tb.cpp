@@ -167,6 +167,7 @@ static uint32_t wfi_(void) { return enc_i(0x105, 0, 0x0, 0, OP_SYSTEM); }
 static uint32_t dret_(void) { return enc_i(0x7b2, 0, 0x0, 0, OP_SYSTEM); }
 static uint32_t sfence_vma_(void) { return enc_r(0x09, 0, 0, 0x0, 0, OP_SYSTEM); }
 static uint32_t famo_add_w(void) { return enc_r(0x00, 6, 1, 0x2, 5, OP_AMO); } // amoadd.w x5,x6,(x1)
+static uint32_t famo_reserved_w(void) { return enc_r(0x14, 6, 1, 0x2, 5, OP_AMO); } // funct5=00101 (reserved)
 static uint32_t fp_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_FP); }
 static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
 static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
@@ -341,6 +342,11 @@ static void test_illegal_closed_list(void) {
     present(famo_add_w()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_lsu_ex1_sel == 1,
           "amoadd.w: legal, dispatches to LSU (M3 AMO decode)");
+
+    present(famo_reserved_w()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1
+          && dut->idu_lsu_ex1_sel == 0,
+          "reserved AMO funct5: illegal (M3 audit; donor decd.v lists only the 9)");
 
     present(sfence_vma_()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "sfence.vma: illegal (needs real MMU, M4)");

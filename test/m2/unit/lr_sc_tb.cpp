@@ -261,11 +261,15 @@ struct LsuResult {
 static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src2,
                        unsigned dst0, bool sel = true, bool dp_sel = true, int guard = 500)
 {
-    int waited = 0;
-    while (dut->lsu_idu_full && waited < guard) { idle_issue(); tick(); waited++; }
-
+    // Drive func/src/dst UP FRONT and hold them while waiting for admission,
+    // mirroring the SoC handshake: idu_lsu_ex1_func is EX1's flopped func and
+    // stays driven while the op is held, so LSU's STB-full admission term
+    // (stb_full && ag_needs_slot_c) sees this op's real slot need. sel stays
+    // gated off until lsu_idu_full drops (that is what the IDU does), then one
+    // tick issues. (Previously the wait loop idled func=0, which let a 5th
+    // back-to-back store slip past admission and deadlock at REPLY.)
     dut->idu_lsu_ex1_dp_sel     = dp_sel ? 1 : 0;
-    dut->idu_lsu_ex1_sel        = sel ? 1 : 0;
+    dut->idu_lsu_ex1_sel        = 0;
     dut->idu_lsu_ex1_func       = func;
     dut->idu_lsu_ex1_src0_data  = src0;
     dut->idu_lsu_ex1_src0_ready = 1;
@@ -274,6 +278,17 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
     dut->idu_lsu_ex1_src2_data  = src2;
     dut->idu_lsu_ex1_src2_ready = 1;
     dut->idu_lsu_ex1_dst0_reg   = dst0;
+
+    // Propagate the driven func/data through the combinational admission term
+    // (stb_full && ag_needs_slot_c) BEFORE polling lsu_idu_full -- Verilator
+    // does not re-evaluate until eval() is called, so without this the first
+    // poll reads the stale full computed with the previous (idle) func.
+    dut->eval();
+
+    int waited = 0;
+    while (dut->lsu_idu_full && waited < guard) { tick(); waited++; }
+
+    dut->idu_lsu_ex1_sel        = sel ? 1 : 0;
     tick();
     idle_issue();
 
@@ -781,6 +796,149 @@ static void test_lr_sc_d(void)
 }
 
 //=============================================================================
+// M3 audit regression tests (HIGH findings)
+//=============================================================================
+
+// T15: five back-to-back distinct-dword stores. Before the audit fix the 5th
+// store DEADLOCKED: its REPLY waited for a free STB slot, but drains start
+// only from ST_IDLE and the FSM never got back to IDLE. The admission-control
+// fix holds the 5th store in EX1 (lsu_idu_full) while drains free a slot,
+// then it issues and completes. The lines are warmed first so the stores HIT
+// (a hit store creates its STB entry at REPLY; a cold wa=0 miss writes
+// through directly and buffers nothing, which would not fill the STB).
+// Addresses are one-per-cache-line so no line-level interaction enters.
+static void test_stb_full_store_admission(void)
+{
+    reset_dut();   // isolate: start from an empty STB
+    const uint64_t A = 0x0000000080100000ULL;
+    const int N = 5;
+    const uint64_t VAL[N] = { 0x1111111111111111ULL, 0x2222222222222222ULL,
+                              0x3333333333333333ULL, 0x4444444444444444ULL,
+                              0x5555555555555555ULL };
+
+    for (int i = 0; i < N; i++)               // warm one line per store
+        do_op(F_LD, A + i * 64, 0, 0, 5);
+    settle(30);
+
+    bool all_cmplt = true;
+    for (int i = 0; i < N; i++) {
+        LsuResult st = do_op(F_SD, A + i * 64, 0, VAL[i], 0, true, true, 2000);
+        if (!st.cmplt || st.timed_out) all_cmplt = false;
+    }
+    settle(40);
+    check(all_cmplt, "5 back-to-back distinct-dword stores all complete", all_cmplt, 1);
+
+    bool mem_ok = true;
+    for (int i = 0; i < N; i++) {
+        LsuResult ld = do_op(F_LD, A + i * 64, 0, 0, 5);
+        if (ld.wb_data != VAL[i]) mem_ok = false;
+    }
+    check(mem_ok, "all 5 store values reached memory", mem_ok, 1);
+
+    test_result("T15 STB-full store admission (no deadlock)");
+}
+
+// T16: an AMO writeback must not be DROPPED when the STB is saturated. Four
+// back-to-back stores fill the STB, then an AMOADD.W to a fifth dword must
+// still commit its NEW value (the deferred amo_wb_pending flag used to be
+// cleared without creating the entry when no slot was free).
+static void test_stb_full_amo_commit(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A = 0x0000000080110000ULL;
+    const uint32_t F_AMOADD_W = 0x01008;
+    const uint64_t FILL[4] = { 0xAAAA000000000000ULL, 0xBBBB000000000000ULL,
+                               0xCCCC000000000000ULL, 0xDDDD000000000000ULL };
+    const uint32_t AMO_INIT = 0x00000064;
+    const uint32_t AMO_ADD  = 0x00000001;
+
+    for (int i = 0; i < 4; i++)               // warm the fill lines
+        do_op(F_LD, A + i * 64, 0, 0, 5);
+    // Seed + warm the AMO target line (its own cache line).
+    for (int i = 0; i < 4; i++) mem_wr(A + 256 + i, (uint8_t)(AMO_INIT >> (i * 8)));
+    do_op(F_LW, A + 256, 0, 0, 5);
+    settle(30);
+
+    for (int i = 0; i < 4; i++)               // hitting stores fill the STB
+        do_op(F_SD, A + i * 64, 0, FILL[i], 0, true, true, 2000);
+
+    LsuResult amo = do_op(F_AMOADD_W, A + 256, 0, AMO_ADD, 5, true, true, 2000);
+    settle(40);
+    check(amo.cmplt && !amo.timed_out, "AMO completes with STB saturated", amo.cmplt, 1);
+    check(amo.wb_data == (uint64_t)(int64_t)(int32_t)AMO_INIT,
+          "AMO returns OLD", amo.wb_data, (uint64_t)(int64_t)(int32_t)AMO_INIT);
+
+    // The AMO's NEW value (INIT+ADD) must have reached memory, not been dropped.
+    LsuResult ld = do_op(F_LW, A + 256, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == AMO_INIT + AMO_ADD,
+          "AMO NEW value committed despite full STB", ld.wb_data & 0xFFFFFFFF,
+          AMO_INIT + AMO_ADD);
+
+    test_result("T16 STB-full AMO commit (no drop)");
+}
+
+// T17: a MISALIGNED AMO traps and must not leave amo_active stuck. Before the
+// fix the trapped AMO left amo_active=1, corrupting the NEXT load's writeback
+// (forced through the W-width sign-extend AMO path) and issuing a bogus store.
+static void test_misaligned_amo_recovery(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A = 0x0000000080120000ULL;
+    const uint32_t F_AMOADD_W = 0x01008;
+    const uint32_t KNOWN = 0x778899AA;
+
+    for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(KNOWN >> (i * 8)));
+    do_op(F_LW, A, 0, 0, 5);   // warm the line
+    settle(10);
+
+    // Misaligned AMO (addr+2): traps, must NOT commit and must clear amo_active.
+    LsuResult amo = do_op(F_AMOADD_W, A + 2, 0, 0x1, 5);
+    check(amo.cmplt && amo.expt_vld, "misaligned AMO raises exception", amo.expt_vld, 1);
+    check(amo.expt_vec == 6, "misaligned AMO vector is store/AMO misalign (6)",
+          amo.expt_vec, 6);
+    settle(20);
+
+    // The next ordinary load must return the KNOWN value UNCORRUPTED (a stuck
+    // amo_active would sign-extend from bit 31 through the AMO wb mux).
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == KNOWN,
+          "load after trapped AMO is uncorrupted", ld.wb_data & 0xFFFFFFFF, KNOWN);
+
+    test_result("T17 misaligned AMO traps, no stuck amo_active");
+}
+
+// T18: LR;LR;SC on the same address must succeed -- a second LR RE-KEYS the
+// reservation (donor lm_set overwrites in EXCL state). Before the fix the
+// second LR's own DCS response hit exclude_on_load and destroyed the
+// reservation, so the SC failed.
+static void test_lr_over_lr_rekey(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A = 0x0000000080130000ULL;
+
+    for (int i = 0; i < 4; i++) mem_wr(A + i, 0x00);
+    do_op(F_LW, A, 0, 0, 5);   // warm the line so the LRs hit
+    settle(10);
+
+    do_op(F_LR, A, 0, 0, 5);   // first LR: sets reservation
+    settle(4);
+    LsuResult lr2 = do_op(F_LR, A, 0, 0, 5);   // second LR: re-keys
+    settle(4);
+    check(lr2.lr_vld == 1, "second LR asserts lr_vld (re-key)", lr2.lr_vld, 1);
+
+    LsuResult sc = do_op(F_SC, A, 0, 0x5A5A5A5A, 6);
+    settle(20);
+    check(sc.sc_res == 0, "SC after LR;LR succeeds (reservation re-keyed)",
+          sc.sc_res, 0);
+
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == 0x5A5A5A5A,
+          "SC committed after LR;LR", ld.wb_data & 0xFFFFFFFF, 0x5A5A5A5A);
+
+    test_result("T18 LR;LR;SC reservation re-key");
+}
+
+//=============================================================================
 // main
 //=============================================================================
 int main(int argc, char **argv)
@@ -804,6 +962,10 @@ int main(int argc, char **argv)
     test_amo_w_unaligned_dword();
     test_sc_w_upper_word();
     test_lr_sc_d();
+    test_stb_full_store_admission();
+    test_stb_full_amo_commit();
+    test_misaligned_amo_recovery();
+    test_lr_over_lr_rekey();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
