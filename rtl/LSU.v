@@ -742,6 +742,8 @@ module LSU #(
     reg [DCACHE_INDEX_W-1:0] amo_index_r;
     reg [DCACHE_TAG_WIDTH-1:0] amo_tag_r;
     reg [2:0]  amo_dw_off_r;
+    reg [WAYS-1:0] amo_way_r;      // cache way the read-phase line lives in
+    reg        amo_line_resident_r; // line is in the array (hit or refilled miss)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -755,6 +757,8 @@ module LSU #(
             amo_index_r  <= {DCACHE_INDEX_W{1'b0}};
             amo_tag_r    <= {DCACHE_TAG_WIDTH{1'b0}};
             amo_dw_off_r <= 3'd0;
+            amo_way_r    <= {WAYS{1'b0}};
+            amo_line_resident_r <= 1'b0;
         end else begin
             // Latch AMO operands at issue_real
             if (issue_real && amo_is_amo) begin
@@ -771,6 +775,12 @@ module LSU #(
                 amo_index_r  <= dc_index_r;
                 amo_tag_r    <= dc_tag_r;
                 amo_dw_off_r <= dc_dw_off_r;
+                amo_way_r    <= final_way;
+                // The read phase is a load: a cacheable load either hits (line
+                // resident) or misses-and-refills (line NOW resident). So for a
+                // cacheable AMO the line is in the array and the writeback must
+                // update it there (not bypass to AXI leaving a stale line).
+                amo_line_resident_r <= dc_ca_r;
                 amo_wb_pending <= 1'b1;
                 amo_active <= 1'b0;
             end
@@ -1269,19 +1279,25 @@ module LSU #(
         reg [63:0] add_rst, logic_rst, sel_rst;
         reg        use_add, use_logic, use_sel;
         reg        src0_sel;
+        reg        is_unsigned;
         begin
-            // Sign/zero extend for W-width min/max (donor's unsign_ext logic)
+            // min/max are SIGNED compares; minu/maxu are UNSIGNED (donor's
+            // unsign_ext selects zero- vs sign-extension the same way).
+            is_unsigned = (op[4:0] == 5'b11000 || op[4:0] == 5'b11100);
             if (is_dw) begin
-                s0_ext = {src0[63], src0};
-                s1_ext = {src1[63], src1};
+                s0_ext = is_unsigned ? {1'b0, src0[63:0]} : {src0[63], src0[63:0]};
+                s1_ext = is_unsigned ? {1'b0, src1[63:0]} : {src1[63], src1[63:0]};
             end else begin
-                s0_ext = {{33{src0[31]}}, src0[31:0]};
-                s1_ext = {{33{src1[31]}}, src1[31:0]};
+                s0_ext = is_unsigned ? {33'b0, src0[31:0]}
+                                     : {{33{src0[31]}}, src0[31:0]};
+                s1_ext = is_unsigned ? {33'b0, src1[31:0]}
+                                     : {{33{src1[31]}}, src1[31:0]};
             end
-            // Adder: used for add and min/max comparison
+            // Adder: used for add
             add_rst = src0 + src1;
-            // Compare for min/max via subtraction borrow
-            adder_cin = (s0_ext >= s1_ext);  // src0 >= src1
+            // Compare for min/max: adder_cin = (src0 < src1). With this
+            // polarity the shared select below yields: min->smaller, max->larger.
+            adder_cin = (s0_ext < s1_ext);
             src0_sel  = ((op[4:0] == 5'b10100 || op[4:0] == 5'b11100) ^ adder_cin)
                         && (op[4:0] != 5'b00001);  // max/maxu select, not swap
             sel_rst   = src0_sel ? src0 : src1;
@@ -1407,10 +1423,13 @@ module LSU #(
             // M3 Task 5: AMO writeback -- after the read phase captured the
             // OLD value (amo_old_data, latched this same cycle via the AMO
             // always block above), create an STB entry holding the computed
-            // NEW value so the existing drain path writes it to memory.
+            // NEW value so the existing drain path writes it. For a cacheable
+            // AMO the read-phase line is resident (hit or refilled miss), so
+            // was_hit=1 and the drain updates that cache way (keeping the
+            // array coherent); for uncached it bypasses to AXI.
             // This fires the cycle AFTER the read completes (amo_wb_pending
-            // is a registered flag set at ST_REPLY). Uses latched amo_addr_r/
-            // amo_index_r/amo_tag_r since dc_* regs may be reused.
+            // is a registered flag set at ST_REPLY). Uses latched amo_* regs
+            // since dc_* regs may be reused.
             if (amo_wb_pending && stb_any_free) begin
                 stb_vld[stb_free_idx]      <= 1'b1;
                 stb_addr[stb_free_idx]      <= amo_addr_r;
@@ -1419,8 +1438,8 @@ module LSU #(
                 stb_dw_off[stb_free_idx]    <= amo_dw_off_r;
                 stb_data[stb_free_idx]      <= amo_new_data;
                 stb_byte_vld[stb_free_idx]  <= (amo_is_dw_r) ? 8'hFF : (8'h0F << amo_dw_off_r);
-                stb_way[stb_free_idx]       <= final_way;
-                stb_was_hit[stb_free_idx]   <= store_line_resident;
+                stb_way[stb_free_idx]       <= amo_way_r;
+                stb_was_hit[stb_free_idx]   <= amo_line_resident_r;
                 stb_size[stb_free_idx]      <= amo_is_dw_r ? 3'd3 : 3'd2;
             end
         end

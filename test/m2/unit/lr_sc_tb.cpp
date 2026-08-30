@@ -392,19 +392,89 @@ static void test_amo_swap_w(void)
 
     // Issue AMOSWAP.W: src0=address, src1=offset, src2=swap value
     LsuResult amo = do_op(F_AMOSWAP_W, A, 0, SWAP_VAL, 5);
-    settle(30);  // let STB drain to memory
+    settle(30);  // let the AMO writeback STB entry drain into the cache
 
     // Check that the OLD value was returned in wb_data (W-width returns
     // the 32-bit value; LSU sign/zero-extends per dc_size_r).
     check((amo.wb_data & 0xFFFFFFFF) == INIT_VAL,
           "AMOSWAP.W returns OLD value (lower 32b)", amo.wb_data & 0xFFFFFFFF, INIT_VAL);
 
-    // Check that the NEW value was stored to memory (lower 32b of the dword)
-    uint64_t mem_val = mem_read64(A);
-    check((mem_val & 0xFFFFFFFF) == SWAP_VAL,
-          "AMOSWAP.W stores NEW value to memory (lower 32b)", mem_val & 0xFFFFFFFF, SWAP_VAL);
+    // Read back the NEW value via a load through the DUT (cache hit on the
+    // line the AMO writeback updated)
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    check((ld.wb_data & 0xFFFFFFFF) == SWAP_VAL,
+          "AMOSWAP.W stores NEW value to memory (lower 32b)", ld.wb_data & 0xFFFFFFFF, SWAP_VAL);
 
     test_result("T4 AMOSWAP.W read-modify-write");
+}
+
+// Build check-label strings (static buffers, test is single-threaded)
+static const char *name_old_ok(const char *n) {
+    static char buf[128]; snprintf(buf, sizeof(buf), "%s returns OLD", n); return buf;
+}
+static const char *name_new_ok(const char *n) {
+    static char buf[128]; snprintf(buf, sizeof(buf), "%s stores NEW", n); return buf;
+}
+
+// Helper: run a W-width AMO op and verify OLD returned + NEW stored.
+// The AMO writeback updates the resident cache line, so the NEW value is
+// read back via a load through the DUT (which hits the updated cache line),
+// not from the golden memory (which the dirty line hasn't reached yet).
+// Each call uses a DISTINCT address (its own cache line) so a prior test's
+// resident line doesn't shadow the mem_wr re-init below.
+static bool run_amo_w_check(const char *name, uint32_t func, uint64_t A,
+                            uint32_t init_val, uint32_t rs1, uint32_t expect_new)
+{
+    for (int i = 0; i < 4; i++) mem_wr(A + i, (uint8_t)(init_val >> (i * 8)));
+
+    LsuResult amo = do_op(func, A, 0, rs1, 5);
+    settle(30);  // let the AMO writeback STB entry drain into the cache
+
+    bool old_ok = (amo.wb_data & 0xFFFFFFFF) == init_val;
+
+    // Read back the NEW value via a load through the DUT (cache hit)
+    LsuResult ld = do_op(F_LW, A, 0, 0, 5);
+    bool new_ok = (ld.wb_data & 0xFFFFFFFF) == expect_new;
+
+    check(old_ok, name_old_ok(name), amo.wb_data & 0xFFFFFFFF, init_val);
+    check(new_ok, name_new_ok(name), ld.wb_data & 0xFFFFFFFF, expect_new);
+    return old_ok && new_ok;
+}
+
+// T5: All W-width AMO arithmetic/logic operations (each on its own cache line)
+static void test_amo_w_ops(void)
+{
+    // AMO opcodes (W-width, func[0]=0)
+    const uint32_t F_AMOADD_W  = 0x01008;
+    const uint32_t F_AMOXOR_W  = 0x01048;
+    const uint32_t F_AMOAND_W  = 0x010c8;
+    const uint32_t F_AMOOR_W   = 0x01088;
+    const uint32_t F_AMOMIN_W  = 0x01108;
+    const uint32_t F_AMOMINU_W = 0x01188;
+    const uint32_t F_AMOMAX_W  = 0x01148;
+    const uint32_t F_AMOMAXU_W = 0x011c8;
+
+    // Distinct cache-line-aligned addresses (64B apart = distinct sets)
+    const uint64_t BASE = 0x0000000080060000ULL;
+
+    // AMOADD.W: NEW = OLD + rs1
+    run_amo_w_check("AMOADD.W", F_AMOADD_W, BASE + 0x000, 0x10000000, 0x02345678, 0x12345678);
+    // AMOXOR.W: NEW = OLD ^ rs1
+    run_amo_w_check("AMOXOR.W", F_AMOXOR_W, BASE + 0x040, 0xFF00FF00, 0x0F0F0F0F, 0xF00FF00F);
+    // AMOAND.W: NEW = OLD & rs1
+    run_amo_w_check("AMOAND.W", F_AMOAND_W, BASE + 0x080, 0xFF00FF00, 0x0F0F0F0F, 0x0F000F00);
+    // AMOOR.W:  NEW = OLD | rs1
+    run_amo_w_check("AMOOR.W",  F_AMOOR_W,  BASE + 0x0C0, 0xFF00FF00, 0x0F0F0F0F, 0xFF0FFF0F);
+    // AMOMIN.W (signed): OLD=+5, rs1=-3 -> NEW=-3 (0xFFFFFFFD)
+    run_amo_w_check("AMOMIN.W", F_AMOMIN_W, BASE + 0x100, 0x00000005, 0xFFFFFFFD, 0xFFFFFFFD);
+    // AMOMAX.W (signed): OLD=+5, rs1=-3 -> NEW=+5
+    run_amo_w_check("AMOMAX.W", F_AMOMAX_W, BASE + 0x140, 0x00000005, 0xFFFFFFFD, 0x00000005);
+    // AMOMINU.W (unsigned): OLD=5, rs1=0xFFFFFFFD(large) -> NEW=5
+    run_amo_w_check("AMOMINU.W", F_AMOMINU_W, BASE + 0x180, 0x00000005, 0xFFFFFFFD, 0x00000005);
+    // AMOMAXU.W (unsigned): OLD=5, rs1=0xFFFFFFFD(large) -> NEW=0xFFFFFFFD
+    run_amo_w_check("AMOMAXU.W", F_AMOMAXU_W, BASE + 0x1C0, 0x00000005, 0xFFFFFFFD, 0xFFFFFFFD);
+
+    test_result("T5 AMO.W ops (add/xor/and/or/min/max/minu/maxu)");
 }
 
 //=============================================================================
@@ -421,6 +491,7 @@ int main(int argc, char **argv)
     test_sc_w_success();
     test_sc_w_address_mismatch();
     test_amo_swap_w();
+    test_amo_w_ops();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
