@@ -264,6 +264,9 @@ parameter [11:0] CSR_MHARTID   = 12'hF14;
 //-----------------------------------------------------------------------------
 parameter [11:0] CSR_MXSTATUS = 12'h7C0;
 parameter [11:0] CSR_MHCR     = 12'h7C1;
+// MHINT -- confirmed aq_cp0_regs.v:851 (`parameter MHINT = 12'h7C5;`),
+// M3b Task D (PFB stride prefetch controls live here).
+parameter [11:0] CSR_MHINT    = 12'h7C5;
 
 // MHCR bit positions -- confirmed aq_cp0_ext_csr.v:670,694,696-725: the RHS
 // concat list of `mhcr_value[63:0] = {45'b0, sck[2:0], 3'b0, l0btbe, 3'b0,

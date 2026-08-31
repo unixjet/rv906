@@ -320,6 +320,14 @@ module IU (
     output wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc,
 
     //=========================================================================
+    // IU -> LSU : low 16 bits of the EX1 instruction's PC, consumed ONLY by
+    // the LSU's PFB stride-prefetch trainer as its PC tag (donor
+    // iu_lsu_ex1_cur_pc, aq_lsu_ag.v:196/685 -> dc_ld_pc, aq_lsu_dc.v:1459).
+    // M3b Task D. PC_WIDTH-wide tracker, sliced to [15:0] at the port.
+    //=========================================================================
+    output wire [15:0]              iu_lsu_ex1_cur_pc,
+
+    //=========================================================================
     // CP0 -> IU : BJU's reset PC seed (already exists as an M1 port on
     // RVProc.v, `cp0_xx_mrvbr` -- restore-checklist item 4, IU note S4.5).
     //=========================================================================
@@ -1267,5 +1275,8 @@ module IU (
     // SECTION OUTPUT -- CSR-facing PC passthrough (IU note S4.5/S9).
     //=========================================================================
     assign iu_cp0_ex1_cur_pc = bju_pcgen_pc;
+    // M3b Task D: PFB trainer's PC tag (donor aq_lsu_ag.v:685 takes the same
+    // EX1 PC the donor IU broadcasts here).
+    assign iu_lsu_ex1_cur_pc = bju_pcgen_pc[15:0];
 
 endmodule

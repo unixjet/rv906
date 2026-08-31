@@ -356,6 +356,7 @@ module RVProc #(
     wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
     wire                     idu_cp0_ex1_inst_len;   // Task 7.3
     wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
+    wire [15:0]              iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
 
     //=========================================================================
     // IU <-> RTU : the four separate writeback buses (contract 1) + RTU's
@@ -501,6 +502,9 @@ module RVProc #(
     wire                     cp0_lsu_dcache_en;
     wire                     cp0_lsu_mm;
     wire                     cp0_lsu_wa;
+    // M3b Task D: MHINT D-cache prefetch controls (CSR -> LSU PFB)
+    wire                     cp0_lsu_dcache_pref_en;
+    wire [1:0]               cp0_lsu_dcache_pref_dist;
 
     //=========================================================================
     // ICache instance
@@ -896,6 +900,7 @@ module RVProc #(
         .lsu_iu_ex2_dest_reg     (lsu_rtu_ex2_dest_reg),
 
         .iu_cp0_ex1_cur_pc       (iu_cp0_ex1_cur_pc),
+        .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr)
     );
@@ -932,6 +937,7 @@ module RVProc #(
         .idu_lsu_ex1_src2_ready  (idu_lsu_ex1_src2_ready),
         .idu_lsu_ex1_dst0_reg    (idu_lsu_ex1_dst0_reg),
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
+        .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
 
         .lsu_idu_full            (lsu_idu_full),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
@@ -974,6 +980,8 @@ module RVProc #(
         .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
         .cp0_lsu_mm              (cp0_lsu_mm),
         .cp0_lsu_wa              (cp0_lsu_wa),
+        .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
+        .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
 
         .axi_d_awvalid           (axi_d_awvalid),
         .axi_d_awready           (axi_d_awready),
@@ -1196,6 +1204,8 @@ module RVProc #(
         .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
         .cp0_lsu_mm              (cp0_lsu_mm),
         .cp0_lsu_wa              (cp0_lsu_wa),
+        .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
+        .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
         .cp0_lsu_dcache_clean    (cp0_lsu_dcache_clean),
         .lsu_cp0_clean_done      (lsu_cp0_clean_done),

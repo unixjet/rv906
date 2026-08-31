@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 //-----------------------------------------------------------------------------
 // FUNC encodings (rvproc_pkg.sv LSU_FUNC_*, confirmed bit-exact).
@@ -50,6 +51,12 @@ static uint64_t g_cycles = 0;
 static int g_cp0_lsu_mm         = 1;   // reset default per contract 3
 static int g_cp0_lsu_wa         = 0;   // reset default per contract 6
 static int g_cp0_lsu_dcache_en  = 1;   // this bench always runs "post-boot"
+// M3b Task D: MHINT prefetch controls + the IU's EX1 PC broadcast (the PFB
+// trainer's PC tag). pref_en defaults to the MHINT reset value (0 = off), so
+// every pre-Task-D test runs with the prefetcher fully disabled.
+static int g_cp0_lsu_pref_en    = 0;
+static int g_cp0_lsu_pref_dist  = 2;   // MHINT reset value
+static uint16_t g_ex1_pc        = 0;
 // AXI read latency (cycles from AR accept to R valid). Default 2 keeps the
 // legacy tests' timing; the non-blocking / hit-under-miss tests raise it so
 // a refill is observably "in flight" while other ops proceed.
@@ -90,9 +97,12 @@ struct AxiDSlave {
     // a decoupled dirty-victim writeback must show the refill READ accepted
     // before the victim WRITE, the reverse of the old inline flow).
     uint64_t last_read_cycle = 0, last_write_cycle = 0;
+    // Every accepted AR address (T11: prove prefetch reads land AHEAD of
+    // demand -- on lines the demand sequence never asked for).
+    std::unordered_set<uint64_t> read_addrs;
 
     void reset() { b_pending = false; r_pending = false; reads = 0; writes = 0;
-                   last_read_cycle = 0; last_write_cycle = 0; }
+                   last_read_cycle = 0; last_write_cycle = 0; read_addrs.clear(); }
 
     void step(VLSU *d)
     {
@@ -119,6 +129,7 @@ struct AxiDSlave {
             last_araddr = r_addr;
             reads++;
             last_read_cycle = g_cycles;
+            read_addrs.insert(r_addr);
             r_pending = true; r_cnt = g_axi_rd_lat;
         } else if (r_pending && r_cnt > 0) {
             r_cnt--;
@@ -183,6 +194,9 @@ static void drive_csr(void)
     dut->cp0_lsu_dcache_en = g_cp0_lsu_dcache_en;
     dut->cp0_lsu_mm        = g_cp0_lsu_mm;
     dut->cp0_lsu_wa        = g_cp0_lsu_wa;
+    dut->cp0_lsu_dcache_pref_en   = g_cp0_lsu_pref_en;
+    dut->cp0_lsu_dcache_pref_dist = g_cp0_lsu_pref_dist;
+    dut->iu_lsu_ex1_cur_pc = g_ex1_pc;   // M3b Task D: PFB trainer's PC tag
     dut->rtu_lsu_expt_ack  = 0;
     dut->rtu_lsu_expt_exit = 0;
 }
@@ -865,6 +879,100 @@ static void test_vb_decoupled_dirty_writeback(void)
     test_result("T10 VB decoupling: refill read ahead of dirty-victim writeback");
 }
 
+// T11 (M3b Task D): PFB stride prefetch (donor aq_lsu_pfb_top/aq_lsu_pfb,
+// gated by MHINT.pref_en). With prefetch enabled, a striding load sequence
+// (same PC, +1-line stride) trains a PC entry and, once confirmed, the PFB
+// must prefetch AHEAD of demand:
+//   (a) AXI reads appear for lines the demand sequence never requested
+//       (past the last demanded line),
+//   (b) a later demand load to an already-prefetched line completes as a
+//       cache HIT (correct data, no new AXI read),
+//   (c) with pref_en=0 the SAME sequence issues exactly the demand reads --
+//       no prefetch traffic at all.
+static void test_pfb_stride_prefetch(void)
+{
+    g_cp0_lsu_pref_en   = 1;
+    g_cp0_lsu_pref_dist = 2;      // reset default: lookahead = stride << 2
+    g_ex1_pc            = 0x1234; // all training loads share one PC
+
+    const uint64_t BASE   = 0x00000000800A0800ULL;   // sets 32..47 (unused so far)
+    const int NLINES = 16;
+    uint64_t line[NLINES];
+    for (int i = 0; i < NLINES; i++) {
+        line[i] = BASE + (uint64_t)i * 64;
+        uint64_t pat = 0xA5A5A5A5A5A50000ULL | (uint64_t)i;
+        for (int b = 0; b < 8; b++) mem_wr(line[i] + b, (uint8_t)(pat >> (b * 8)));
+    }
+
+    // ---- Phase A: pref_en=1 -- demand loads 0..7, prefetch runs ahead ----
+    std::unordered_set<uint64_t> reads_before = g_slave.read_addrs;
+    for (int i = 0; i < 8; i++) {
+        LsuResult r = do_op(F_LD, line[i], 0, 0, 5);
+        check(r.cmplt && r.wb_data == (0xA5A5A5A5A5A50000ULL | (uint64_t)i),
+              "demand load completes with correct data (prefetch enabled)",
+              r.wb_data, 0xA5A5A5A5A5A50000ULL | (uint64_t)i);
+        settle(6);
+    }
+    settle(120);   // let every in-flight prefetch fill drain
+
+    // At least one AXI read landed PAST the demand sequence's last line.
+    bool ahead = false;
+    uint64_t ahead_addr = 0;
+    for (uint64_t a : g_slave.read_addrs) {
+        if (reads_before.count(a)) continue;          // only this phase's reads
+        if (a >= line[8] && a < BASE + (uint64_t)NLINES * 64) { ahead = true; ahead_addr = a; }
+    }
+    check(ahead, "prefetcher read at least one line AHEAD of the demand sequence",
+          (uint64_t)ahead, 1);
+
+    // ---- Phase B: demand load to an already-prefetched line is a HIT ----
+    if (ahead) {
+        int reads_before_hit = g_slave.reads;
+        LsuResult h = do_op(F_LD, ahead_addr, 0, 0, 5);
+        int idx = (int)((ahead_addr - BASE) / 64);
+        check(h.cmplt && h.wb_data == (0xA5A5A5A5A5A50000ULL | (uint64_t)idx),
+              "demand load to a prefetched line returns correct data",
+              h.wb_data, 0xA5A5A5A5A5A50000ULL | (uint64_t)idx);
+        check(g_slave.reads == reads_before_hit,
+              "... and it was a cache HIT (no new AXI read needed)",
+              (uint64_t)g_slave.reads, (uint64_t)reads_before_hit);
+        settle(10);
+    }
+
+    // ---- Phase C: pref_en=0 -- identical sequence, zero prefetch ----
+    g_cp0_lsu_pref_en = 0;
+    settle(10);   // clearing pref_en flushes the PFB (donor pfb_top.v:363-367)
+    // In-flight prefetch LFB entries survive that flush and drain their
+    // refills (the donor kills the PFB trackers, not pending fills) -- and
+    // Phase B's own load retrained the still-enabled PFB one last time, so
+    // wait long enough for every queued entry to drain (they activate in
+    // FIFO order, ~13 cycles apart -- a flat 300 covers a full LFB) before
+    // counting.
+    settle(300);
+
+    const uint64_t BASE2 = 0x00000000800A1000ULL;    // sets 64..71 (clean)
+    for (int i = 0; i < 8; i++) {
+        uint64_t l2 = BASE2 + (uint64_t)i * 64;
+        uint64_t pat = 0x5A5A5A5A5A5A0000ULL | (uint64_t)i;
+        for (int b = 0; b < 8; b++) mem_wr(l2 + b, (uint8_t)(pat >> (b * 8)));
+    }
+    int reads_phase_c = g_slave.reads;
+    for (int i = 0; i < 8; i++) {
+        LsuResult r = do_op(F_LD, BASE2 + (uint64_t)i * 64, 0, 0, 5);
+        check(r.cmplt && r.wb_data == (0x5A5A5A5A5A5A0000ULL | (uint64_t)i),
+              "pref_en=0: demand load completes with correct data",
+              r.wb_data, 0x5A5A5A5A5A5A0000ULL | (uint64_t)i);
+        settle(6);
+    }
+    settle(40);
+    check(g_slave.reads == reads_phase_c + 8,
+          "pref_en=0: exactly the 8 demand reads -- no prefetch traffic",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_phase_c + 8));
+
+    g_ex1_pc = 0;
+    test_result("T11 PFB stride prefetch: trains, prefetches ahead, hits; off=quiet");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -885,6 +993,7 @@ int main(int argc, char **argv)
     test_miss_inflight_replay();    // M3b Task A rework: same-line replay, no corruption
     test_lfb_full_backpressure();   // M3b Task A rework: 8-entry LFB-full backpressure
     test_vb_decoupled_dirty_writeback();   // M3b Task B/C: single-entry VB decoupling
+    test_pfb_stride_prefetch();            // M3b Task D: PFB stride prefetch + MHINT
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

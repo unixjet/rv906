@@ -175,6 +175,10 @@ module CSR #(
     output wire                     cp0_lsu_dcache_en,
     output wire                     cp0_lsu_mm,
     output wire                     cp0_lsu_wa,
+    // M3b Task D: MHINT D-cache prefetch controls (donor aq_cp0_ext_csr.v
+    // :861,:868) routed to the LSU's PFB.
+    output wire                     cp0_lsu_dcache_pref_en,
+    output wire [1:0]               cp0_lsu_dcache_pref_dist,
     // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1): FENCE/FENCE.I
     // hold in EX1 while this is low -- stores must reach their completion
     // point before the fence's I-side invalidate (or any later observer) may
@@ -630,6 +634,65 @@ module CSR #(
     wire [63:0] mxstatus_value = {48'b0, mm, 15'b0};
 
     //=========================================================================
+    // SECTION MHINT -- M hint register (donor aq_cp0_ext_csr.v:840-914, CSR
+    // address aq_cp0_regs.v:851). M3b Task D: the D-cache stride prefetcher
+    // (PFB) is controlled from here. Bit-exact donor layout of the WRITABLE
+    // fields:
+    //   bit 2     dcache_pref_en    (reset 0)  -- enables the PFB; clearing
+    //                                             it flushes all PFB entries
+    //                                             (pfb_top.v:363-367)
+    //   bits 4:3  amr               (reset 0)  -- write-allocate disabler,
+    //                                             storage only until M3b Task E
+    //   bit 8     icache_pref_en    (reset 0)  -- storage only: rv906's IFU
+    //                                             has no prefetcher structure
+    //   bit 10    iwpe              (reset 0)  -- storage only (branch-pred
+    //                                             weight enhancement, no rv906
+    //                                             consumer)
+    //   bits 14:13 dcache_pref_dist (reset 2'b10) -- PFB lookahead distance
+    //                                             = stride << dist (pfb.v:494)
+    //   bit 24    pcfifo_freeze     (reset 0)  -- storage only (no rv906
+    //                                             consumer)
+    // Every other MHINT bit reads 0 (donor ties them off at :905-910).
+    //=========================================================================
+    reg        mhint_dcache_pref_en;
+    reg [1:0]  mhint_amr;
+    reg        mhint_icache_pref_en;
+    reg        mhint_iwpe;
+    reg [1:0]  mhint_dcache_pref_dist;
+    reg        mhint_pcfifo_freeze;
+    wire mhint_local_en = csr_wen && (csr_addr == CSR_MHINT);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            mhint_dcache_pref_en   <= 1'b0;
+            mhint_amr              <= 2'b0;
+            mhint_icache_pref_en   <= 1'b0;
+            mhint_iwpe             <= 1'b0;
+            mhint_dcache_pref_dist <= 2'b10;   // donor reset, ext_csr.v:868
+            mhint_pcfifo_freeze    <= 1'b0;
+        end else if (mhint_local_en) begin
+            mhint_dcache_pref_en   <= csr_wdata[2];
+            mhint_amr              <= csr_wdata[4:3];
+            mhint_icache_pref_en   <= csr_wdata[8];
+            mhint_iwpe             <= csr_wdata[10];
+            mhint_dcache_pref_dist <= csr_wdata[14:13];
+            mhint_pcfifo_freeze    <= csr_wdata[24];
+        end
+    end
+
+    // Donor read-value layout (ext_csr.v:909-912): {32'b0, 7'b0,
+    // pcfifo_freeze, 2'b0, tlb_broad_dis, l2stpld, ecc_en, nsfe,
+    // l2_pref_dist[1:0], l2pld, dcache_pref_dist[1:0], 1'b0, sre, iwpe,
+    // lpe, icache_pref_en, 2'b0, amr2, amr[1:0], dcache_pref_en, 2'b0}
+    // -- all unmodeled fields tied 0 (ext_csr.v:905-910).
+    wire [63:0] mhint_value = {32'b0, 7'b0, mhint_pcfifo_freeze, 2'b0,
+                               1'b0, 1'b0, 1'b0,
+                               1'b0, 2'b0, 1'b0,
+                               mhint_dcache_pref_dist, 1'b0, 1'b0,
+                               mhint_iwpe, 1'b0, mhint_icache_pref_en, 2'b0, 1'b0,
+                               mhint_amr, mhint_dcache_pref_en, 2'b0};
+
+    //=========================================================================
     // SECTION READ MUX -- the generic address-decoded read bus every RMW
     // (and every plain CSR read) goes through (CP0 note B1's "hybrid" bus).
     // Unimplemented addresses read 0 -- IDU (Task 5) is the one that must
@@ -656,6 +719,7 @@ module CSR #(
             CSR_MHARTID:   csr_read_mux = mhartid_value;
             CSR_MXSTATUS:  csr_read_mux = mxstatus_value;
             CSR_MHCR:      csr_read_mux = mhcr_value;
+            CSR_MHINT:     csr_read_mux = mhint_value;
             default:       csr_read_mux = 64'd0;
         endcase
     endfunction
@@ -761,6 +825,9 @@ module CSR #(
     assign cp0_lsu_dcache_en = mhcr_de;
     assign cp0_lsu_mm        = mm;
     assign cp0_lsu_wa        = mhcr_wa;
+    // M3b Task D: MHINT prefetch controls to the LSU's PFB (ext_csr.v:861/868)
+    assign cp0_lsu_dcache_pref_en   = mhint_dcache_pref_en;
+    assign cp0_lsu_dcache_pref_dist = mhint_dcache_pref_dist;
 
     assign cp0_xx_mrvbr = RESET_VECTOR[PC_WIDTH-1:0];
 

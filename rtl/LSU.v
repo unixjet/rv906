@@ -96,6 +96,10 @@ module LSU #(
     // slice -- latched with the in-flight instruction, reported back to the
     // RTU's pcgen inst_len mux (aq_rtu_dp.v:367 lsu arm).
     input  wire                     idu_lsu_ex1_inst_len,
+    // M3b Task D: the EX1 instruction's PC[15:0] from the IU, latched into
+    // the DC stage as the PFB trainer's PC tag (donor iu_lsu_ex1_cur_pc,
+    // aq_lsu_ag.v:196/685 -> ag_pipe_pc -> dc_ld_pc, aq_lsu_dc.v:1459).
+    input  wire [15:0]              iu_lsu_ex1_cur_pc,
 
     //=========================================================================
     // LSU -> IDU : the single EX1 issue-gate stall signal (contract 8;
@@ -187,6 +191,10 @@ module LSU #(
     input  wire                     cp0_lsu_dcache_en,
     input  wire                     cp0_lsu_mm,
     input  wire                     cp0_lsu_wa,
+    // M3b Task D: MHINT D-cache prefetch controls (donor aq_cp0_ext_csr.v
+    // :861,:868) feeding the PFB stride prefetcher below.
+    input  wire                     cp0_lsu_dcache_pref_en,
+    input  wire [1:0]               cp0_lsu_dcache_pref_dist,
 
     //=========================================================================
     // AXI Master Interface - DCache (ch[1]) -- copied verbatim from
@@ -420,6 +428,7 @@ module LSU #(
     // Task 7.3: length of the in-flight LSU instruction, latched on issue
     // (1=32b,0=16b RVC); reported as lsu_rtu_ex1_inst_len at completion.
     reg                     dc_inst_len_r;
+    reg  [15:0]             dc_pc_r;        // M3b Task D: PFB trainer PC tag
     reg        dc_is_drain_r /* verilator public */;
     reg [1:0]  dc_drain_idx_r;
     reg        dc_wa_r;
@@ -662,6 +671,7 @@ module LSU #(
             dc_misalign_r   <= 1'b0;
             dc_dst0_reg_r   <= {GPR_IDX_WIDTH{1'b0}};
             dc_inst_len_r   <= 1'b0;
+            dc_pc_r         <= 16'd0;
             dc_is_drain_r   <= 1'b0;
             dc_drain_idx_r  <= 2'd0;
             dc_wa_r         <= 1'b0;
@@ -692,6 +702,7 @@ module LSU #(
                         dc_misalign_r   <= ag_misalign;
                         dc_dst0_reg_r   <= idu_lsu_ex1_dst0_reg;
                         dc_inst_len_r   <= idu_lsu_ex1_inst_len;
+                        dc_pc_r         <= iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
                         dc_touched_array_r <= touches_array;
@@ -1038,6 +1049,15 @@ module LSU #(
     reg [2:0]  lfb_dw_off   [0:LFB_DEPTH-1];
     reg [DCACHE_TAG_WIDTH-1:0] lfb_tag   [0:LFB_DEPTH-1];
     reg [DCACHE_INDEX_W-1:0]   lfb_index [0:LFB_DEPTH-1];
+    // M3b Task D: prefetch-allocated entries (donor lfb.v's lfb_pf per-entry
+    // attribute, carried on the create bus from pfb_top.v:414). A prefetch
+    // entry refills exactly like a demand miss but drains SILENTLY (no RTU
+    // completion/writeback), and if its activation-time D-cache re-read finds
+    // the line already resident it completes without any refill at all
+    // (donor rdl.v:627 pf_cache_hit -> rdl_lfb_cmplt at CHECK).
+    reg        lfb_pf      [0:LFB_DEPTH-1];
+    reg [4:0]  lfb_pfb_id  [0:LFB_DEPTH-1];   // one-hot PFB entry id, for the
+                                              // cache_hit/miss fill feedback
 
     reg [3:0] lfb_head_ptr;   // [2:0] entry index, [3] wrap bit
     reg [3:0] lfb_tail_ptr;
@@ -1050,6 +1070,12 @@ module LSU #(
     // the donor's own RDL-time, not LFB-creation-time, victim lookup).
     reg [WAYS-1:0] lfb_way_vld_r;
     reg [WAYS-1:0] lfb_way_dirty_r;
+    // M3b Task D: activation-time D-cache residency for the active entry's
+    // line -- the activation peek already requests the entry's own tag/index,
+    // so |u_dc_resp_hit_way| on its response is the donor's RDL-time prefetch
+    // tag compare (rdl.v:609-627) for free. A PREFETCH entry that hits here
+    // completes without any refill (rdl_lfb_cmplt at CHECK on pf_cache_hit).
+    reg            lfb_dc_hit_r;
     // Dedicated capture of the active entry's refill dword, latched the
     // cycle its background refill commits (lfb_rf_done_set). frz_rdata_r is
     // shared with any later op's own miss/refill (same miss_state FSM);
@@ -1135,11 +1161,103 @@ module LSU #(
     // can fire, so this offset is already valid the cycle the refill commits.
     wire [8:0] lfb_dword_bitoff = {6'b0, lfb_dw_off[lfb_head_idx]} << 6;
 
+    //-------------------------------------------------------------------------
+    // SECTION PFB -- M3b Task D: PC-indexed stride prefetcher (donor
+    // aq_lsu_pfb_top.v + aq_lsu_pfb.v, see rtl/PFB.v for the port and its
+    // adaptation notes). Trained by cacheable load MISSES at ST_DCS (donor
+    // dc_pfb_*, aq_lsu_dc.v:1881-1899); a confirmed stride issues prefetch
+    // requests that allocate LFB entries here -- demand always wins
+    // (lfb.v:673,730), and a request whose line is already covered in the
+    // LFB/STB/VB or is the in-flight demand line is suppressed at grant time
+    // (pfb_top.v:395-396). The authoritative "line already resident" check
+    // happens at activation time (MS_LFB_PEEK_*, mirroring the donor's
+    // RDL-time prefetch tag compare, rdl.v:609-627), completing such an
+    // entry without a refill and reporting cache_hit feedback.
+    //-------------------------------------------------------------------------
+    // Training event: one cacheable plain-load DC-stage lookup (hit OR miss
+    // -- donor trains entries on every load; only CREATION needs a miss).
+    // !dc_wait_lfb_r scopes the pulse to this op's OWN probe response: while
+    // an op is parked here, the shared (unscoped) D-cache response bus also
+    // carries background-refill traffic, which must not be counted as loads
+    // (same hazard the latched-dc_hit_r retry note above documents).
+    wire pfb_ld_vld_c
+         = (state == ST_DCS) && u_dc_resp_vld && !dc_wait_lfb_r
+           && dc_touched_array_r && dc_plain_ld_r && dc_ca_r && !dc_is_drain_r;
+    wire pfb_ld_miss_c = !dc_hit_c;
+
+    // Granted request out of the PFB (already suppression-checked inside).
+    wire        pfb_req;
+    wire [39:0] pfb_req_pa;
+    wire [4:0]  pfb_req_id;
+
+    wire [DCACHE_TAG_WIDTH-1:0] pfb_req_tag   = pfb_req_pa[39:13];
+    wire [DCACHE_INDEX_W-1:0]   pfb_req_index = pfb_req_pa[12:6];
+
+    // Suppression compares (donor pfb_top.v:395-396 hit_idx inputs):
+    //  lfb: pfb_hit_lfb_idx OR-tree (lfb.v:729)
+    //  stb: pfb_hit_stb_idx       (stb.v:615)
+    //  vb : line == vb_addr & vb_vld (vb.v:490)
+    //  dc : line == the demand line currently occupying the pipe (dc.v:1901)
+    reg pfb_lfb_hit_c, pfb_stb_hit_c;
+    always @* begin
+        pfb_lfb_hit_c = 1'b0;
+        pfb_stb_hit_c = 1'b0;
+        for (lfb_i = 0; lfb_i < LFB_DEPTH; lfb_i = lfb_i + 1) begin
+            if ((lfb_state[lfb_i] != E_IDLE)
+                && (lfb_tag[lfb_i] == pfb_req_tag) && (lfb_index[lfb_i] == pfb_req_index))
+                pfb_lfb_hit_c = 1'b1;
+        end
+        for (lfb_i = 0; lfb_i < 4; lfb_i = lfb_i + 1) begin
+            if (stb_vld[lfb_i]
+                && (stb_tag[lfb_i] == pfb_req_tag) && (stb_index[lfb_i] == pfb_req_index))
+                pfb_stb_hit_c = 1'b1;
+        end
+    end
+    wire pfb_vb_hit = vb_vld && (vb_tag_r == pfb_req_tag) && (vb_index_r == pfb_req_index);
+    wire pfb_dc_hit = (state != ST_IDLE) && dc_ca_r
+                      && (dc_tag_r == pfb_req_tag) && (dc_index_r == pfb_req_index);
+
+    // Raw grant (donor lfb_pfb_grant = !lfb_full & !dc_sel, lfb.v:730):
+    // a slot is free and no demand miss is creating one this cycle.
+    wire pfb_grant_c = !lfb_full && !lfb_defer_fire && !clean_active;
+
+    // Fill feedback (donor lfb_pfb_cache_hit/miss, lfb.v:842-843): one-hot
+    // id pulses when a prefetch entry completes -- cache_hit if the line was
+    // already resident (activation-time drop, below), cache_miss if it
+    // genuinely refilled.
+    wire lfb_pf_drop_c = (miss_state == MS_IDLE) && lfb_engine_active
+                         && lfb_pf[lfb_head_idx] && lfb_dc_hit_r;
+    reg  lfb_pf_drop_r;   // held through the drop's MS_DONE cycle so the
+                          // completion reports cache_HIT, not cache_miss
+    wire [4:0] pfb_fb_hit  = lfb_pf_drop_c            ? lfb_pfb_id[lfb_head_idx] : 5'b0;
+    wire [4:0] pfb_fb_miss  = (lfb_rf_done_set && lfb_pf[lfb_head_idx] && !lfb_pf_drop_r)
+                              ? lfb_pfb_id[lfb_head_idx] : 5'b0;
+
+    PFB u_pfb (
+        .clk(clk), .rst_n(rst_n),
+        .cp0_lsu_dcache_en(cp0_lsu_dcache_en),
+        .cp0_lsu_dcache_pref_en(cp0_lsu_dcache_pref_en),
+        .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
+        .clean_active(clean_active),
+        .pfb_ld_vld(pfb_ld_vld_c), .pfb_ld_miss(pfb_ld_miss_c),
+        .pfb_ld_pc(dc_pc_r), .pfb_ld_chk_pa(dc_addr_r[39:0]),
+        .lfb_grant(pfb_grant_c),
+        .lfb_hit_idx(pfb_lfb_hit_c), .stb_hit_idx(pfb_stb_hit_c),
+        .vb_hit_idx(pfb_vb_hit), .dc_hit_idx(pfb_dc_hit),
+        .lfb_fb_hit(pfb_fb_hit), .lfb_fb_miss(pfb_fb_miss),
+        .pfb_req(pfb_req), .pfb_req_pa(pfb_req_pa), .pfb_req_id(pfb_req_id)
+    );
+
+    // Prefetch create: mutually exclusive with the demand create above by
+    // pfb_grant_c's !lfb_defer_fire term (donor create mux, lfb.v:673).
+    wire pfb_create_fire = pfb_req && !lfb_full;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             lfb_head_ptr <= 4'd0;
             lfb_tail_ptr <= 4'd0;
             lfb_rdata_r  <= 64'd0;
+            lfb_pf_drop_r <= 1'b0;
             for (lfb_i = 0; lfb_i < LFB_DEPTH; lfb_i = lfb_i + 1) begin
                 lfb_state[lfb_i]    <= E_IDLE;
                 lfb_addr[lfb_i]     <= 64'd0;
@@ -1150,6 +1268,8 @@ module LSU #(
                 lfb_dw_off[lfb_i]   <= 3'd0;
                 lfb_tag[lfb_i]      <= {DCACHE_TAG_WIDTH{1'b0}};
                 lfb_index[lfb_i]    <= {DCACHE_INDEX_W{1'b0}};
+                lfb_pf[lfb_i]       <= 1'b0;
+                lfb_pfb_id[lfb_i]   <= 5'b0;
             end
         end else begin
             // Tail side: allocate a new entry. Independent of the head-side
@@ -1164,6 +1284,24 @@ module LSU #(
                 lfb_dw_off[lfb_tail_idx]   <= dc_dw_off_r;
                 lfb_tag[lfb_tail_idx]      <= dc_tag_r;
                 lfb_index[lfb_tail_idx]    <= dc_index_r;
+                lfb_pf[lfb_tail_idx]       <= 1'b0;
+                lfb_pfb_id[lfb_tail_idx]   <= 5'b0;
+                lfb_state[lfb_tail_idx]    <= E_PENDING;
+                lfb_tail_ptr <= lfb_tail_ptr + 4'd1;
+            end else if (pfb_create_fire) begin
+                // M3b Task D: prefetch allocation (donor lfb.v:673's create
+                // mux, pfb side). Line-based address, no writeback context
+                // (dst/size/offsets unused -- a prefetch drains silently).
+                lfb_addr[lfb_tail_idx]     <= {24'b0, pfb_req_pa};
+                lfb_dst[lfb_tail_idx]      <= {GPR_IDX_WIDTH{1'b0}};
+                lfb_size[lfb_tail_idx]     <= 2'd3;
+                lfb_sign_ext[lfb_tail_idx] <= 1'b0;
+                lfb_byte_off[lfb_tail_idx] <= 3'd0;
+                lfb_dw_off[lfb_tail_idx]   <= 3'd0;
+                lfb_tag[lfb_tail_idx]      <= pfb_req_tag;
+                lfb_index[lfb_tail_idx]    <= pfb_req_index;
+                lfb_pf[lfb_tail_idx]       <= 1'b1;
+                lfb_pfb_id[lfb_tail_idx]   <= pfb_req_id;
                 lfb_state[lfb_tail_idx]    <= E_PENDING;
                 lfb_tail_ptr <= lfb_tail_ptr + 4'd1;
             end
@@ -1247,6 +1385,7 @@ module LSU #(
             frz_rdata_r    <= 512'd0;
             lfb_way_vld_r   <= {WAYS{1'b0}};
             lfb_way_dirty_r <= {WAYS{1'b0}};
+            lfb_dc_hit_r    <= 1'b0;
         end else begin
             // one-cycle-late AW/W accept bookkeeping (shared by every write use)
             if (axi_w_active) begin
@@ -1269,11 +1408,22 @@ module LSU #(
                         if (u_dc_resp_vld) begin
                             lfb_way_vld_r   <= u_dc_resp_way_vld;
                             lfb_way_dirty_r <= u_dc_resp_way_dirty;
+                            lfb_dc_hit_r    <= |u_dc_resp_hit_way;
                             miss_state <= MS_IDLE;
                         end
                     end
                     MS_IDLE: begin
-                        if (frz_is_direct_r && !lfb_engine_active) begin
+                        if (lfb_engine_active && lfb_pf[lfb_head_idx] && lfb_dc_hit_r) begin
+                            // M3b Task D: prefetch target is ALREADY resident
+                            // (found by the activation re-read) -- complete
+                            // with no refill, exactly the donor's RDL
+                            // pf_cache_hit early completion (rdl.v:627,634).
+                            // lfb_pf_drop_r (set here, cleared at the next
+                            // activation) makes the completion pulse report
+                            // cache_HIT feedback to the PFB entry.
+                            lfb_pf_drop_r <= 1'b1;
+                            miss_state <= MS_DONE;
+                        end else if (frz_is_direct_r && !lfb_engine_active) begin
                             if (dc_is_store_r) begin
                                 if (vb_vld) begin
                                     // M3b Task B/C: wait for the single-entry
@@ -1388,6 +1538,7 @@ module LSU #(
                     // lfb_state[head] E_PENDING->E_ACTIVE this same edge;
                     // miss_state starts the activation-time way_vld/dirty
                     // re-read next.
+                    lfb_pf_drop_r <= 1'b0;   // fresh activation: no drop pending
                     miss_state <= MS_LFB_PEEK_ISSUE;
                 end else begin
                     if (miss_state != MS_IDLE) miss_state <= MS_IDLE;
@@ -2002,7 +2153,8 @@ module LSU #(
     wire miss_done_latched = 1'b1;   // FRZ always fully drains before REPLY is entered
 
     assign lsu_rtu_ex1_cmplt_dp   = ((state == ST_REPLY) && reply_can_complete && !dc_is_drain_r)
-                                    || lfb_cmplt_fire;   // M3b: deferred-load completion
+                                    || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // M3b: deferred-load
+                                    // completion; a PREFETCH entry drains silently (no instruction)
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
     // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
     // ag_pipe_cmplt_normal ~ ag_pipe_inst_vld && dt_fsm_idle). In this
@@ -2021,7 +2173,8 @@ module LSU #(
     // scrambled branch PCs from test 18 onward).
     assign lsu_rtu_ex1_inst_len   = idu_lsu_ex1_inst_len;
 
-    assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign) || lfb_cmplt_fire;
+    assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign)
+                             || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // prefetch drains silently
     // W-width AMOs write back the OLD value sign-extended (da_final arrives
     // zero-extended since the AMO func leaves the sign bit clear); amo_active
     // is still asserted this ST_REPLY cycle (cleared by NBA at the edge).
