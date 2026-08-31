@@ -1065,6 +1065,61 @@ static void test_amr_streaming_store(void)
     test_result("T12 AMR streaming stores: wa disabled after training; off=allocate");
 }
 
+// T13 (M3b Task F): STB-forward-under-miss. A store to a line whose miss is
+// still in flight parks behind the deferred load's LFB entry (replay, donor
+// lfb.v:722-726), the deferred load completes with the refill data, then
+// the store retries, refills and lands in the STB -- and a subsequent load
+// returns the stored data (STB forward / drained array), all with exactly
+// the expected bus traffic.
+static void test_stb_forward_under_miss(void)
+{
+    g_cp0_lsu_pref_en = 0;
+    g_cp0_lsu_wa      = 1;
+    const uint64_t LINE = 0x00000000800E0000ULL;   // cold line, set 0 tag space
+    const uint64_t SVAL = 0xFEEDFACEFEEDFACEULL;
+
+    int reads_before = g_slave.reads;
+
+    // Load misses and defers into the LFB (non-blocking).
+    issue_only(F_LD, LINE, 0, 0, 5);
+
+    // Store to the SAME line while the miss is in flight: it probes, misses,
+    // sees the in-flight LFB entry (lfb_addr_hit) and parks behind it.
+    issue_only(F_SD, LINE, 0, SVAL, 0);
+
+    // The deferred load completes first, with memory's (zero) data.
+    LsuResult a = wait_completion(5, 600);
+    check(a.cmplt && a.wb_data == 0,
+          "deferred load completes with refill data while store parked",
+          a.wb_data, 0);
+
+    // The parked store retries once the entry drains: refills the line
+    // (redundant but correct -- replay-not-merge) and lands in the STB.
+    LsuResult s = wait_completion(0, 600);
+    check(s.cmplt, "parked store retries and completes after the entry drains",
+          (uint64_t)s.cmplt, 1);
+
+    // Load again: the stored data must be visible (STB forward or drained
+    // array), with no further bus read.
+    int rb = g_slave.reads;
+    LsuResult b = do_op(F_LD, LINE, 0, 0, 5);
+    check(b.cmplt && b.wb_data == SVAL,
+          "subsequent load returns the store's data (forward under miss)",
+          b.wb_data, SVAL);
+    check(g_slave.reads == rb, "... as a hit (no new read)",
+          (uint64_t)g_slave.reads, (uint64_t)rb);
+
+    // Exactly two reads for the whole sequence: the load's refill and the
+    // store's retry refill.
+    check(g_slave.reads == reads_before + 2,
+          "exactly two refill reads (load miss + store retry)",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 2));
+
+    settle(20);
+    g_cp0_lsu_wa = 0;
+    test_result("T13 STB forward under miss: store parks, retries, data visible");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -1087,6 +1142,7 @@ int main(int argc, char **argv)
     test_vb_decoupled_dirty_writeback();   // M3b Task B/C: single-entry VB decoupling
     test_pfb_stride_prefetch();            // M3b Task D: PFB stride prefetch + MHINT
     test_amr_streaming_store();            // M3b Task E: AMR write-allocate disabler
+    test_stb_forward_under_miss();         // M3b Task F: store-under-miss consolidation
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
