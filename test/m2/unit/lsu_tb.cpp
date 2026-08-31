@@ -86,8 +86,13 @@ struct AxiDSlave {
     bool     r_pending = false; int r_cnt = 0; uint64_t r_addr = 0;
     int      reads = 0, writes = 0;
     uint64_t last_awaddr = 0, last_araddr = 0;
+    // Cycle stamps of the most recent AR/AW acceptance (T10 decoupling check:
+    // a decoupled dirty-victim writeback must show the refill READ accepted
+    // before the victim WRITE, the reverse of the old inline flow).
+    uint64_t last_read_cycle = 0, last_write_cycle = 0;
 
-    void reset() { b_pending = false; r_pending = false; reads = 0; writes = 0; }
+    void reset() { b_pending = false; r_pending = false; reads = 0; writes = 0;
+                   last_read_cycle = 0; last_write_cycle = 0; }
 
     void step(VLSU *d)
     {
@@ -103,6 +108,7 @@ struct AxiDSlave {
             }
             last_awaddr = addr;
             writes++;
+            last_write_cycle = g_cycles;
             b_pending = true; b_cnt = 2;
         } else if (b_pending && b_cnt > 0) {
             b_cnt--;
@@ -112,6 +118,7 @@ struct AxiDSlave {
             r_addr = d->axi_d_araddr;
             last_araddr = r_addr;
             reads++;
+            last_read_cycle = g_cycles;
             r_pending = true; r_cnt = g_axi_rd_lat;
         } else if (r_pending && r_cnt > 0) {
             r_cnt--;
@@ -779,6 +786,85 @@ static void test_lfb_full_backpressure(void)
     test_result("T9 LFB-full backpressure: 9th miss held until a slot frees, all 9 complete correctly");
 }
 
+// T10 (M3b Task B/C): single-entry victim buffer decouples the dirty-victim
+// writeback from the refill (donor aq_lsu_rdl.v CHECK->WVB + aq_lsu_vb.v
+// :135-148). A load that misses on a set whose 4 ways all hold DIRTY lines
+// must evict one of them. Asserts:
+//   (a) DECOUPLING: the refill READ is accepted by the slave BEFORE the
+//       victim writeback is even accepted -- the old inline flow issued the
+//       write first and held the refill until the writeback's B response, so
+//       this ordering is the observable signature of the VB handoff;
+//   (b) exactly one writeback + one refill read for the one eviction;
+//   (c) the evicted line's dirty data reaches golden memory intact;
+//   (d) a reload of the evicted address misses again (fresh AXI read) and
+//       returns the written-back value.
+// Uses set index 1 (base bit [12:6] = 1) so the setup starts from an empty
+// set regardless of what earlier tests left in index 0.
+static void test_vb_decoupled_dirty_writeback(void)
+{
+    g_cp0_lsu_wa = 1;   // write-allocate so the setup stores allocate + dirty
+    const uint64_t SET_BASE = 0x0000000080090040ULL;   // index 1, clean slate
+    const uint64_t STRIDE   = 0x2000ULL;               // same index, new tag
+    uint64_t lines[5];
+    for (int i = 0; i < 5; i++) lines[i] = SET_BASE + (uint64_t)i * STRIDE;
+
+    uint64_t patterns[4] = {
+        0xA5A5A5A5A5A5A5A5ULL, 0x5A5A5A5A5A5A5A5AULL,
+        0x0F0F0F0F0F0F0F0FULL, 0xF0F0F0F0F0F0F0F0ULL,
+    };
+    for (int i = 0; i < 4; i++) {
+        LsuResult r = do_op(F_SD, lines[i], 0, patterns[i], 0);
+        check(r.cmplt && !r.expt_vld, "setup store dirties a line (cold miss+refill+alloc)",
+              r.cmplt && !r.expt_vld, 1);
+        settle(25);   // let each store drain so the line is genuinely dirty
+                      // in the array before the eviction decision reads it
+    }
+    int leaked = 0;
+    for (int i = 0; i < 4; i++) if (mem_read64(lines[i]) == patterns[i]) leaked++;
+    check(leaked == 0, "all 4 dirty lines still only in the cache (no premature writeback)",
+          (uint64_t)leaked, 0);
+
+    int reads_before  = g_slave.reads;
+    int writes_before = g_slave.writes;
+
+    LsuResult r5 = do_op(F_LD, lines[4], 0, 0, 5);
+    check(r5.cmplt, "eviction-forcing load completes", r5.cmplt, 1);
+    check(r5.wb_data == 0, "the newly-refilled line reads as zero (never written)",
+          r5.wb_data, 0);
+    settle(30);   // let the VB drain fully (writeback retires on B response)
+
+    check(g_slave.writes == writes_before + 1, "exactly one writeback for the one eviction",
+          (uint64_t)g_slave.writes, (uint64_t)(writes_before + 1));
+    check(g_slave.reads == reads_before + 1, "exactly one refill read for the miss",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 1));
+    check(g_slave.last_read_cycle < g_slave.last_write_cycle,
+          "DECOUPLED: refill read accepted BEFORE the victim writeback "
+          "(old inline flow wrote back first, blocking the refill)",
+          g_slave.last_read_cycle, g_slave.last_write_cycle);
+
+    // Exactly one of the four dirty lines landed in golden memory -- the
+    // evicted one (which way the round-robin picked is deliberately not
+    // assumed here).
+    int evicted = -1;
+    for (int i = 0; i < 4; i++) if (mem_read64(lines[i]) == patterns[i]) evicted = i;
+    check(evicted >= 0, "the evicted line's dirty data reached memory intact",
+          (uint64_t)(evicted >= 0 ? 1 : 0), 1);
+
+    if (evicted >= 0) {
+        int reads_before2 = g_slave.reads;
+        LsuResult reload = do_op(F_LD, lines[evicted], 0, 0, 5);
+        check(reload.wb_data == patterns[evicted],
+              "reloading the evicted address returns the written-back value",
+              reload.wb_data, patterns[evicted]);
+        check(g_slave.reads == reads_before2 + 1,
+              "the reload missed again (line was truly evicted, fresh AXI read)",
+              (uint64_t)g_slave.reads, (uint64_t)(reads_before2 + 1));
+    }
+
+    g_cp0_lsu_wa = 0;   // restore reset default
+    test_result("T10 VB decoupling: refill read ahead of dirty-victim writeback");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -798,6 +884,7 @@ int main(int argc, char **argv)
     test_multi_miss_tracking();     // M3b Task A rework: 8-entry LFB, multi-miss
     test_miss_inflight_replay();    // M3b Task A rework: same-line replay, no corruption
     test_lfb_full_backpressure();   // M3b Task A rework: 8-entry LFB-full backpressure
+    test_vb_decoupled_dirty_writeback();   // M3b Task B/C: single-entry VB decoupling
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

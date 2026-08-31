@@ -948,8 +948,13 @@ module LSU #(
     // M3b: a deferred load (any LFB entry occupied) also means the LSU is
     // not quiescent -- fence/fence.i must wait for its refill to land
     // (rv64ui-p-fence_i).
+    // M3b Task B/C: the VB can still hold an undrained dirty writeback after
+    // its owning LFB entry has already drained (vb_vld is decoupled from
+    // lfb_empty by design -- see the VB section) -- a fence must wait for
+    // that writeback to become globally visible too, else fence/fence.i
+    // could complete before the old line's data actually reaches memory.
     assign lsu_cp0_stb_empty = (state == ST_IDLE) && !any_stb_vld && !clean_active
-                               && lfb_empty;
+                               && lfb_empty && !vb_vld;
 
     //-------------------------------------------------------------------------
     // SECTION FRZ -- victim-select/writeback/refill-commit (cacheable miss)
@@ -959,7 +964,9 @@ module LSU #(
     localparam [3:0] MS_IDLE          = 4'd0;
     localparam [3:0] MS_VPEEK_ISSUE   = 4'd1;
     localparam [3:0] MS_VPEEK_WAIT    = 4'd2;
-    localparam [3:0] MS_VB_WRITE      = 4'd3;
+    // 4'd3 retired (M3b Task B/C): the old inline MS_VB_WRITE state used to
+    // block the refill on the victim writeback; the victim now hands off to
+    // the VB (below) and MS_VPEEK_WAIT goes straight to MS_REFILL_READ.
     localparam [3:0] MS_REFILL_READ   = 4'd4;
     localparam [3:0] MS_COMMIT_ISSUE  = 4'd5;
     localparam [3:0] MS_COMMIT_WAIT   = 4'd6;
@@ -977,9 +984,22 @@ module LSU #(
     reg [1:0]  victim_idx_r;
     reg [WAYS-1:0] victim_way_r;
     reg        victim_dirty_r;
-    reg [DCACHE_TAG_WIDTH-1:0] victim_tag_r;
-    reg [511:0] victim_data_r;
     reg [1:0]  rr_ctr;
+    // M3b Task B/C: single-entry victim buffer (donor aq_lsu_vb.v, ONE entry
+    // :135-148) decouples the dirty-victim writeback from the refill
+    // critical path (donor aq_lsu_rdl.v CHECK->WVB before evicting another
+    // dirty line). MS_VPEEK_WAIT hands the peeked victim off here and moves
+    // straight to MS_REFILL_READ; the VB then drains independently whenever
+    // the shared axi_w_* write-channel registers are free. Adaptation: since
+    // rv906's AXI slave is single-outstanding for ANY transaction (read or
+    // write, AXICrossbar.v sr_active), true bus concurrency between the
+    // refill read and the victim write isn't achievable -- but ordering the
+    // refill ahead of the writeback still removes the writeback from the
+    // demand-miss's own latency, matching the donor's decoupling intent.
+    reg        vb_vld;
+    reg [DCACHE_TAG_WIDTH-1:0] vb_tag_r;
+    reg [DCACHE_INDEX_W-1:0]   vb_index_r;
+    reg [511:0]                vb_data_r;
     reg [511:0] frz_rdata_r;   // FRZ-local capture (refill or direct-read data);
                                  // copied into dc_rdata_r by the MAIN fsm's own
                                  // always block at the FRZ->REPLY transition so
@@ -1209,8 +1229,10 @@ module LSU #(
             victim_idx_r   <= 2'd0;
             victim_way_r   <= {WAYS{1'b0}};
             victim_dirty_r <= 1'b0;
-            victim_tag_r   <= {DCACHE_TAG_WIDTH{1'b0}};
-            victim_data_r  <= 512'd0;
+            vb_vld         <= 1'b0;
+            vb_tag_r       <= {DCACHE_TAG_WIDTH{1'b0}};
+            vb_index_r     <= {DCACHE_INDEX_W{1'b0}};
+            vb_data_r      <= 512'd0;
             rr_ctr         <= 2'd0;
             axi_w_active   <= 1'b0;
             axi_w_aw_sent  <= 1'b0;
@@ -1253,6 +1275,13 @@ module LSU #(
                     MS_IDLE: begin
                         if (frz_is_direct_r && !lfb_engine_active) begin
                             if (dc_is_store_r) begin
+                                if (vb_vld) begin
+                                    // M3b Task B/C: wait for the single-entry
+                                    // VB to free before claiming the shared
+                                    // axi_w_* write-channel registers for
+                                    // this direct store. Retry at MS_IDLE.
+                                    miss_state <= MS_IDLE;
+                                end else begin
                                     axi_w_active  <= 1'b1;
                                     axi_w_aw_sent <= 1'b0;
                                     axi_w_w_sent  <= 1'b0;
@@ -1276,43 +1305,45 @@ module LSU #(
                                     // (aq_lsu_stb.v:898).
                                     axi_w_awsize_r <= dc_is_drain_r ? stb_size[dc_drain_idx_r] : {1'b0, dc_size_r};
                                     miss_state <= MS_DIRECT_WRITE;
-                                end else begin
-                                    axi_r_active  <= 1'b1;
-                                    axi_r_ar_sent <= 1'b0;
-                                    axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
-                                    miss_state <= MS_DIRECT_READ;
                                 end
                             end else begin
-                                victim_idx_r   <= victim_idx_c;
-                                victim_way_r   <= victim_way_c;
-                                victim_dirty_r <= victim_dirty_c;
+                                axi_r_active  <= 1'b1;
+                                axi_r_ar_sent <= 1'b0;
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
+                                miss_state <= MS_DIRECT_READ;
+                            end
+                        end else begin
+                            victim_idx_r   <= victim_idx_c;
+                            victim_way_r   <= victim_way_c;
+                            victim_dirty_r <= victim_dirty_c;
+                            if (victim_dirty_c && vb_vld) begin
+                                // M3b Task B/C RDL WVB: donor waits for
+                                // the single-entry VB to free before
+                                // evicting another dirty line (donor
+                                // aq_lsu_rdl.v CHECK->WVB, aq_lsu_vb.v
+                                // ONE entry :135-148). Retry at MS_IDLE.
+                                miss_state <= MS_IDLE;
+                            end else begin
                                 miss_state <= victim_dirty_c ? MS_VPEEK_ISSUE : MS_REFILL_READ;
                             end
                         end
+                        end
                         MS_VPEEK_ISSUE: if (frz_issue_vpeek) miss_state <= MS_VPEEK_WAIT;
                         MS_VPEEK_WAIT: begin
+                            // M3b Task B/C: hand the peeked victim off to the
+                            // single-entry VB (donor aq_lsu_rdl.v CHECK->WVB,
+                            // aq_lsu_vb.v :135-148) and go straight to the
+                            // refill read instead of blocking on the
+                            // writeback -- the VB drains independently below.
                             if (u_dc_resp_vld) begin
-                                victim_tag_r  <= u_dc_resp_victim_tag;
-                                victim_data_r <= u_dc_resp_rdata;
-                                axi_w_active  <= 1'b1;
-                                axi_w_aw_sent <= 1'b0;
-                                axi_w_w_sent  <= 1'b0;
-                                axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, frz_eff_index, 6'b0};
-                                axi_w_data_r  <= u_dc_resp_rdata;
-                                axi_w_strb_r  <= 64'hFFFF_FFFF_FFFF_FFFF;
-                                axi_w_awsize_r <= 3'd6;
-                                miss_state <= MS_VB_WRITE;
-                            end
-                        end
-                        MS_VB_WRITE: begin
-                            if (axi_w_done) begin
-                                axi_w_active  <= 1'b0;
-                                axi_w_aw_sent <= 1'b0;
-                                axi_w_w_sent  <= 1'b0;
+                                vb_vld       <= 1'b1;
+                                vb_tag_r     <= u_dc_resp_victim_tag;
+                                vb_index_r   <= frz_eff_index;
+                                vb_data_r    <= u_dc_resp_rdata;
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
                                 axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, frz_eff_tag, frz_eff_index, 6'b0};
-                                miss_state <= MS_REFILL_READ;
+                                miss_state    <= MS_REFILL_READ;
                             end
                         end
                         MS_REFILL_READ: begin
@@ -1362,12 +1393,16 @@ module LSU #(
                     if (miss_state != MS_IDLE) miss_state <= MS_IDLE;
                 end
 
-            // FENCE.I D-cache clean walk's AXI writeback control (this block
-            // is the single writer of axi_w_*): on the peek-response cycle,
-            // launch a full-line write of the dirty way just peeked; retire
-            // the write sub-sequence once the B response lands. Mutually
-            // exclusive with every FRZ/IDLE use above (clean only runs while
-            // state==ST_IDLE and issue_real/issue_drain are gated off).
+            // FENCE.I D-cache clean walk's AXI writeback control: on the
+            // peek-response cycle, launch a full-line write of the dirty way
+            // just peeked; retire the write sub-sequence once the B response
+            // lands. Mutually exclusive with every FRZ/IDLE use above (clean
+            // only runs while state==ST_IDLE and issue_real/issue_drain are
+            // gated off) AND with the VB drain below: clean can only launch
+            // once lsu_cp0_stb_empty proved !vb_vld, and vb_vld cannot rise
+            // during the walk (no new miss engine activity while
+            // clean_active gates issue), so the CL_WB axi_w_done here is
+            // unambiguously the clean walk's own write.
             if (clean_state == CL_PEEK_WAIT && u_dc_resp_vld) begin
                 axi_w_active   <= 1'b1;
                 axi_w_aw_sent  <= 1'b0;
@@ -1381,6 +1416,34 @@ module LSU #(
                 axi_w_active  <= 1'b0;
                 axi_w_aw_sent <= 1'b0;
                 axi_w_w_sent  <= 1'b0;
+            end
+
+            // M3b Task B/C: VB drain -- the single-entry victim buffer's
+            // writeback to memory (donor aq_lsu_vb.v FSM IDLE->DATA_0..3->
+            // BUS_REQ/WFC with its dedicated AXI writeback, :267-354,:462-477;
+            // rv906 adaptation: the shared axi_w_* registers stand in for the
+            // donor's dedicated channel since the crossbar serializes all
+            // transactions to the memory slave anyway). Claims the write
+            // channel whenever the VB is occupied and the channel is free;
+            // retires on the B response. Mutual exclusion with the other two
+            // axi_w claimants: the FRZ direct-store path only claims when
+            // !vb_vld (see MS_IDLE above) and the clean walk only runs with
+            // vb_vld==0 (see comment above), so while vb_vld==1 the VB owns
+            // any axi_w_active transaction and axi_w_done here is its own.
+            if (vb_vld && !axi_w_active) begin
+                axi_w_active   <= 1'b1;
+                axi_w_aw_sent  <= 1'b0;
+                axi_w_w_sent   <= 1'b0;
+                axi_w_addr_r   <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, vb_tag_r, vb_index_r, 6'b0};
+                axi_w_data_r   <= vb_data_r;
+                axi_w_strb_r   <= 64'hFFFF_FFFF_FFFF_FFFF;
+                axi_w_awsize_r <= 3'd6;
+            end
+            if (vb_vld && axi_w_active && axi_w_done) begin
+                axi_w_active  <= 1'b0;
+                axi_w_aw_sent <= 1'b0;
+                axi_w_w_sent  <= 1'b0;
+                vb_vld        <= 1'b0;
             end
         end
     end
