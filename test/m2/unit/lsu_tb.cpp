@@ -614,6 +614,171 @@ static void test_hit_under_miss(void)
     test_result("T6 hit-under-miss: hit load completes during an outstanding miss refill");
 }
 
+// T7 (M3b Task A rework): multi-miss tracking. Two distinct-line misses are
+// deferred back-to-back into the now-8-entry LFB. rv906's AXI is genuinely
+// single-outstanding (Adaptation Decision #1), so only one entry can ever be
+// "active" at a time and activation order == creation order -- completion
+// order is therefore forced to equal issue order. Asserts: (a) both misses
+// defer and free up quickly (neither blocks on the other), (b) the two
+// completions land in issue order (C before D), each with correct data.
+static void test_multi_miss_tracking(void)
+{
+    g_cp0_lsu_wa = 0;
+    const uint64_t LINE_C = 0x0000000080070000ULL;
+    const uint64_t LINE_D = 0x0000000080071000ULL;
+    const uint64_t VAL_C  = 0xCCCCCCCCCCCCCCCCULL;
+    const uint64_t VAL_D  = 0xDDDDDDDDDDDDDDDDULL;
+    for (int i = 0; i < 8; i++) {
+        mem_wr(LINE_C + i, (uint8_t)(VAL_C >> (i * 8)));
+        mem_wr(LINE_D + i, (uint8_t)(VAL_D >> (i * 8)));
+    }
+
+    g_axi_rd_lat = 40;   // slow refill so both misses are genuinely in flight together
+
+    issue_only(F_LD, LINE_C, 0, 0, 5);
+    int freed_c = 0;
+    while (dut->lsu_idu_full && freed_c < 60) { idle_issue(); tick(); freed_c++; }
+    check(!dut->lsu_idu_full && freed_c < 15, "LSU frees quickly after deferring C (1st miss)",
+          (uint64_t)(dut->lsu_idu_full ? 999 : freed_c), 15);
+
+    issue_only(F_LD, LINE_D, 0, 0, 6);
+    int freed_d = 0;
+    while (dut->lsu_idu_full && freed_d < 60) { idle_issue(); tick(); freed_d++; }
+    check(!dut->lsu_idu_full && freed_d < 15,
+          "LSU frees quickly after deferring D (2nd miss, while C's refill still in flight)",
+          (uint64_t)(dut->lsu_idu_full ? 999 : freed_d), 15);
+
+    LsuResult first = wait_completion(-1, 600);
+    check(first.cmplt && first.wb_preg == 5 && first.wb_data == VAL_C,
+          "1st completion is C (issue order == completion order, single-outstanding engine)",
+          first.cmplt ? first.wb_preg : 999, 5);
+
+    LsuResult second = wait_completion(-1, 600);
+    check(second.cmplt && second.wb_preg == 6 && second.wb_data == VAL_D,
+          "2nd completion is D, with correct data", second.cmplt ? second.wb_preg : 999, 6);
+
+    g_axi_rd_lat = 2;
+    settle(10);
+    test_result("T7 multi-miss tracking: two outstanding misses complete in issue order");
+}
+
+// T8 (M3b Task A rework): miss-to-in-flight-line replay. A second access to
+// the SAME line as an already in-flight miss must not corrupt the first or
+// deadlock -- it replays (parks at ST_DCS via lfb_addr_hit, LSU.v's OR-tree
+// across all entries, mirroring donor dc_hit_lfb_idx/_addr,
+// aq_lsu_lfb.v:722-726) until that entry fully drains, then proceeds.
+// Asserts: no deadlock (both complete), correct data for both, and the
+// second access's completion is strictly ordered after the first's (proof
+// it genuinely stalled/replayed rather than being tracked as a second,
+// concurrently-active entry for the same line).
+static void test_miss_inflight_replay(void)
+{
+    g_cp0_lsu_wa = 0;
+    const uint64_t LINE_E = 0x0000000080072000ULL;
+    const uint64_t VAL_E  = 0xEEEEEEEEEEEEEEEEULL;
+    for (int i = 0; i < 8; i++) mem_wr(LINE_E + i, (uint8_t)(VAL_E >> (i * 8)));
+
+    g_axi_rd_lat = 40;   // slow refill so the 2nd access genuinely overlaps the 1st's in-flight miss
+
+    issue_only(F_LD, LINE_E, 0, 0, 5);
+    int freed = 0;
+    while (dut->lsu_idu_full && freed < 60) { idle_issue(); tick(); freed++; }
+    check(!dut->lsu_idu_full, "LSU frees after deferring the 1st access to E",
+          dut->lsu_idu_full ? 1 : 0, 0);
+
+    settle(3);   // let the 1st access's entry genuinely start refilling before the 2nd probes the same line
+    issue_only(F_LD, LINE_E, 0, 0, 6);
+
+    LsuResult first = wait_completion(-1, 600);
+    check(first.cmplt && first.wb_preg == 5 && first.wb_data == VAL_E,
+          "1st access to E completes first, with correct data",
+          first.cmplt ? first.wb_preg : 999, 5);
+
+    LsuResult second = wait_completion(-1, 600);
+    check(second.cmplt && second.wb_preg == 6 && second.wb_data == VAL_E,
+          "2nd access to the same in-flight line completes after (replayed), with correct data",
+          second.cmplt ? second.wb_preg : 999, 6);
+
+    g_axi_rd_lat = 2;
+    settle(10);
+    test_result("T8 miss-to-in-flight-line replay: 2nd access to same line stalls then completes correctly");
+}
+
+// T9 (M3b Task A rework): LFB-full backpressure. Fill all 8 LFB entries with
+// distinct-line misses, then issue a 9th. The 9th must be genuinely HELD
+// (lsu_idu_full stays asserted) until a slot frees via drain -- the same
+// circular-FIFO lfb_full test as the donor (aq_lsu_lfb.v:718-719) -- not
+// silently corrupt or skip ahead. All 9 then complete with correct data.
+static void test_lfb_full_backpressure(void)
+{
+    g_cp0_lsu_wa = 0;
+    const int N = 9;
+    uint64_t lines[N];
+    uint64_t vals[N];
+    for (int i = 0; i < N; i++) {
+        lines[i] = 0x0000000080080000ULL + (uint64_t)i * 0x1000ULL;
+        vals[i]  = 0x1100000000000000ULL * (uint64_t)(i + 1) + (uint64_t)i;
+        for (int b = 0; b < 8; b++) mem_wr(lines[i] + b, (uint8_t)(vals[i] >> (b * 8)));
+    }
+
+    g_axi_rd_lat = 200;   // service time per entry >> the few cycles needed to issue all 8
+
+    // Fill all 8 LFB slots -- each of the first 8 misses must defer and free
+    // quickly (LFB has room), matching T6/T7's non-blocking behavior.
+    for (int i = 0; i < 8; i++) {
+        issue_only(F_LD, lines[i], 0, 0, (unsigned)(i + 10));
+        int freed_in = 0;
+        while (dut->lsu_idu_full && freed_in < 60) { idle_issue(); tick(); freed_in++; }
+        check(!dut->lsu_idu_full && freed_in < 15,
+              "LSU frees quickly deferring miss into an LFB slot (slots 0-7)",
+              (uint64_t)(dut->lsu_idu_full ? 999 : freed_in), 15);
+    }
+
+    // The 9th miss finds the LFB genuinely full: it must park (lsu_idu_full
+    // stays asserted for a while) rather than proceed immediately, until the
+    // head entry (slot 0) drains and frees a slot. From here on, poll in a
+    // SINGLE continuous loop and record every completion the instant it
+    // happens: entries 0-7 keep draining in the background while we wait for
+    // the 9th to unpark, so a busy-wait loop followed by separate per-preg
+    // wait_completion() calls would miss (swallow) those one-cycle
+    // completion pulses -- exactly what the first draft of this test did.
+    issue_only(F_LD, lines[8], 0, 0, 18);
+
+    bool     got[N]      = { false };
+    uint64_t got_data[N] = { 0 };
+    int      held_for    = -1;
+    for (int cyc = 0; cyc < 6000; cyc++) {
+        if (held_for < 0 && !dut->lsu_idu_full) held_for = cyc;
+        if (dut->lsu_rtu_ex1_cmplt_dp) {
+            unsigned preg = dut->lsu_rtu_wb_preg;
+            for (int i = 0; i < N; i++) {
+                unsigned want = (unsigned)(i < 8 ? i + 10 : 18);
+                if (preg == want && !got[i]) { got[i] = true; got_data[i] = dut->lsu_rtu_wb_data; }
+            }
+        }
+        idle_issue();
+        tick();
+        bool all_done = true;
+        for (int i = 0; i < N; i++) if (!got[i]) { all_done = false; break; }
+        if (all_done) break;
+    }
+
+    check(held_for >= 0, "the 9th miss eventually unparks once a slot drains",
+          held_for < 0 ? 1 : 0, 0);
+    check(held_for > 30, "the 9th miss was genuinely held back (LFB-full backpressure), "
+          "not deferred immediately like the first 8", (uint64_t)(held_for < 0 ? 0 : held_for), 31);
+
+    // All 9 complete with correct data.
+    for (int i = 0; i < N; i++) {
+        check(got[i] && got_data[i] == vals[i], "each of the 9 misses completes with correct data",
+              got[i] ? got_data[i] : 0xdeadULL, vals[i]);
+    }
+
+    g_axi_rd_lat = 2;
+    settle(10);
+    test_result("T9 LFB-full backpressure: 9th miss held until a slot frees, all 9 complete correctly");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -630,6 +795,9 @@ int main(int argc, char **argv)
     test_stb_create_vs_flush_interlock();
     test_miss_refill_dirty_victim_writeback();
     test_hit_under_miss();   // M3b Task A: hit-under-miss (non-blocking LFB)
+    test_multi_miss_tracking();     // M3b Task A rework: 8-entry LFB, multi-miss
+    test_miss_inflight_replay();    // M3b Task A rework: same-line replay, no corruption
+    test_lfb_full_backpressure();   // M3b Task A rework: 8-entry LFB-full backpressure
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
