@@ -1314,7 +1314,22 @@ module IDU (
                           || (ex1_eu_r[EU_LSU_SEL]  && lsu_idu_full)
                           || (ex1_eu_r[EU_CP0_SEL]  && cp0_idu_fencei_full);
     wire ctrl_ex1_issue_stall    = ex1_vld_r && iu_idu_mult_issue_stall;
-    wire ctrl_ex1_internal_stall = ex1_vld_r && iu_idu_bju_global_full;
+    // A store's store-data operand (src2) is deliberately exempted from the
+    // dispatch-time RAW stall when its producer is a still-in-flight LSU op
+    // (raw2_except's WB_INT_TYPE_LSU/dis_is_store term, ~line 1269) -- the
+    // design instead relies on the EX1-resident lf2_hit/rtu_idu_wb1 late
+    // forward (below) to backfill src2 while the store sits parked in EX1.
+    // Donor aq_lsu_ag.v:497,667 computes the analogous
+    // `ag_src2_depd = !idu_lsu_ex1_src2_ready` and factors it into its own
+    // `ag_stall`/`ag_req_buffer_src2_depd` (aq_lsu_ag.v:885-930,1065),
+    // snooping a forward bus while parked until the value lands -- i.e. the
+    // donor's LSU never accepts a store whose data isn't ready yet. Without
+    // an equivalent hold here, `idu_lsu_ex1_sel` (~line 1401) would fire
+    // unconditionally once !ctrl_ex1_internal_stall, handing LSU a stale
+    // (reset-value) src2 before the producing load's writeback (wb1) lands.
+    wire ex1_is_store          = ex1_eu_r[EU_LSU_SEL] && ex1_func_r[0];
+    wire ex1_store_src2_unrdy  = ex1_vld_r && ex1_is_store && !ex1_src2_rdy_r;
+    wire ctrl_ex1_internal_stall = (ex1_vld_r && iu_idu_bju_global_full) || ex1_store_src2_unrdy;
     wire ctrl_ex1_stall = ctrl_ex1_eu_full || ctrl_ex1_issue_stall || ctrl_ex1_internal_stall;
 
     wire ctrl_dis_stall = rtu_idu_flush_stall || ctrl_ex1_stall || dis_dep_stall;

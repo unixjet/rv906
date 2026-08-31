@@ -50,6 +50,10 @@ static uint64_t g_cycles = 0;
 static int g_cp0_lsu_mm         = 1;   // reset default per contract 3
 static int g_cp0_lsu_wa         = 0;   // reset default per contract 6
 static int g_cp0_lsu_dcache_en  = 1;   // this bench always runs "post-boot"
+// AXI read latency (cycles from AR accept to R valid). Default 2 keeps the
+// legacy tests' timing; the non-blocking / hit-under-miss tests raise it so
+// a refill is observably "in flight" while other ops proceed.
+static int g_axi_rd_lat         = 2;
 
 //-----------------------------------------------------------------------------
 // Golden memory (sparse -- test addresses are deliberately scattered).
@@ -108,7 +112,7 @@ struct AxiDSlave {
             r_addr = d->axi_d_araddr;
             last_araddr = r_addr;
             reads++;
-            r_pending = true; r_cnt = 2;
+            r_pending = true; r_cnt = g_axi_rd_lat;
         } else if (r_pending && r_cnt > 0) {
             r_cnt--;
         }
@@ -320,6 +324,53 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
 
 static inline uint64_t LD(uint64_t addr) { return do_op(F_LD, addr, 0, 0, 5).wb_data; }
 
+// Issue one EX1 dispatch and return immediately WITHOUT waiting for
+// completion (non-blocking). Used by the hit-under-miss tests to put a
+// missing load in flight and then observe other ops proceeding.
+static void issue_only(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src2,
+                       unsigned dst0)
+{
+    int waited = 0;
+    while (dut->lsu_idu_full && waited < 500) { idle_issue(); tick(); waited++; }
+    dut->idu_lsu_ex1_dp_sel     = 1;
+    dut->idu_lsu_ex1_sel        = 1;
+    dut->idu_lsu_ex1_func       = func;
+    dut->idu_lsu_ex1_src0_data  = src0;
+    dut->idu_lsu_ex1_src0_ready = 1;
+    dut->idu_lsu_ex1_src1_data  = src1;
+    dut->idu_lsu_ex1_src1_ready = 1;
+    dut->idu_lsu_ex1_src2_data  = src2;
+    dut->idu_lsu_ex1_src2_ready = 1;
+    dut->idu_lsu_ex1_dst0_reg   = dst0;
+    tick();
+    idle_issue();
+}
+
+// Poll lsu_rtu_ex1_cmplt_dp until a completion lands on `preg` (or any preg
+// if preg<0), returning the captured bus. guard bounds the wait.
+static LsuResult wait_completion(int preg, int guard = 600)
+{
+    LsuResult r;
+    for (int i = 0; i < guard; i++) {
+        if (dut->lsu_rtu_ex1_cmplt_dp &&
+            (preg < 0 || (unsigned)preg == dut->lsu_rtu_wb_preg)) {
+            r.cmplt    = true;
+            r.wb_vld   = dut->lsu_rtu_wb_vld != 0;
+            r.wb_data  = dut->lsu_rtu_wb_data;
+            r.wb_preg  = dut->lsu_rtu_wb_preg;
+            r.expt_vld = dut->lsu_rtu_expt_vld != 0;
+            r.expt_vec = dut->lsu_rtu_expt_vec;
+            r.tval     = dut->lsu_rtu_tval;
+            r.cycles   = i + 1;
+            tick();
+            return r;
+        }
+        tick();
+    }
+    r.timed_out = true;
+    return r;
+}
+
 //=============================================================================
 // Tests
 //=============================================================================
@@ -505,6 +556,64 @@ static void test_miss_refill_dirty_victim_writeback(void)
     test_result("T5 single-outstanding-miss refill + dirty-victim writeback ordering");
 }
 
+// T6 (M3b Task A): hit-under-miss. A missing load A is deferred into the LFB
+// and its refill runs in the background; the LSU must FREE UP (non-blocking)
+// so a cache-HIT load B can complete while A's refill is still in flight.
+// Asserts: (a) the LSU frees shortly after A's miss (NOT held for the whole
+// refill -- that is the blocking behavior this replaces), (b) A's refill read
+// was actually issued, (c) B completes with correct data before A does, and
+// (d) A completes with correct data once its refill lands.
+static void test_hit_under_miss(void)
+{
+    g_cp0_lsu_wa = 0;
+    const uint64_t LINE_A = 0x0000000080060000ULL;   // cold line -> A misses
+    const uint64_t LINE_B = 0x0000000080061000ULL;   // warmed line -> B hits
+    const uint64_t VAL_A  = 0xAAAAAAAAAAAAAAAAULL;
+    const uint64_t VAL_B  = 0xBBBBBBBBBBBBBBBBULL;
+    for (int i = 0; i < 8; i++) {
+        mem_wr(LINE_A + i, (uint8_t)(VAL_A >> (i * 8)));
+        mem_wr(LINE_B + i, (uint8_t)(VAL_B >> (i * 8)));
+    }
+
+    // Warm B's line so B will be a cache hit.
+    LsuResult warm = do_op(F_LD, LINE_B, 0, 0, 6);
+    check(warm.cmplt && warm.wb_data == VAL_B, "warm B's line (hit thereafter)",
+          warm.cmplt && warm.wb_data == VAL_B, 1);
+    settle(5);
+
+    g_axi_rd_lat = 40;   // slow refill so the in-flight window is observable
+
+    // Issue A: cold miss. A non-blocking LSU defers it and frees up fast.
+    int reads_before = g_slave.reads;
+    issue_only(F_LD, LINE_A, 0, 0, 5);
+    int freed_in = 0;
+    while (dut->lsu_idu_full && freed_in < 60) { idle_issue(); tick(); freed_in++; }
+    bool freed = !dut->lsu_idu_full;
+    check(freed && freed_in < 15, "LSU frees quickly after deferring A's miss (non-blocking)",
+          (uint64_t)(freed ? freed_in : 999), 15);
+
+    // Issue B: cache hit. Completes while A's refill is still in flight.
+    issue_only(F_LD, LINE_B, 0, 0, 6);
+    LsuResult b = wait_completion(6, 100);
+    check(b.cmplt && b.wb_data == VAL_B, "B (hit) completes while A's refill in flight (hit-under-miss)",
+          b.cmplt && b.wb_data == VAL_B, 1);
+
+    // A completes once its refill lands, with correct data.
+    LsuResult a = wait_completion(5, 600);
+    check(a.cmplt && a.wb_data == VAL_A, "A completes with correct data after refill",
+          a.cmplt && a.wb_data == VAL_A, 1);
+
+    // By now A's refill read has definitely been issued to AXI (it follows the
+    // dirty-victim peek/writeback, so it is checked here rather than right
+    // after issue). Exactly one new read: A's line refill.
+    check(g_slave.reads == reads_before + 1, "A's refill read was issued to AXI",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 1));
+
+    g_axi_rd_lat = 2;   // restore
+    settle(10);
+    test_result("T6 hit-under-miss: hit load completes during an outstanding miss refill");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -520,6 +629,7 @@ int main(int argc, char **argv)
     test_stb_forward();
     test_stb_create_vs_flush_interlock();
     test_miss_refill_dirty_victim_writeback();
+    test_hit_under_miss();   // M3b Task A: hit-under-miss (non-blocking LFB)
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

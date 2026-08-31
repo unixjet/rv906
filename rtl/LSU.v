@@ -332,6 +332,13 @@ module LSU #(
     wire        ag_is_store = idu_lsu_ex1_func[0];
     wire        ag_sign_ext = idu_lsu_ex1_func[1];
     wire [1:0]  ag_size     = idu_lsu_ex1_func[3:2];   // 00=B,01=H,10=W,11=D
+    // M3b: plain-load detector (not store / AMO / LR / SC). Only a plain
+    // cacheable load miss is deferred into the LFB for a non-blocking refill;
+    // store/AMO/LR/SC keep the blocking FRZ path this cut.
+    wire        ag_is_plain_ld = !ag_is_store
+                      && (idu_lsu_ex1_func[19:12] != 8'h01)               // not AMO
+                      && (idu_lsu_ex1_func != LSU_FUNC_LR_W) && (idu_lsu_ex1_func != LSU_FUNC_LR_D)
+                      && (idu_lsu_ex1_func != LSU_FUNC_SC_W) && (idu_lsu_ex1_func != LSU_FUNC_SC_D);
 
     wire [63:0] ag_addr = idu_lsu_ex1_src0_data + idu_lsu_ex1_src1_data;
 
@@ -399,6 +406,7 @@ module LSU #(
     // AG-latch: captured every time IDLE accepts something (a real
     // instruction or an STB drain), read uniformly by DCS/FRZ/REPLY.
     reg        dc_is_store_r /* verilator public */, dc_sign_ext_r;
+    reg        dc_plain_ld_r;   // M3b: this op is a plain load (LFB-deferrable)
     reg [1:0]  dc_size_r;
     reg [63:0] dc_addr_r /* verilator public */;
     reg [2:0]  dc_dw_off_r, dc_byte_off_r;
@@ -427,6 +435,15 @@ module LSU #(
     reg [WAYS-1:0] dc_way_vld_r, dc_way_dirty_r;
     reg [511:0]    dc_rdata_r;
     reg            frz_is_direct_r /* verilator public */;
+    // M3b: set when a SECOND op misses ST_DCS while the LFB already holds a
+    // deferred load (single-entry LFB -- the slot is occupied). DCache.v's
+    // dc_resp_vld is a single unscoped pulse, not tagged per-requester
+    // (DCache.v:115-144), so this op's hit/miss decision must NOT be
+    // re-derived from a later u_dc_resp_vld pulse (that pulse could belong
+    // to the background refill's own vpeek/commit traffic instead). Park
+    // here using the already-latched dc_hit_r/dc_way_vld_r/dc_way_dirty_r
+    // and retry once the background refill's miss_state frees up.
+    reg            dc_wait_lfb_r;
 
     //-------------------------------------------------------------------------
     // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
@@ -596,10 +613,21 @@ module LSU #(
     // task's own "STB drains unconditionally... but must not starve the
     // main pipe" framing.
     //-------------------------------------------------------------------------
-    wire issue_real  = (state == ST_IDLE) && ag_valid && !clean_active;   // misaligned accesses still
+    // M3b: a new op must not collide with a background LFB refill's D-cache
+    // port phase (rf_port_busy), and the deferred-load completion
+    // (lfb_cmplt_fire) takes the IDLE slot before a fresh issue. A drain
+    // yields only while the background refill OWNS the D-cache port
+    // (rf_port_busy: vpeek/commit); it must NOT be blocked for the whole time
+    // a load is deferred, else the STB can never drain and a full STB
+    // deadlocks (rv64ui-p-ld_st). Cacheable drains use the state FSM
+    // (ST_DCS->ST_REPLY), not the FRZ sub-FSM, so they interleave safely
+    // with the background refill's AXI phases.
+    wire issue_real  = (state == ST_IDLE) && ag_valid && !clean_active
+                       && !rf_port_busy && !lfb_cmplt_fire;   // misaligned accesses still
                                                            // enter the pipe (see below) --
                                                            // they just never touch the array.
-    wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active;
+    wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
+                       && !rf_port_busy && !lfb_cmplt_fire;
 
     wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign)
                         : issue_drain ? stb_was_hit[drain_pick]
@@ -610,11 +638,17 @@ module LSU #(
     //-------------------------------------------------------------------------
     wire dc_hit_c        = |u_dc_resp_hit_way;
     wire store_wa_miss_c = dc_is_store_r && !dc_hit_c && !dc_wa_r;   // contract 6: wa=0 default
+    // M3b dc_wait_lfb_r retry: same decision, but off the LATCHED dc_hit_r
+    // (this op's own, already-resolved response) instead of the live
+    // dc_hit_c wire, which by retry time may reflect unrelated background-
+    // refill traffic on the shared (unscoped) DCache.v response.
+    wire store_wa_miss_r = dc_is_store_r && !dc_hit_r && !dc_wa_r;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state           <= ST_IDLE;
             dc_is_store_r   <= 1'b0;
+            dc_plain_ld_r   <= 1'b0;
             dc_sign_ext_r   <= 1'b0;
             dc_size_r       <= 2'b0;
             dc_addr_r       <= 64'd0;
@@ -638,11 +672,13 @@ module LSU #(
             dc_rdata_r      <= 512'd0;
             frz_is_direct_r <= 1'b0;
             dc_touched_array_r <= 1'b0;
+            dc_wait_lfb_r   <= 1'b0;
         end else begin
             case (state)
                 ST_IDLE: begin
                     if (issue_real) begin
                         dc_is_store_r   <= ag_is_store;
+                        dc_plain_ld_r   <= ag_is_plain_ld;
                         dc_sign_ext_r   <= ag_sign_ext;
                         dc_size_r       <= ag_size;
                         dc_addr_r       <= ag_addr;
@@ -674,6 +710,23 @@ module LSU #(
                     end
                 end
                 ST_DCS: begin
+                    // M3b: this op already missed once (dc_hit_r latched a
+                    // miss) while the single-entry LFB held an earlier
+                    // deferred load. Retry only on !lfb_rf_active (the
+                    // background refill's miss_state sub-FSM has freed
+                    // itself -- see the MS_IDLE/reset arbitration below,
+                    // LSU.v:1077-1183) rather than !lfb_vld (which needs
+                    // state==ST_IDLE to ever clear, and would recreate this
+                    // very deadlock). This op does NOT also try to defer
+                    // into the (still-occupied) LFB slot; it just blocks
+                    // via the ordinary ST_FRZ path, matching pre-M3b
+                    // (single-outstanding) behavior for this rarer case.
+                    if (dc_wait_lfb_r) begin
+                        if (!lfb_rf_active) begin
+                            dc_wait_lfb_r <= 1'b0;
+                            frz_is_direct_r <= !dc_ca_r || store_wa_miss_r;
+                            state <= ST_FRZ;
+                        end
                     // Wait for DCache.v's own response (its IDLE->DCS->REPLY
                     // protocol takes a fixed 2 cycles from request to
                     // dc_resp_vld -- this state simply waits however long
@@ -681,7 +734,7 @@ module LSU #(
                     // UNLESS nothing was ever requested (a misaligned
                     // access, an uncached real access, or a direct drain),
                     // in which case there is nothing to wait for at all.
-                    if (!dc_touched_array_r || u_dc_resp_vld) begin
+                    end else if (!dc_touched_array_r || u_dc_resp_vld) begin
                         if (dc_touched_array_r) begin
                             dc_hit_way_r   <= u_dc_resp_hit_way;
                             dc_hit_r       <= dc_hit_c;
@@ -704,17 +757,33 @@ module LSU #(
                             state <= dc_ca_r ? ST_REPLY : ST_FRZ;
                         end else if (dc_misalign_r) begin
                             state <= ST_REPLY;
-                        end else if (!dc_ca_r) begin
+                        end else if (!dc_ca_r && !lfb_vld) begin
                             frz_is_direct_r <= 1'b1;
                             state <= ST_FRZ;
-                        end else if (store_wa_miss_c) begin
+                        end else if (store_wa_miss_c && !lfb_vld) begin
                             frz_is_direct_r <= 1'b1;
                             state <= ST_FRZ;
                         end else if (dc_hit_c) begin
                             state <= ST_REPLY;
-                        end else begin
+                        end else if (dc_plain_ld_r && !lfb_vld && dc_ca_r) begin
+                            // M3b Task A: defer a cacheable plain-load miss into
+                            // the LFB. The refill runs in the background (FRZ
+                            // sub-FSM gated by lfb_rf_active) while the main FSM
+                            // returns to ST_IDLE, so cache-HIT ops complete while
+                            // this miss is in flight (hit-under-miss).
+                            frz_is_direct_r <= 1'b0;
+                            state <= ST_IDLE;
+                        end else if (!lfb_vld) begin
                             frz_is_direct_r <= 1'b0;
                             state <= ST_FRZ;
+                        end else begin
+                            // a miss, but the LFB holds a deferred load (its
+                            // refill and its frz_rdata_r are owned) -- park
+                            // here (dc_hit_r/dc_way_vld_r/dc_way_dirty_r are
+                            // already latched above) and retry via the
+                            // dc_wait_lfb_r branch once the background
+                            // refill's miss_state frees up.
+                            dc_wait_lfb_r <= 1'b1;
                         end
                     end
                 end
@@ -848,14 +917,30 @@ module LSU #(
     wire [63:0] amo_new_c = amo_alu_compute(amo_old_c, amo_src0_r, amo_op_r, amo_is_dw_r);
 
     assign lsu_idu_full = (state != ST_IDLE) || clean_active
-                          || (stb_full && ag_needs_slot_c);
+                          || (stb_full && ag_needs_slot_c)
+                          || rf_port_busy   // M3b: don't accept a new op while a
+                                             // background refill owns the D-cache
+                                             // port (vpeek/commit), else the IDU
+                                             // would hand off an op the LSU can't
+                                             // take this cycle.
+                          || lfb_cmplt_fire; // M3b: the deferred-load completion
+                                             // takes the ST_IDLE issue slot this
+                                             // cycle (see issue_real/issue_drain's
+                                             // own !lfb_cmplt_fire term) -- without
+                                             // this term IDU sees "not full" and
+                                             // advances EX1 past an op LSU is
+                                             // about to silently refuse, dropping
+                                             // it forever (rv64ui-p-ld_st hang).
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
-    // flight. state==ST_IDLE implies no AG-issued op is in flight
-    // (issue_real leaves IDLE the cycle it fires) and no drain/miss/
-    // writeback transaction is pending (all of those live in non-IDLE
-    // states). any_stb_vld covers the created-but-undrained entries whose
-    // eventual writes must be globally visible before a fence.
-    assign lsu_cp0_stb_empty = (state == ST_IDLE) && !any_stb_vld && !clean_active;
+    // flight AND no deferred load outstanding. state==ST_IDLE implies no
+    // AG-issued op is in flight (issue_real leaves IDLE the cycle it fires)
+    // and no drain/miss/writeback transaction is pending (all of those live
+    // in non-IDLE states). any_stb_vld covers the created-but-undrained
+    // entries whose eventual writes must be globally visible before a fence.
+    // M3b: a deferred load (lfb_vld) also means the LSU is not quiescent --
+    // fence/fence.i must wait for its refill to land (rv64ui-p-fence_i).
+    assign lsu_cp0_stb_empty = (state == ST_IDLE) && !any_stb_vld && !clean_active
+                               && !lfb_vld;
 
     //-------------------------------------------------------------------------
     // SECTION FRZ -- victim-select/writeback/refill-commit (cacheable miss)
@@ -887,16 +972,111 @@ module LSU #(
 
     wire miss_done = (miss_state == MS_DONE);
 
+    //-------------------------------------------------------------------------
+    // M3b Task A -- LFB (Load-Fill Buffer), single demand-load entry (the
+    // structure extends to DEPTH=8 per aq_lsu_lfb.v:666; this first cut holds
+    // ONE outstanding deferred load miss, which is what delivers the
+    // non-blocking / hit-under-miss behavior). A cacheable LOAD miss is
+    // captured here and its refill runs in the background (the FRZ sub-FSM
+    // below is gated to run for `lfb_rf_active` as well as `state==ST_FRZ`),
+    // so the main FSM returns to ST_IDLE and can complete cache-HIT ops while
+    // the refill is in flight. When the refill commits, the deferred load
+    // completes straight from the refill data (frz_rdata_r) merged with any
+    // STB store forward -- no second cache probe, so no eviction race.
+    //-------------------------------------------------------------------------
+    reg        lfb_vld;          // a deferred load miss is held
+    reg        lfb_rf_done;      // its refill has committed (line in cache)
+    reg [63:0] lfb_addr;         // deferred load byte address
+    reg [GPR_IDX_WIDTH-1:0] lfb_dst;
+    reg [1:0]  lfb_size;
+    reg        lfb_sign_ext;
+    reg [2:0]  lfb_byte_off;
+    reg [2:0]  lfb_dw_off;
+    reg [DCACHE_TAG_WIDTH-1:0]   lfb_tag;
+    reg [DCACHE_INDEX_W-1:0]     lfb_index;
+    // the set's way-valid/dirty snapshot at deferral (dc_way_vld_r/_dirty_r
+    // would be overwritten by the next op's DCS latch, so the background
+    // refill's victim-select reads these instead)
+    reg [WAYS-1:0] lfb_way_vld;
+    reg [WAYS-1:0] lfb_way_dirty;
+    // Dedicated capture of the LFB's own refill dword, latched the cycle its
+    // background refill commits (lfb_rf_done_set). frz_rdata_r is shared with
+    // any later op's own miss/refill (same miss_state FSM); without this
+    // separate copy, a second op missing after this refill completes but
+    // before lfb_cmplt_fire drains it (main FSM busy servicing that op) would
+    // clobber frz_rdata_r and corrupt this load's writeback data.
+    reg [63:0] lfb_rdata_r;
+
+    wire lfb_rf_active = lfb_vld && !lfb_rf_done;
+
+    // Effective line address for the FRZ refill: background refill uses the
+    // LFB's captured tag/index; the blocking FRZ keeps dc_* as before.
+    wire [DCACHE_TAG_WIDTH-1:0] frz_eff_tag   = lfb_rf_active ? lfb_tag   : dc_tag_r;
+    wire [DCACHE_INDEX_W-1:0]   frz_eff_index = lfb_rf_active ? lfb_index : dc_index_r;
+
+    // Defer: a cacheable plain-load miss captures into the LFB this cycle
+    // (same condition the ST_DCS branch uses to return to ST_IDLE).
+    wire lfb_defer_fire = (state == ST_DCS) && u_dc_resp_vld && !dc_is_drain_r
+                          && !dc_misalign_r && dc_ca_r && dc_plain_ld_r
+                          && !dc_hit_c && !lfb_vld;
+    // Refill committed: the background refill's sub-FSM reaching MS_DONE
+    // (single-writer of lfb_rf_done is the LFB always block below).
+    wire lfb_rf_done_set = (miss_state == MS_DONE) && lfb_rf_active;
+    // Complete: once the refill has committed (lfb_rf_done) and the FSM is
+    // idle, the deferred load completes straight from the refill data.
+    wire lfb_cmplt_fire = lfb_vld && lfb_rf_done && (state == ST_IDLE) && !clean_active;
+
+    // lfb_dw_off is latched at lfb_defer_fire, well before lfb_rf_done_set can
+    // fire, so this offset is already valid the cycle the refill commits.
+    wire [8:0] lfb_dword_bitoff = {6'b0, lfb_dw_off} << 6;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            lfb_vld <= 1'b0; lfb_rf_done <= 1'b0;
+            lfb_addr <= 64'd0; lfb_dst <= {GPR_IDX_WIDTH{1'b0}};
+            lfb_size <= 2'd0; lfb_sign_ext <= 1'b0;
+            lfb_byte_off <= 3'd0; lfb_dw_off <= 3'd0;
+            lfb_tag <= {DCACHE_TAG_WIDTH{1'b0}}; lfb_index <= {DCACHE_INDEX_W{1'b0}};
+            lfb_way_vld <= {WAYS{1'b0}}; lfb_way_dirty <= {WAYS{1'b0}};
+            lfb_rdata_r <= 64'd0;
+        end else begin
+            if (lfb_defer_fire) begin
+                lfb_vld       <= 1'b1;
+                lfb_rf_done   <= 1'b0;
+                lfb_addr      <= dc_addr_r;
+                lfb_dst       <= dc_dst0_reg_r;
+                lfb_size      <= dc_size_r;
+                lfb_sign_ext  <= dc_sign_ext_r;
+                lfb_byte_off  <= dc_byte_off_r;
+                lfb_dw_off    <= dc_dw_off_r;
+                lfb_tag       <= dc_tag_r;
+                lfb_index     <= dc_index_r;
+                lfb_way_vld   <= u_dc_resp_way_vld;
+                lfb_way_dirty <= u_dc_resp_way_dirty;
+            end else if (lfb_rf_done_set) begin
+                lfb_rf_done   <= 1'b1;
+                lfb_rdata_r   <= frz_rdata_r[lfb_dword_bitoff +: 64];
+            end else if (lfb_cmplt_fire) begin
+                lfb_vld     <= 1'b0;
+                lfb_rf_done <= 1'b0;
+            end
+        end
+    end
+
     // Replacement policy (LSU-owned, per DCache.v's header decision):
-    // prefer an invalid way, else the round-robin counter.
-    wire [1:0] victim_idx_c = !dc_way_vld_r[0] ? 2'd0 :
-                              !dc_way_vld_r[1] ? 2'd1 :
-                              !dc_way_vld_r[2] ? 2'd2 :
-                              !dc_way_vld_r[3] ? 2'd3 : rr_ctr;
+    // prefer an invalid way, else the round-robin counter. The source of the
+    // set's way-valid/dirty is muxed: a background (LFB) refill reads the
+    // snapshot captured at deferral, the blocking FRZ reads the dc_* latches.
+    wire [WAYS-1:0] vic_src_vld   = lfb_rf_active ? lfb_way_vld   : dc_way_vld_r;
+    wire [WAYS-1:0] vic_src_dirty = lfb_rf_active ? lfb_way_dirty : dc_way_dirty_r;
+    wire [1:0] victim_idx_c = !vic_src_vld[0] ? 2'd0 :
+                              !vic_src_vld[1] ? 2'd1 :
+                              !vic_src_vld[2] ? 2'd2 :
+                              !vic_src_vld[3] ? 2'd3 : rr_ctr;
     wire [WAYS-1:0] victim_way_c = 4'b0001 << victim_idx_c;
-    wire victim_dirty_c = (victim_idx_c == 2'd0) ? dc_way_dirty_r[0] :
-                          (victim_idx_c == 2'd1) ? dc_way_dirty_r[1] :
-                          (victim_idx_c == 2'd2) ? dc_way_dirty_r[2] : dc_way_dirty_r[3];
+    wire victim_dirty_c = (victim_idx_c == 2'd0) ? vic_src_dirty[0] :
+                          (victim_idx_c == 2'd1) ? vic_src_dirty[1] :
+                          (victim_idx_c == 2'd2) ? vic_src_dirty[2] : vic_src_dirty[3];
 
     //---- generic AXI write sub-sequence (victim writeback / uncached store
     // / direct STB drain) -- FetchSink.v's proven D-side write FSM
@@ -948,12 +1128,14 @@ module LSU #(
             end
             if (axi_r_active && axi_r_ar_hs) axi_r_ar_sent <= 1'b1;
 
-            case (state)
-                ST_FRZ: begin
-                    case (miss_state)
-                        MS_IDLE: begin
-                            if (frz_is_direct_r) begin
-                                if (dc_is_store_r) begin
+            // M3b: the miss sub-FSM runs both for the blocking FRZ
+            // (state==ST_FRZ) and for a background LFB refill
+            // (lfb_rf_active, main FSM back at ST_IDLE servicing hits).
+            if ((state == ST_FRZ) || lfb_rf_active) begin
+                case (miss_state)
+                    MS_IDLE: begin
+                        if (frz_is_direct_r && !lfb_rf_active) begin
+                            if (dc_is_store_r) begin
                                     axi_w_active  <= 1'b1;
                                     axi_w_aw_sent <= 1'b0;
                                     axi_w_w_sent  <= 1'b0;
@@ -990,7 +1172,7 @@ module LSU #(
                                 miss_state <= victim_dirty_c ? MS_VPEEK_ISSUE : MS_REFILL_READ;
                             end
                         end
-                        MS_VPEEK_ISSUE: miss_state <= MS_VPEEK_WAIT;
+                        MS_VPEEK_ISSUE: if (frz_issue_vpeek) miss_state <= MS_VPEEK_WAIT;
                         MS_VPEEK_WAIT: begin
                             if (u_dc_resp_vld) begin
                                 victim_tag_r  <= u_dc_resp_victim_tag;
@@ -998,7 +1180,7 @@ module LSU #(
                                 axi_w_active  <= 1'b1;
                                 axi_w_aw_sent <= 1'b0;
                                 axi_w_w_sent  <= 1'b0;
-                                axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, dc_index_r, 6'b0};
+                                axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, u_dc_resp_victim_tag, frz_eff_index, 6'b0};
                                 axi_w_data_r  <= u_dc_resp_rdata;
                                 axi_w_strb_r  <= 64'hFFFF_FFFF_FFFF_FFFF;
                                 axi_w_awsize_r <= 3'd6;
@@ -1012,7 +1194,7 @@ module LSU #(
                                 axi_w_w_sent  <= 1'b0;
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
-                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, frz_eff_tag, frz_eff_index, 6'b0};
                                 miss_state <= MS_REFILL_READ;
                             end
                         end
@@ -1020,7 +1202,7 @@ module LSU #(
                             if (miss_state == MS_REFILL_READ && axi_r_active == 1'b0) begin
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
-                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, frz_eff_tag, frz_eff_index, 6'b0};
                             end else if (axi_r_data_hs) begin
                                 axi_r_active <= 1'b0;
                                 frz_rdata_r   <= axi_d_rdata;
@@ -1028,7 +1210,7 @@ module LSU #(
                                 miss_state    <= MS_COMMIT_ISSUE;
                             end
                         end
-                        MS_COMMIT_ISSUE: miss_state <= MS_COMMIT_WAIT;
+                        MS_COMMIT_ISSUE: if (frz_issue_commit) miss_state <= MS_COMMIT_WAIT;
                         MS_COMMIT_WAIT: begin
                             if (u_dc_resp_vld) miss_state <= MS_DONE;
                         end
@@ -1047,14 +1229,15 @@ module LSU #(
                                 miss_state    <= MS_DONE;
                             end
                         end
-                        MS_DONE: ;   // held for exactly one cycle by the outer FSM's own transition
+                        MS_DONE: ;   // M3b: lfb_rf_done_set (combinational, below)
+                                     // samples this state for a background refill;
+                                     // the blocking FRZ's MS_DONE is held one cycle
+                                     // by the outer FSM's own transition as before.
                         default: miss_state <= MS_IDLE;
                     endcase
-                end
-                default: begin
+                end else begin
                     if (miss_state != MS_IDLE) miss_state <= MS_IDLE;
                 end
-            endcase
 
             // FENCE.I D-cache clean walk's AXI writeback control (this block
             // is the single writer of axi_w_*): on the peek-response cycle,
@@ -1175,8 +1358,27 @@ module LSU #(
     // combinational, mutually exclusive with the IDLE-cycle issue mux above
     // (this module is single-outstanding: the main FSM is in FRZ, not
     // IDLE, whenever any of this fires).
-    wire frz_issue_vpeek  = (state == ST_FRZ) && (miss_state == MS_VPEEK_ISSUE);
-    wire frz_issue_commit = (state == ST_FRZ) && (miss_state == MS_COMMIT_ISSUE);
+    // M3b: the background LFB refill (main FSM back at ST_IDLE) drives the
+    // same vpeek/commit port phases as the blocking FRZ. The blocking FRZ
+    // (state==ST_FRZ) is already serialized by the FSM; the BACKGROUND refill
+    // must wait until the main FSM is at ST_IDLE (no hit-lookup in flight)
+    // -- OR the main FSM is ST_DCS but PARKED in dc_wait_lfb_r, which reads
+    // no live u_dc_resp_*/dc_hit_c wire at all (see the ST_DCS case) and so
+    // cannot collide with this traffic -- before driving the port, else its
+    // vpeek/commit would collide with a concurrent hit-lookup still using
+    // the shared response bus. rf_port_busy blocks NEW issues while the
+    // background refill owns the port.
+    wire frz_issue_vpeek  = (miss_state == MS_VPEEK_ISSUE)
+                            && ((state == ST_FRZ)
+                                || (lfb_rf_active && (state == ST_IDLE || dc_wait_lfb_r)));
+    wire frz_issue_commit = (miss_state == MS_COMMIT_ISSUE)
+                            && ((state == ST_FRZ)
+                                || (lfb_rf_active && (state == ST_IDLE || dc_wait_lfb_r)));
+    // While a background refill is using the D-cache port (vpeek/commit
+    // issue+response), a new op's lookup must not collide with it.
+    wire rf_port_busy = lfb_rf_active && (miss_state == MS_VPEEK_ISSUE
+                        || miss_state == MS_VPEEK_WAIT || miss_state == MS_COMMIT_ISSUE
+                        || miss_state == MS_COMMIT_WAIT);
 
     assign u_dc_req_vld       = touches_array || frz_issue_vpeek || frz_issue_commit || clean_req;
     assign u_dc_req_way_sel   = frz_issue_vpeek ? victim_way_r : (frz_issue_commit ? victim_way_r
@@ -1192,10 +1394,10 @@ module LSU #(
                                 : (issue_drain ? ({56'b0, stb_byte_vld[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 8))
                                 : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8)));
     assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (issue_drain ? 1'b1 : ag_is_store);
-    assign u_dc_req_index      = frz_issue_vpeek || frz_issue_commit ? dc_index_r
+    assign u_dc_req_index      = frz_issue_vpeek || frz_issue_commit ? frz_eff_index
                                 : clean_req ? clean_set
                                 : (issue_drain ? stb_index[drain_pick] : ag_dc_index);
-    assign u_dc_req_tag        = frz_issue_vpeek || frz_issue_commit ? dc_tag_r
+    assign u_dc_req_tag        = frz_issue_vpeek || frz_issue_commit ? frz_eff_tag
                                 : (issue_drain ? stb_tag[drain_pick] : ag_dc_tag);
 
     //-------------------------------------------------------------------------
@@ -1286,6 +1488,46 @@ module LSU #(
             3'b0_10: da_final = {32'b0, rotated[31:0]};
             3'b1_10: da_final = {{32{rotated[31]}}, rotated[31:0]};
             default: da_final = rotated;
+        endcase
+    end
+
+    //-------------------------------------------------------------------------
+    // M3b Task A -- deferred-load completion data. A deferred load completes
+    // from the refill line (frz_rdata_r, captured at MS_REFILL_READ) merged
+    // with any STB store forward for its address -- no second cache probe, so
+    // no eviction race. Mirrors the DA byte-rotate + sign/zero-extend above
+    // but keyed on the LFB's captured attributes.
+    //-------------------------------------------------------------------------
+    wire [60:0] lfb_rp_dword = lfb_addr[63:3];
+    wire lfb_stb_m0 = stb_vld[0] && (stb_addr[0][63:3] == lfb_rp_dword);
+    wire lfb_stb_m1 = stb_vld[1] && (stb_addr[1][63:3] == lfb_rp_dword);
+    wire lfb_stb_m2 = stb_vld[2] && (stb_addr[2][63:3] == lfb_rp_dword);
+    wire lfb_stb_m3 = stb_vld[3] && (stb_addr[3][63:3] == lfb_rp_dword);
+    wire [63:0] lfb_stb_fwd_data = lfb_stb_m0 ? stb_data[0] : lfb_stb_m1 ? stb_data[1]
+                                 : lfb_stb_m2 ? stb_data[2] : lfb_stb_m3 ? stb_data[3] : 64'd0;
+    wire [7:0]  lfb_stb_fwd_mask = lfb_stb_m0 ? stb_byte_vld[0] : lfb_stb_m1 ? stb_byte_vld[1]
+                                 : lfb_stb_m2 ? stb_byte_vld[2] : lfb_stb_m3 ? stb_byte_vld[3] : 8'd0;
+    wire [63:0] lfb_stb_fwd_bits = expand_byte_mask(lfb_stb_fwd_mask);
+
+    // lfb_dword_bitoff is declared above (needed by the LFB always block to
+    // capture lfb_rdata_r at lfb_rf_done_set time, ahead of this point).
+    wire [63:0] lfb_raw_dword    = lfb_rdata_r;
+    wire [63:0] lfb_merged_dword = (lfb_stb_fwd_bits & lfb_stb_fwd_data)
+                                 | (~lfb_stb_fwd_bits & lfb_raw_dword);
+    wire [127:0] lfb_merged2     = {lfb_merged_dword, lfb_merged_dword};
+    wire [127:0] lfb_merged2_rsh = lfb_merged2 >> ({61'b0, lfb_byte_off} * 8);
+    wire [63:0]  lfb_rotated     = lfb_merged2_rsh[63:0];
+
+    reg [63:0] lfb_wb_data;
+    always @* begin
+        case ({lfb_sign_ext, lfb_size})
+            3'b0_00: lfb_wb_data = {56'b0, lfb_rotated[7:0]};
+            3'b1_00: lfb_wb_data = {{56{lfb_rotated[7]}}, lfb_rotated[7:0]};
+            3'b0_01: lfb_wb_data = {48'b0, lfb_rotated[15:0]};
+            3'b1_01: lfb_wb_data = {{48{lfb_rotated[15]}}, lfb_rotated[15:0]};
+            3'b0_10: lfb_wb_data = {32'b0, lfb_rotated[31:0]};
+            3'b1_10: lfb_wb_data = {{32{lfb_rotated[31]}}, lfb_rotated[31:0]};
+            default: lfb_wb_data = lfb_rotated;
         endcase
     end
 
@@ -1554,7 +1796,8 @@ module LSU #(
     // ordinary store-hit takes.
     wire miss_done_latched = 1'b1;   // FRZ always fully drains before REPLY is entered
 
-    assign lsu_rtu_ex1_cmplt_dp   = (state == ST_REPLY) && reply_can_complete && !dc_is_drain_r;
+    assign lsu_rtu_ex1_cmplt_dp   = ((state == ST_REPLY) && reply_can_complete && !dc_is_drain_r)
+                                    || lfb_cmplt_fire;   // M3b: deferred-load completion
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
     // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
     // ag_pipe_cmplt_normal ~ ag_pipe_inst_vld && dt_fsm_idle). In this
@@ -1573,18 +1816,20 @@ module LSU #(
     // scrambled branch PCs from test 18 onward).
     assign lsu_rtu_ex1_inst_len   = idu_lsu_ex1_inst_len;
 
-    assign lsu_rtu_wb_vld  = reply_is_load && !reply_is_misalign;
+    assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign) || lfb_cmplt_fire;
     // W-width AMOs write back the OLD value sign-extended (da_final arrives
     // zero-extended since the AMO func leaves the sign bit clear); amo_active
     // is still asserted this ST_REPLY cycle (cleared by NBA at the edge).
     // For SC.W: the "load" result is actually the SC result (0=success, 1=fail).
     // Use sc_addr_set (not idu_lsu_ex1_func which may have moved on by ST_REPLY).
-    assign lsu_rtu_wb_data = sc_addr_set ? lsu_rtu_sc_res[4:0]
-                                 : (amo_active
-                                    ? (amo_is_dw_r ? da_final
-                                                   : {{32{da_final[31]}}, da_final[31:0]})
-                                    : da_final);
-    assign lsu_rtu_wb_preg = dc_dst0_reg_r;
+    // M3b: a deferred load returns lfb_wb_data (refill line + STB forward).
+    assign lsu_rtu_wb_data = lfb_cmplt_fire ? lfb_wb_data
+                                 : (sc_addr_set ? lsu_rtu_sc_res[4:0]
+                                    : (amo_active
+                                       ? (amo_is_dw_r ? da_final
+                                                      : {{32{da_final[31]}}, da_final[31:0]})
+                                       : da_final));
+    assign lsu_rtu_wb_preg = lfb_cmplt_fire ? lfb_dst : dc_dst0_reg_r;
 
     // DC-stage forward for a cache hit: the line is available combinationally
     // at ST_DCS, so forward it there (one cycle before the ST_REPLY wb).
@@ -1616,14 +1861,15 @@ module LSU #(
     // the stale memory value (rv64ua-p-lrsc test 2).
     wire sc_dcs_fire = (state == ST_DCS) && sc_func_is_sc && u_dc_resp_vld
                        && dc_touched_array_r && dc_hit_c && !dc_misalign_r;
-    assign lsu_rtu_ex2_data      = sc_addr_set ? lsu_rtu_sc_res[4:0]
+    assign lsu_rtu_ex2_data      = lfb_cmplt_fire ? lfb_wb_data
+                                 : sc_addr_set ? lsu_rtu_sc_res[4:0]
                                  : sc_dcs_fire ? (sc_match_c ? 5'd0 : 5'd1)
                                  : (amo_active
                                     ? (amo_is_dw_r ? da_final
                                                    : {{32{da_final[31]}}, da_final[31:0]})
                                     : da_final);
     assign lsu_rtu_ex2_data_vld  = lsu_fwd2_dc_fire || lsu_rtu_wb_vld;
-    assign lsu_rtu_ex2_dest_reg  = dc_dst0_reg_r;
+    assign lsu_rtu_ex2_dest_reg  = lfb_cmplt_fire ? lfb_dst : dc_dst0_reg_r;
 
     // M3 Task 1: LR.W / SC.W foundation outputs
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)

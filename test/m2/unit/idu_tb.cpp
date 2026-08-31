@@ -501,10 +501,31 @@ static void test_wbt_except4_store_data_from_load(void) {
     reset_dut();
     present(lw(3, 1, 0)); tick();          // creates WBT busy(x3, type=LSU, cnt=0)
     present(sw(3, 1, 0));                   // x3 used as STORE DATA (src2)
+    // raw2_except's WB_INT_TYPE_LSU/dis_is_store term (IDU.v ~1269) exempts
+    // THIS dispatch from the ordinary producer-busy stall -- observable here
+    // because ctrl_ex1_stall still reflects the EX1-resident lw (not yet a
+    // store), so no eval-triggering tick is needed to see the dispatch-time
+    // decision in isolation.
+    dut->eval();
+    check(dut->idu_ifu_id_stall == 0, "except4: store-data-from-load dispatch exempted from RAW stall");
     tick();
-    check(dut->idu_ifu_id_stall == 0, "except4: store-data-from-load forwarding allowed through");
+    // sw is now EX1-resident with its src2 (x3) not yet ready. The front end
+    // correctly holds it here -- ctrl_ex1_internal_stall's
+    // ex1_store_src2_unrdy term (IDU.v ~1317) -- rather than letting LSU
+    // capture a stale store-data operand, which was Root Cause #3 of the
+    // rv64ui-p-ld_st data-corruption bug this session fixed. Donor
+    // aq_lsu_ag.v:497,667,885-930 holds the analogous op via ag_src2_depd
+    // until its own forward bus resolves it.
+    check(dut->idu_ifu_id_stall == 1, "except4: EX1-resident store parks until its src2 is actually ready");
+    // Producer's writeback lands (late-forward hit, lf2_hit) -- park releases.
+    dut->rtu_idu_wb1_vld = 1; dut->rtu_idu_wb1_reg = 3; dut->rtu_idu_wb1_data = 0x77;
+    tick();
+    dut->rtu_idu_wb1_vld = 0;
+    check(dut->idu_ifu_id_stall == 0, "except4: park releases once the late forward lands");
+    check(dut->idu_lsu_ex1_src2_data == 0x77, "except4: forwarded store data reaches LSU's src2 port",
+          dut->idu_lsu_ex1_src2_data, 0x77);
     present(0, false);
-    test_result("T19 WBT except 4: LSU producer + store consumer's src2 (store data) exempted");
+    test_result("T19 WBT except 4: LSU producer + store consumer's src2 (store data) exempted at dispatch, then EX1-parked until ready");
 }
 
 static void test_wbt_except4_defeated_base_reg(void) {
