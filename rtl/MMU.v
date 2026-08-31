@@ -129,50 +129,74 @@ module MMU (
     // region); `sec`/`sh` are permanently 0 (M4/never territory, design doc
     // S2.3.5).
     //=========================================================================
-    function automatic pma_cacheable(input [MMU_PA_WIDTH-1:0] page_num);
+    function automatic [4:0] sysmap_attr(input [MMU_PA_WIDTH-1:0] page_num);
         reg [39:0] pa_full;
         begin
             pa_full = {page_num, 12'b0};   // page-aligned reconstruction, PC_WIDTH=40
-            pma_cacheable = (pa_full >= 40'h8000_0000) && (pa_full <= 40'hFFFF_FFFF);
+            if ((pa_full >= 40'h8000_0000) && (pa_full <= 40'hFFFF_FFFF))
+                sysmap_attr = 5'b01100;    // DRAM: {so,ca,buf,sh,sec}
+            else
+                sysmap_attr = 5'b10000;    // uncached: so=1, rest 0
         end
     endfunction
 
-    // ---- ITLB port (IFU) ----
-    wire _ifu_mmu_abort_unused = ifu_mmu_abort;   // comb stub: nothing to cancel
+    //=========================================================================
+    // M4 TASK 3 -- satp decode + translation enable (donor aq_mmu_regs.v;
+    // aq_cp0_prtc_csr.v:139-140). CSR.v holds the satp CSR itself (S-bank,
+    // WARL: only mode bit63 writable -> Mode in {0=Bare, 8=Sv39}; ASID[59:44],
+    // PPN[27:0] stored) and presents it here as cp0_mmu_satp_data. The MMU
+    // extracts the fields and forms the per-port translation enable:
+    //   sv39_en   = satp[63]                  (donor regs_mmu_en)
+    //   xx_mmu_en = Sv39 && priv != M         (donor aq_mmu_regs.v)
+    // M-mode and bare accesses (xx_mmu_en=0) take the mach/identity path
+    // (D14) -- still PMP-checked once PMP joins (Tasks 5/6). Until the
+    // TLB/PTW storage exists (Task 4) BOTH ports stay on the identity+PMA
+    // path, so the OFF template (satp=0 reset, or any M-mode access) is
+    // bit-exact with the M2/M3 stub (G5 off-template equivalence). MXR/SUM
+    // (cp0_mmu_mxr/_sum) feed the PTE permission predicate at Task 4.
+    //=========================================================================
+    wire        sv39_en   = cp0_mmu_satp_data[63];
+    wire [15:0] satp_asid = cp0_mmu_satp_data[59:44];
+    wire [MMU_PA_WIDTH-1:0] satp_ppn = cp0_mmu_satp_data[MMU_PA_WIDTH-1:0];
 
-    wire ifu_ca = pma_cacheable(ifu_mmu_va[MMU_PA_WIDTH-1:0]);
+    wire ifu_mmu_en = sv39_en && (cp0_yy_priv_mode  != PRIV_M);
+    wire lsu_mmu_en = sv39_en && (lsu_mmu_priv_mode != PRIV_M);
+
+    // satp-write flush (donor aq_cp0_prtc_csr.v): any accepted satp write
+    // pulses cp0_mmu_satp_wen; it invalidates the TLB at Task 4.
+    wire satp_write_flush = cp0_mmu_satp_wen;
+
+    // Task 4 consumers not yet built -- keep the carries visible, no effect.
+    wire _t4_unused = ifu_mmu_en ^ lsu_mmu_en ^ satp_write_flush
+                    ^ cp0_mmu_mxr ^ cp0_mmu_sum ^ (|satp_asid) ^ (|satp_ppn)
+                    ^ ifu_mmu_abort ^ lsu_mmu_st_inst;
+
+    // ---- ITLB port (IFU) ----
+    wire [4:0] ifu_attr = sysmap_attr(ifu_mmu_va[MMU_PA_WIDTH-1:0]);
+    wire       ifu_ca   = ifu_attr[3];
 
     assign mmu_ifu_access_fault = 1'b0;
     assign mmu_ifu_pa           = ifu_mmu_va[MMU_PA_WIDTH-1:0];
-    assign mmu_ifu_pa_vld       = 1'b1;                          // contract 2: never a miss
-    // {pgflt, supv, ca, ba, sec} -- pinned by ICache.v's own header from
-    // icache.v's actual consumers; pgflt/sec permanently 0 (no fault-capable
-    // MMU exists until M4), supv permissively 1 (M2 is M-mode-only, matching
-    // RVProc.v's M1 inline stub convention this module replaces).
-    assign mmu_ifu_prot = {1'b0, 1'b1, ifu_ca, ifu_ca, 1'b0};
+    assign mmu_ifu_pa_vld       = 1'b1;                          // no TLB miss until Task 4
+    // {pgflt, supv, ca, ba, sec} -- pgflt/sec 0 and supv permissively 1
+    // until translation (Task 4/6); ba = bufferable attribute (== ca in this
+    // table, bit-exact with the M2 stub).
+    assign mmu_ifu_prot = {1'b0, 1'b1, ifu_ca, ifu_attr[2], 1'b0};
 
     // ---- DTLB port (LSU) ----
-    wire _lsu_priv_unused = lsu_mmu_priv_mode[0] ^ lsu_mmu_priv_mode[1];
-    wire _lsu_st_unused   = lsu_mmu_st_inst;   // no permission checks in M2 (bare M-mode)
-
     // `lsu_mmu_va` is the PAGE NUMBER, not the byte address -- the SAME
-    // convention as the ITLB port above (icache.v drives
-    // `icache_rd_addr[63:12]`). Donor proof: aq_lsu_ag.v:1566 `assign
-    // lsu_mmu_va[51:0] = ag_pipe_addr[63:12]`, response aq_lsu_ag.v:201
-    // `input [27:0] mmu_lsu_pa`, PA reassembled by the requester itself,
-    // aq_lsu_ag.v:1446 `ag_pipe_pa = {mmu_pa, ag_pipe_addr[11:0]}`. (An
-    // earlier revision of this file misread contract 2's "va[51:0]" as a
-    // byte VA and did the >>12 HERE; a donor check found LSU.v was the
-    // module that deviated, so the shift lives in LSU.v -- 2026-08-23.)
-    wire lsu_ca = pma_cacheable(lsu_mmu_va[MMU_PA_WIDTH-1:0]);
+    // convention as the ITLB port above (donor aq_lsu_ag.v:1566 `lsu_mmu_va
+    // = ag_pipe_addr[63:12]`, response `mmu_lsu_pa[27:0]`, PA reassembled by
+    // the requester, aq_lsu_ag.v:1446).
+    wire [4:0] lsu_attr = sysmap_attr(lsu_mmu_va[MMU_PA_WIDTH-1:0]);
 
-    assign mmu_lsu_pa           = lsu_mmu_va[MMU_PA_WIDTH-1:0];   // identity map: page in, page out
-    assign mmu_lsu_pa_vld       = 1'b1;                            // contract 2: never a miss
-    assign mmu_lsu_ca           = lsu_ca;
-    assign mmu_lsu_so           = !lsu_ca;
-    assign mmu_lsu_buf          = lsu_ca;
-    assign mmu_lsu_sec          = 1'b0;
-    assign mmu_lsu_sh           = 1'b0;
+    assign mmu_lsu_pa           = lsu_mmu_va[MMU_PA_WIDTH-1:0];   // identity: page in, page out
+    assign mmu_lsu_pa_vld       = 1'b1;                            // no TLB miss until Task 4
+    assign mmu_lsu_ca           = lsu_attr[3];
+    assign mmu_lsu_so           = lsu_attr[4];
+    assign mmu_lsu_buf          = lsu_attr[2];
+    assign mmu_lsu_sec          = lsu_attr[0];
+    assign mmu_lsu_sh           = lsu_attr[1];
     assign mmu_lsu_page_fault   = 1'b0;
     assign mmu_lsu_access_fault = 1'b0;
 
