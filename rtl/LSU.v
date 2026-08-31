@@ -198,6 +198,11 @@ module LSU #(
     // M3b Task E: MHINT.amr (ext_csr.v:881) enabling the AMR streaming-store
     // write-allocate disabler below (00 = off, the reset default).
     input  wire [1:0]               cp0_lsu_amr,
+    // M4 Task 1: privilege/MPRV controls (CSR.v storage; the effective
+    // lsu_mmu_priv_mode resolution moves here at Task 5).
+    input  wire                     cp0_lsu_mprv,
+    input  wire [1:0]               cp0_lsu_mpp,
+    input  wire [1:0]               cp0_yy_priv_mode,
 
     //=========================================================================
     // AXI Master Interface - DCache (ch[1]) -- copied verbatim from
@@ -371,7 +376,10 @@ module LSU #(
     // clone-faithful; corrected against the donor 2026-08-23.
     assign lsu_mmu_va        = ag_addr[12 +: MMU_VA_WIDTH];      // = ag_addr[63:12]
     assign lsu_mmu_va_vld    = ag_valid;
-    assign lsu_mmu_priv_mode = 2'b11;          // M-mode always (M2 has no other level)
+    // M4 Task 1: effective data-access privilege (donor aq_lsu_ag.v:674-675:
+    // MPRV redirects loads/stores to MPP's privilege). While MPRV=0 this is
+    // the current mode (M-mode = 2'b11 for the existing battery).
+    assign lsu_mmu_priv_mode = cp0_lsu_mprv ? cp0_lsu_mpp : cp0_yy_priv_mode;
     assign lsu_mmu_st_inst   = ag_is_store;
 
     // Full 40-bit PA: MMU's translated page number + AG's own (untranslated)

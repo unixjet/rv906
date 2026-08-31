@@ -246,8 +246,12 @@ static void test_reset_state(void) {
     check(dut->cp0_rtu_ex1_wb_vld == 0, "reset: wb_vld quiescent");
     check(dut->cp0_rtu_ex1_expt_vld == 0, "reset: expt_vld quiescent");
     check(dut->cp0_rtu_ex1_chgflw == 0, "reset: chgflw quiescent");
-    check(csr_read(CSR_MSTATUS) == 0x1800,
-          "reset: mstatus reads MPP=11,MIE=0,MPIE=0 (0x1800)", csr_read(CSR_MSTATUS), 0x1800);
+    // M4: mstatus reset now carries the donor's full RV64 shape: SXL/UXL=2'b10
+    // (bits 35:32 = 0xA), MPP=11 (bits 12:11), SPP=1 (bit 8) -- donor
+    // aq_cp0_trap_csr.v:499-501,654. 0xA00001900.
+    check(csr_read(CSR_MSTATUS) == 0xA00001900ULL,
+          "reset: mstatus reads SXL/UXL=10,MPP=11,SPP=1 (0xA00001900)",
+          csr_read(CSR_MSTATUS), 0xA00001900ULL);
     check(csr_read(CSR_MHCR) == 0x108,
           "reset: MHCR reads wb=1(bit3)+wbr=1(bit8)=0x108, rest 0", csr_read(CSR_MHCR), 0x108);
     check(csr_read(CSR_MXSTATUS) == (1ULL << MXSTATUS_MM),
@@ -348,7 +352,9 @@ static void test_csrrci_rmw(void) {
 
 static void test_mret_pop(void) {
     // Arrange: MIE=1, MPIE=0 via csrrw mstatus (bit3=MIE, bit7=MPIE).
-    csr_write(CSR_MSTATUS, (1ULL << 3));
+    // M4: keep MPP=M(11) so mret stays in M-mode (full-CSRRW would otherwise
+    // clear MPP to 0 and drop the bench to U-mode for later tests).
+    csr_write(CSR_MSTATUS, (1ULL << 3) | (3ULL << 11));
     check((csr_read(CSR_MSTATUS) & 0x88) == 0x08, "mret setup: MIE=1,MPIE=0 written");
     csr_write(CSR_MEPC, 0x80001000ULL);
 
@@ -370,7 +376,8 @@ static void test_mret_pop(void) {
 
 static void test_mret_pop_bit_semantics(void) {
     // Precise MIE<=MPIE / MPIE<=1 semantics, isolated from T9a's setup.
-    csr_write(CSR_MSTATUS, (1ULL << 7));   // MPIE=1, MIE=0
+    // M4: keep MPP=M(11) so mret stays in M-mode.
+    csr_write(CSR_MSTATUS, (1ULL << 7) | (3ULL << 11));   // MPIE=1, MIE=0
     check(((csr_read(CSR_MSTATUS) >> 7) & 1) == 1, "mret bit-semantics: MPIE=1 written");
     check(((csr_read(CSR_MSTATUS) >> 3) & 1) == 0, "mret bit-semantics: MIE=0 written");
 

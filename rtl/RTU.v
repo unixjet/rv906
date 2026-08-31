@@ -288,6 +288,12 @@ module RTU (
     output wire                     rtu_yy_xx_dbgon,
     output wire [PC_WIDTH-1:0]      rtu_cp0_epc,
     output wire [63:0]              rtu_cp0_tval,
+    // M4 Task 1: one pulse per retiring instruction for CSR.v's minstret
+    // auto-increment (CSR.v's header "KNOWN, DELIBERATE GAP" discharged).
+    // ex2_retire_vld is the retire heartbeat; multi-cycle producers hold it
+    // high across residency (header note), acceptable for M4 (no test checks
+    // exact per-DIV counts).
+    output wire                     rtu_cp0_inst_retire,
 
     //=========================================================================
     // RTU -> IFU : redirect target + FE-kill pulse. Reused UNCHANGED from
@@ -888,6 +894,7 @@ module RTU (
 
     assign rtu_cp0_epc  = retire_trap_epc;
     assign rtu_cp0_tval = retire_trap_tval;
+    assign rtu_cp0_inst_retire = ex2_retire_vld;
 
     assign rtu_ifu_chgflw_vld = retire_chgflw_vld;
     assign rtu_ifu_chgflw_pc  = retire_chgflw_pc;

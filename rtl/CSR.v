@@ -145,6 +145,10 @@ module CSR #(
     input  wire                     rtu_yy_xx_flush,
     input  wire [PC_WIDTH-1:0]      rtu_cp0_epc,
     input  wire [63:0]              rtu_cp0_tval,
+    // M4 Task 1: one pulse per architecturally-retiring instruction, feeding
+    // minstret's auto-increment (this file's header "KNOWN, DELIBERATE GAP"
+    // note is discharged here; RTU.v exposes ex2_retire_vld, wired by RVProc).
+    input  wire                     rtu_cp0_inst_retire,
 
     //=========================================================================
     // CSR -> IFU/ICache/BPU : MHCR fan-out, replacing FetchSink's harness
@@ -181,6 +185,35 @@ module CSR #(
     output wire [1:0]               cp0_lsu_dcache_pref_dist,
     // M3b Task E: MHINT.amr to the LSU's AMR (ext_csr.v:881).
     output wire [1:0]               cp0_lsu_amr,
+
+    //=========================================================================
+    // M4 Task 2: PMP register interface. The pmpcfg/pmpaddr STORAGE lives in
+    // rtl/PMP.v (mirroring donor aq_pmp_regs inside aq_pmp_top); CSR.v decodes
+    // the addresses, strokes the writes, and reads back via pmp_*_value.
+    //=========================================================================
+    output wire                     pmp_cfg0_wen,
+    output wire [63:0]              pmp_cfg0_wdata,
+    output wire [7:0]               pmp_addr_wen,
+    output wire [63:0]              pmp_addr_wdata,
+    output wire [2:0]               pmp_addr_rsel,
+    input  wire [63:0]              pmp_cfg0_value,
+    input  wire [63:0]              pmp_addr_value,
+    // current privilege mode fed to PMP (for the M-mode bypass)
+    output wire [1:0]               cp0_pmp_priv_mode,
+
+    //=========================================================================
+    // M4 Task 1: privilege + MMU controls. cp0_yy_priv_mode is the current
+    // privilege mode broadcast (donor aq_cp0_trap_csr.v:1390). satp routing +
+    // MXR/SUM/MPRV feed the MMU/LSU (wired through RVProc; the MMU gives them
+    // meaning at Tasks 3-5). cp0_rtu_trap_pc's M/S mux lives below.
+    //=========================================================================
+    output wire [1:0]               cp0_yy_priv_mode,
+    output wire [63:0]              cp0_mmu_satp_data,
+    output wire                     cp0_mmu_satp_wen,
+    output wire                     cp0_mmu_mxr,
+    output wire                     cp0_mmu_sum,
+    output wire                     cp0_lsu_mprv,
+    output wire [1:0]               cp0_lsu_mpp,
     // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1): FENCE/FENCE.I
     // hold in EX1 while this is low -- stores must reach their completion
     // point before the fence's I-side invalidate (or any later observer) may
@@ -240,6 +273,11 @@ module CSR #(
     wire is_ecall  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_ECALL);
     wire is_ebreak = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_EBREAK);
     wire is_mret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_MRET);
+    // M4: SRET / WFI / SFENCE.VMA (IDU decodes them as CP0 ops; privilege-
+    // based legality -- TSR/TW/TVM/U-mode -- is checked below in CSR.v).
+    wire is_sret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_SRET);
+    wire is_wfi    = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_WFI);
+    wire is_sfence = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_SFENCE);
     // FENCE/FENCE.I serialization sequence (Task 10.1, rv64ui-p-fence_i;
     // donor aq_cp0_fence_inst.v's FNC_FENC->FNC_CDCA->FNC_IICA ordering):
     // (1) hold in EX1 until the LSU is quiescent (`lsu_cp0_stb_empty` --
@@ -321,62 +359,232 @@ module CSR #(
     // this file's `mcycle_local_en` write path (wdata==rdata|0==rdata) and
     // SUPPRESS that cycle's natural +1 increment -- caught by this file's
     // own unit bench (csr_tb.cpp T20) before it ever reached Task 4.
-    wire rs1_is_x0 = (idu_cp0_ex1_opcode[19:15] == 5'b0);
-    wire csr_wen   = is_csr_op && (csr_write_form || !rs1_is_x0);
+    wire rs1_is_x0   = (idu_cp0_ex1_opcode[19:15] == 5'b0);
+    wire csr_wen_raw = is_csr_op && (csr_write_form || !rs1_is_x0);
+    // M4: an illegal CSR access (privilege/RO/TVM) raises an exception and
+    // must NOT write (spec). csr_wen is csr_access_illegal-gated; the gate is
+    // defined in the exception section below (forward ref), and csr_ro_write
+    // there uses csr_wen_raw (not csr_wen) to keep the graph acyclic.
+    wire csr_wen     = csr_wen_raw && !csr_access_illegal;
 
-    // MRET/trap sequencing shares the exact same three-way priority the
-    // donor's mstatus/mepc/mcause/mtval always-blocks use (trap capture >
-    // mret pop > software CSR write > hold) -- one flop per bit, no FSM
-    // (CP0 note B1).
-    wire mret_fire = is_mret;
+    // MRET/SRET/trap sequencing shares the same priority the donor's
+    // mstatus/mepc/mcause/mtval always-blocks use (trap capture > xret pop >
+    // software CSR write > hold) -- one flop per bit, no FSM (CP0 note B1).
+    // xret_fire is gated by the privilege checks below (an illegal mret/sret
+    // must NOT change pm); the illegal condition itself is raised as vec 2 in
+    // the exception section. pm_r/tsr_f/tw_f/tvm_f are forward references to
+    // the flops defined in the PRIVILEGE/MSTATUS sections below.
+    wire mret_priv_illegal  = is_mret && (pm_r != PRIV_M);
+    wire sret_priv_illegal  = is_sret && ((pm_r == PRIV_U)
+                                          || (pm_r == PRIV_S && tsr_f));
+    wire wfi_priv_illegal   = is_wfi  && (pm_r != PRIV_M) && tw_f;
+    wire sfence_priv_illegal= is_sfence && ((pm_r == PRIV_U)
+                                          || (pm_r == PRIV_S && tvm_f));
+    wire xret_illegal = mret_priv_illegal || sret_priv_illegal
+                      || wfi_priv_illegal || sfence_priv_illegal;
+    wire mret_fire = is_mret && !mret_priv_illegal;
+    wire sret_fire = is_sret && !sret_priv_illegal;
 
     //=========================================================================
-    // SECTION MSTATUS -- only MIE/MPIE are real flops; MPP tied 2'b11 RO;
-    // everything else tied 0/RO (contract 7, design doc S2.3.6). Trap-entry
-    // swap / mret pop confirmed bit-exact, aq_cp0_trap_csr.v:669-711:
-    //   trap : mpie <= mie_bit; mie_bit <= 1'b0;
-    //   mret : mie_bit <= mpie; mpie <= 1'b1;
-    //   sw wr: mpie <= wdata[7]; mie_bit <= wdata[3];
-    // (the donor's `!mdeleg_vld_dp` qualifier is dropped -- M2 has no S-mode
-    // to delegate to, so it is unconditionally true here.)
+    // SECTION PRIVILEGE MODE + DELEGATION (M4 Task 1). pm register + the
+    // trap-to-M-vs-S routing, donor aq_cp0_trap_csr.v:590-631 (pm FSM) and
+    // :755-849 (medeleg/mideleg + mdeleg_vld). VERBATIM spans cited in the
+    // extraction notes §B.1/§B.2.
     //=========================================================================
-    reg mie_bit, mpie_bit;
-    wire mstatus_local_en = csr_wen && (csr_addr == CSR_MSTATUS);
+    // Delegation registers. medeleg: 16-bit, write mask hardwires bits
+    // 14/11/10 to 0 (donor :755-757; delegable 0-9,12,13,15). mideleg: S
+    // interrupt bits SSIP(1)/STIP(5)/SEIP(9) writable (donor :815-838).
+    reg [15:0] medeleg_reg;
+    reg [63:0] mideleg_reg;
+    wire medeleg_local_en = csr_wen && (csr_addr == CSR_MEDELEG);
+    wire mideleg_local_en = csr_wen && (csr_addr == CSR_MIDELEG);
 
     always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            medeleg_reg <= 16'd0;
+        else if (medeleg_local_en)
+            medeleg_reg <= {csr_wdata[15], 1'b0, csr_wdata[13:12], 2'b0,
+                            csr_wdata[9:0]};
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            mideleg_reg <= 64'd0;
+        else if (mideleg_local_en)
+            mideleg_reg <= csr_wdata & 64'h0000_0000_0000_022A;  // bits 1,5,9
+    end
+
+    // mdeleg_vld (donor :796-798 exceptions, :848-849 interrupts): a trap is
+    // delegated to S only when taken from below M and the cause's bit is set.
+    wire trap_vld      = rtu_yy_xx_expt_vld;
+    wire trap_int      = rtu_yy_xx_expt_int;
+    wire [4:0] trap_vec = rtu_yy_xx_expt_vec;
+    wire trap_deleg    = trap_vld && (pm_r != PRIV_M) &&
+                         (trap_int ? mideleg_reg[{1'b0, trap_vec}]
+                                   : (trap_vec <= 5'd15) && medeleg_reg[trap_vec[3:0]]);
+
+    // pm register (donor :590-631). Priority mret > sret > trap (the data-mux
+    // order below is the donor's; mret/sret are gated by rtu_idu_commit so a
+    // same-cycle older trap always wins in practice, see the DECODE note).
+    reg [1:0] pm_r;
+    reg [1:0] pm_wdata;
+    wire      pm_wen = trap_vld || mret_fire || sret_fire;
+    always @* begin
+        if (mret_fire)                 pm_wdata = mpp_field;
+        else if (sret_fire)            pm_wdata = {1'b0, spp_field};
+        else if (trap_vld && !trap_deleg) pm_wdata = PRIV_M;
+        else                           pm_wdata = PRIV_S;   // trap && trap_deleg
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) pm_r <= PRIV_M;
+        else if (pm_wen) pm_r <= pm_wdata;
+    end
+    assign cp0_yy_priv_mode = pm_r;
+
+    //=========================================================================
+    // SECTION MSTATUS -- full arm set (M4 Task 1; donor aq_cp0_trap_csr.v
+    // :639-727). Fields: MIE/MPIE/SIE/SPIE (trap/xret swap), MPP/SPP
+    // (trap/xret), SUM/MXR/MPRV/TSR/TW/TVM/FS (software-write only), SD
+    // computed (FS==dirty). Reset: MPP=11, SPP=1, all else 0 (donor,
+    // extraction notes §B.1). MPP write is WARL: 2'b10 -> 2'b00.
+    //=========================================================================
+    reg mie_f, mpie_f, sie_f, spie_f, spp_f, sum_f, mxr_f, mprv_f, tsr_f, tw_f, tvm_f;
+    reg [1:0] mpp_field;
+    wire [1:0] spp_field_w = {1'b0, spp_f};   // SPP is 1-bit; alias for pm mux
+    wire spp_field = spp_f;
+    wire mstatus_local_en  = csr_wen && (csr_addr == CSR_MSTATUS);
+    wire sstatus_local_en  = csr_wen && (csr_addr == CSR_SSTATUS);
+    wire mstatus_wr        = mstatus_local_en || sstatus_local_en;
+    wire [1:0] mpp_write   = (csr_wdata[12:11] == 2'b10) ? 2'b00 : csr_wdata[12:11];
+
+    wire trap_to_m = trap_vld && !trap_deleg;
+    wire trap_to_s = trap_vld &&  trap_deleg;
+
+    // MIE / MPIE (M path: trap_to_m clears MIE, mret pops MPIE).
+    always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            mie_bit  <= 1'b0;
-            mpie_bit <= 1'b0;
-        end else if (rtu_yy_xx_expt_vld) begin
-            mpie_bit <= mie_bit;
-            mie_bit  <= 1'b0;
+            mie_f  <= 1'b0;
+            mpie_f <= 1'b0;
+        end else if (trap_to_m) begin
+            mpie_f <= mie_f;
+            mie_f  <= 1'b0;
         end else if (mret_fire) begin
-            mie_bit  <= mpie_bit;
-            mpie_bit <= 1'b1;
-        end else if (mstatus_local_en) begin
-            mpie_bit <= csr_wdata[7];
-            mie_bit  <= csr_wdata[3];
+            mie_f  <= mpie_f;
+            mpie_f <= 1'b1;
+        end else if (mstatus_wr) begin
+            mpie_f <= csr_wdata[MSTATUS_MPIE_BIT];
+            mie_f  <= csr_wdata[MSTATUS_MIE_BIT];
         end
     end
 
-    // Layout matches the real 64-bit mstatus bit positions (trap_csr.v:
-    // 486-494) with every non-implemented field tied 0: [12:11]=MPP(fixed
-    // 2'b11, contract 7 -- no other privilege level exists to hold), [7]=
-    // MPIE, [3]=MIE, everything else (SD/MPV/SXL/UXL/TSR/TM/TVM/MXR/SUM/
-    // MPRV/FS/SPP/SPIE/SIE/...) reads 0.
-    wire [63:0] mstatus_value = {51'b0, 2'b11, 3'b0,
-                                 mpie_bit, 1'b0, 1'b0, 1'b0,
-                                 mie_bit,  1'b0, 1'b0, 1'b0};
+    // SIE / SPIE (S path: trap_to_s clears SIE, sret pops SPIE).
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sie_f  <= 1'b0;
+            spie_f <= 1'b0;
+        end else if (trap_to_s) begin
+            spie_f <= sie_f;
+            sie_f  <= 1'b0;
+        end else if (sret_fire) begin
+            sie_f  <= spie_f;
+            spie_f <= 1'b1;
+        end else if (mstatus_wr) begin
+            spie_f <= csr_wdata[MSTATUS_SPIE_BIT];
+            sie_f  <= csr_wdata[MSTATUS_SIE_BIT];
+        end
+    end
+
+    // MPP (trap_to_m captures pm; mret sets U) and SPP (trap_to_s captures
+    // pm[0]; sret sets 0).
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            mpp_field <= PRIV_M;
+        else if (trap_to_m)
+            mpp_field <= pm_r;
+        else if (mret_fire)
+            mpp_field <= PRIV_U;
+        else if (mstatus_wr)
+            mpp_field <= mpp_write;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            spp_f <= 1'b1;                 // donor reset SPP=1
+        else if (trap_to_s)
+            spp_f <= pm_r[0];
+        else if (sret_fire)
+            spp_f <= 1'b0;
+        else if (mstatus_wr)
+            spp_f <= csr_wdata[MSTATUS_SPP_BIT];
+    end
+
+    // Software-write-only arms (SUM/MXR/MPRV/TSR/TW/TVM/FS). Writable from
+    // both mstatus and sstatus views (donor :535-557); only the S-visible
+    // subset (SUM/MXR/FS/SPP/SPIE/SIE) takes an sstatus write.
+    wire sstatus_subset = sstatus_local_en;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sum_f  <= 1'b0;
+            mxr_f  <= 1'b0;
+            mprv_f <= 1'b0;
+            tsr_f  <= 1'b0;
+            tw_f   <= 1'b0;
+            tvm_f  <= 1'b0;
+        end else if (mstatus_local_en) begin
+            sum_f  <= csr_wdata[MSTATUS_SUM_BIT];
+            mxr_f  <= csr_wdata[MSTATUS_MXR_BIT];
+            mprv_f <= csr_wdata[MSTATUS_MPRV_BIT];
+            tsr_f  <= csr_wdata[MSTATUS_TSR_BIT];
+            tw_f   <= csr_wdata[MSTATUS_TW_BIT];
+            tvm_f  <= csr_wdata[MSTATUS_TVM_BIT];
+        end else if (sstatus_subset) begin
+            sum_f  <= csr_wdata[MSTATUS_SUM_BIT];
+            mxr_f  <= csr_wdata[MSTATUS_MXR_BIT];
+        end
+    end
+
+    // FS: M4 keeps it storage-only (no FPU until M5); writes accepted so
+    // software (rv64si-p-csr sets FS via mstatus) behaves, reads back.
+    reg [1:0] fs_field;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            fs_field <= 2'b00;
+        else if (mstatus_wr)
+            fs_field <= csr_wdata[MSTATUS_FS_HI:MSTATUS_FS_LO];
+    end
+    wire sd_bit = (fs_field == 2'b11);
+
+    // 64-bit mstatus layout (donor trap_csr.v:486-494). SXL/UXL = 2'b10 RO.
+    // Bit map: [63]SD [62:38]rsvd [37:36]SBE/MBE=0 [35:34]SXL [33:32]UXL
+    // [31:23]rsvd [22]TSR [21]TW [20]TVM [19]MXR [18]SUM [17]MPRV [16:15]XS
+    // [14:13]FS [12:11]MPP [10:9]VS [8]SPP [7]MPIE [6]UBE [5]SPIE [4]UPIE
+    // [3]MIE [2]rsvd [1]SIE [0]UIE.
+    wire [63:0] mstatus_value =
+          {sd_bit, 25'b0, 2'b0, 2'b10, 2'b10, 9'b0,     // [63:23]
+           tsr_f, tw_f, tvm_f, mxr_f, sum_f, mprv_f,    // [22:17]
+           2'b0, fs_field, mpp_field, 2'b0,             // [16:15]XS [14:13]FS [12:11]MPP [10:9]VS
+           spp_f, mpie_f, 1'b0, spie_f, 1'b0, mie_f, 1'b0, sie_f, 1'b0};
+    // sstatus is the S-view (donor :742-745): SD, UXL, MXR, SUM, FS, SPP,
+    // SPIE, SIE visible; M-only fields (TSR/TW/TVM/MPRV/MPP/MPIE/MIE) read 0.
+    wire [63:0] sstatus_value =
+          {sd_bit, 29'b0, 2'b10, 12'b0,                 // [63:34] [33:32]UXL [31:20]rsvd
+           mxr_f, sum_f, 3'b0, fs_field, 4'b0,          // [19:18] [17:15]MPRV/XS=0 [14:13]FS [12:9]MPP/VS=0
+           spp_f, 1'b0, 1'b0, spie_f, 1'b0, 1'b0, 1'b0, sie_f, 1'b0};
+
 
     //=========================================================================
-    // SECTION MTVEC -- real flop, direct mode only (contract 7): mode bit
-    // (and the reserved bit above it) tied 0; writes attempting vectored
-    // mode are accepted-but-ignored on the mode bit (i.e. the mode bit is
-    // simply never stored). Base layout matches trap_csr.v:956
-    // (`mtvec_value = {mtvec_base[61:0], 1'b0, mtvec_mode[0]}`).
+    // SECTION MTVEC / STVEC -- real flops, direct mode only (contract 7):
+    // mode bit tied 0 (accepted-but-ignored). M4 Task 1 adds stvec; the
+    // trap redirect target is muxed on the POST-trap pm (donor
+    // aq_cp0_trap_csr.v:1346-1359): M trap -> mtvec, delegated S trap ->
+    // stvec. pm updates on the expt_vld cycle, so the mux is settled by the
+    // time RTU samples cp0_rtu_trap_pc (one cycle later; the donor timing
+    // subtlety, extraction notes §B.4).
     //=========================================================================
     reg [PC_WIDTH-3:0] mtvec_base;   // bits [PC_WIDTH-1:2]
+    reg [PC_WIDTH-3:0] stvec_base;
     wire mtvec_local_en = csr_wen && (csr_addr == CSR_MTVEC);
+    wire stvec_local_en = csr_wen && (csr_addr == CSR_STVEC);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
@@ -385,42 +593,64 @@ module CSR #(
             mtvec_base <= csr_wdata[PC_WIDTH-1:2];
     end
 
-    wire [PC_WIDTH-1:0] mtvec_pc    = {mtvec_base, 2'b00};   // mode forced 0 (direct)
-    wire [63:0]         mtvec_value = {{(64-PC_WIDTH){1'b0}}, mtvec_pc};
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            stvec_base <= {(PC_WIDTH-2){1'b0}};
+        else if (stvec_local_en)
+            stvec_base <= csr_wdata[PC_WIDTH-1:2];
+    end
 
-    // The one direct-mode redirect target RTU needs every cycle it takes a
-    // trap (see this file's header "TASK 2 DISCOVERED GAP" note) -- exposed
-    // unconditionally, not gated on any dispatch/valid signal, exactly like
-    // the donor's own `cp0_rtu_trap_pc` (aq_cp0_trap_csr.v:1396).
-    assign cp0_rtu_trap_pc = mtvec_pc;
+    wire [PC_WIDTH-1:0] mtvec_pc    = {mtvec_base, 2'b00};   // mode forced 0 (direct)
+    wire [PC_WIDTH-1:0] stvec_pc    = {stvec_base, 2'b00};
+    wire [63:0]         mtvec_value = {{(64-PC_WIDTH){1'b0}}, mtvec_pc};
+    wire [63:0]         stvec_value = {{(64-PC_WIDTH){1'b0}}, stvec_pc};
+
+    // The trap redirect target RTU reads every cycle it takes a trap (see
+    // this file's header "TASK 2 DISCOVERED GAP" note) -- muxed on the
+    // current pm, which already holds the post-trap mode when RTU samples.
+    assign cp0_rtu_trap_pc = (pm_r == PRIV_M) ? mtvec_pc : stvec_pc;
 
     //=========================================================================
-    // SECTION MEPC -- real flop, LSB forced 0 on write (contract 7, matches
-    // `regs_iui_mepc={mepc_reg[38:0],1'b0}`, trap_csr.v:1382). Trap-entry
-    // capture confirmed bit-exact, trap_csr.v:1039-1049 (`mepc_reg[62:0] <=
-    // rtu_cp0_epc[63:1]` on `rtu_yy_xx_expt_vld`, else on `mepc_local_en`).
+    // SECTION MEPC / SEPC -- real flops, LSB forced 0 on write. Trap-entry
+    // capture routed by delegation (donor trap_csr.v:1039-1049 mepc,
+    // :1061-1073 sepc): non-delegated traps capture mepc, delegated traps
+    // capture sepc.
     //=========================================================================
     reg [PC_WIDTH-2:0] mepc_reg;   // stores epc[PC_WIDTH-1:1]; LSB re-added on read
+    reg [PC_WIDTH-2:0] sepc_reg;
     wire mepc_local_en = csr_wen && (csr_addr == CSR_MEPC);
+    wire sepc_local_en = csr_wen && (csr_addr == CSR_SEPC);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             mepc_reg <= {(PC_WIDTH-1){1'b0}};
-        else if (rtu_yy_xx_expt_vld)
+        else if (trap_vld && !trap_deleg)
             mepc_reg <= rtu_cp0_epc[PC_WIDTH-1:1];
         else if (mepc_local_en)
             mepc_reg <= csr_wdata[PC_WIDTH-1:1];
     end
 
-    wire [PC_WIDTH-1:0] mepc_pc    = {mepc_reg, 1'b0};
-    wire [63:0]         mepc_value = {{(64-PC_WIDTH){1'b0}}, mepc_pc};
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            sepc_reg <= {(PC_WIDTH-1){1'b0}};
+        else if (trap_vld && trap_deleg)
+            sepc_reg <= rtu_cp0_epc[PC_WIDTH-1:1];
+        else if (sepc_local_en)
+            sepc_reg <= csr_wdata[PC_WIDTH-1:1];
+    end
 
-    // mret's redirect target -- CP0 computes it itself and asserts
-    // chgflw/chgflw_pc during its own EX1 cycle, uniform with every other
-    // CP0-declared changeflow (RTU note S7: "MRET/SRET redirect is uniform
-    // with every other changeflow... CP0 computes the return PC itself").
-    assign cp0_rtu_ex1_chgflw    = mret_fire || (is_fencei && (fencei_state == FI_CMPLT));
+    wire [PC_WIDTH-1:0] mepc_pc    = {mepc_reg, 1'b0};
+    wire [PC_WIDTH-1:0] sepc_pc    = {sepc_reg, 1'b0};
+    wire [63:0]         mepc_value = {{(64-PC_WIDTH){1'b0}}, mepc_pc};
+    wire [63:0]         sepc_value = {{(64-PC_WIDTH){1'b0}}, sepc_pc};
+
+    // mret/sret redirect targets -- CP0 computes the return PC itself and
+    // asserts chgflw/chgflw_pc during the xret's own EX1 cycle, uniform with
+    // every other CP0-declared changeflow (RTU note S7).
+    assign cp0_rtu_ex1_chgflw    = mret_fire || sret_fire
+                                 || (is_fencei && (fencei_state == FI_CMPLT));
     assign cp0_rtu_ex1_chgflw_pc = mret_fire ? mepc_pc
+                                 : sret_fire ? sepc_pc
                                              : iu_cp0_ex1_cur_pc + {{(PC_WIDTH-3){1'b0}}, 3'd4};
 
     // FENCE.I walk requests (Task 10.1): FI_CLEAN holds the LSU's D-cache
@@ -442,7 +672,7 @@ module CSR #(
         if (!rst_n) begin
             m_intr   <= 1'b0;
             m_vector <= 5'd0;
-        end else if (rtu_yy_xx_expt_vld) begin
+        end else if (trap_vld && !trap_deleg) begin
             m_intr   <= rtu_yy_xx_expt_int;
             m_vector <= rtu_yy_xx_expt_vec;
         end else if (mcause_local_en) begin
@@ -453,18 +683,47 @@ module CSR #(
 
     wire [63:0] mcause_value = {m_intr, 58'b0, m_vector};
 
+    // SCAUSE (donor trap_csr.v:1117-1141): delegated traps capture here.
+    reg        s_intr;
+    reg  [4:0] s_vector;
+    wire scause_local_en = csr_wen && (csr_addr == CSR_SCAUSE);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            s_intr   <= 1'b0;
+            s_vector <= 5'd0;
+        end else if (trap_vld && trap_deleg) begin
+            s_intr   <= rtu_yy_xx_expt_int;
+            s_vector <= rtu_yy_xx_expt_vec;
+        end else if (scause_local_en) begin
+            s_intr   <= csr_wdata[63];
+            s_vector <= csr_wdata[4:0];
+        end
+    end
+
+    wire [63:0] scause_value = {s_intr, 58'b0, s_vector};
+
     //=========================================================================
-    // SECTION MSCRATCH -- plain flopped R/W register (contract 7; trap_csr.v
-    // :998-1008, trivial).
+    // SECTION MSCRATCH / SSCRATCH -- plain flopped R/W registers (contract 7;
+    // trap_csr.v :998-1008 mscratch, :1018-1028 sscratch, trivial).
     //=========================================================================
     reg [63:0] mscratch_reg;
+    reg [63:0] sscratch_reg;
     wire mscratch_local_en = csr_wen && (csr_addr == CSR_MSCRATCH);
+    wire sscratch_local_en = csr_wen && (csr_addr == CSR_SSCRATCH);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             mscratch_reg <= 64'd0;
         else if (mscratch_local_en)
             mscratch_reg <= csr_wdata;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            sscratch_reg <= 64'd0;
+        else if (sscratch_local_en)
+            sscratch_reg <= csr_wdata;
     end
 
     //=========================================================================
@@ -493,38 +752,74 @@ module CSR #(
                               || (rtu_yy_xx_expt_vec == 5'd15);
 
     reg [63:0] mtval_reg;
+    reg [63:0] stval_reg;
     wire mtval_local_en = csr_wen && (csr_addr == CSR_MTVAL);
+    wire stval_local_en = csr_wen && (csr_addr == CSR_STVAL);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             mtval_reg <= 64'd0;
-        else if (rtu_yy_xx_expt_vld)
+        else if (trap_vld && !trap_deleg)
             mtval_reg <= vec_in_tval_allowlist ? rtu_cp0_tval : 64'd0;
         else if (mtval_local_en)
             mtval_reg <= csr_wdata;
     end
 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            stval_reg <= 64'd0;
+        else if (trap_vld && trap_deleg)
+            stval_reg <= vec_in_tval_allowlist ? rtu_cp0_tval : 64'd0;
+        else if (stval_local_en)
+            stval_reg <= csr_wdata;
+    end
+
     //=========================================================================
-    // SECTION MIE / MIP -- mie is a real R/W flop; mip's bits are pure
-    // read-only wires from mtip/msip/meip (contract 7; trap_csr.v:1234-1245
-    // `assign meip=biu_cp0_me_int; assign mtip=biu_cp0_mt_int; assign msip=
-    // biu_cp0_ms_int` -- NOT flops at all in the donor either). Standard
-    // bit positions MEIP=11/MTIP=7/MSIP=3; mie mirrors the same positions
-    // for the matching enables, though M2 does not gate anything on them
-    // (contract 7: "not required for M2's rv64ui/um pass bar... it is
-    // nearly free given the M1 ports already exist").
+    // SECTION MIE / MIP (+ SIE / SIP views, M4 Task 1). mie is a real R/W
+    // flop. mip has writable SSIP(1)/STIP(5)/SEIP(9) flops plus RO
+    // MEIP(11)/MTIP(7)/MSIP(3) from the pins (donor trap_csr.v:1202-1240).
+    // sie/sip are mideleg-masked views of mie/mip (donor :922-926,:1260-1264);
+    // writes through sie/sip touch only the delegated bits (donor :1216-1221).
+    // Interrupt delivery is M6; M4 provides the storage/views the si/mi tests
+    // exercise.
     //=========================================================================
     reg [63:0] mie_reg;
-    wire mie_local_en = csr_wen && (csr_addr == CSR_MIE);
+    reg        ssip_f, stip_f, seip_f;     // writable S-interrupt pending bits
+    wire mie_local_en  = csr_wen && (csr_addr == CSR_MIE);
+    wire mip_local_en  = csr_wen && (csr_addr == CSR_MIP);
+    wire sie_local_en  = csr_wen && (csr_addr == CSR_SIE);
+    wire sip_local_en  = csr_wen && (csr_addr == CSR_SIP);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             mie_reg <= 64'd0;
         else if (mie_local_en)
             mie_reg <= csr_wdata;
+        else if (sie_local_en)                 // sie write touches delegated bits only
+            mie_reg <= (mie_reg & ~mideleg_reg) | (csr_wdata & mideleg_reg);
     end
 
-    wire [63:0] mip_value = {52'b0, meip, 3'b0, mtip, 3'b0, msip, 3'b0};
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ssip_f <= 1'b0;
+            stip_f <= 1'b0;
+            seip_f <= 1'b0;
+        end else if (mip_local_en) begin
+            ssip_f <= csr_wdata[1];
+            stip_f <= csr_wdata[5];
+            seip_f <= csr_wdata[9];
+        end else if (sip_local_en) begin
+            ssip_f <= csr_wdata[1];            // only SSIP is S-writable
+        end
+    end
+
+    wire mip_meip = meip, mip_mtip = mtip, mip_msip = msip;
+    wire [63:0] mip_value = {52'b0, mip_meip, 3'b0, mip_mtip, 3'b0, mip_msip, 3'b0}
+                          | (64'd1 << 9) * seip_f | (64'd1 << 5) * stip_f | (64'd1 << 1) * ssip_f;
+    // sie/sip views masked by mideleg.
+    wire [63:0] sie_value = mie_reg & mideleg_reg;
+    wire [63:0] sip_value = mip_value & mideleg_reg;
+
 
     //=========================================================================
     // SECTION MISA / MVENDORID / MARCHID / MIMPID / MHARTID -- hardwired RO
@@ -542,27 +837,20 @@ module CSR #(
     wire [63:0] mhartid_value   = 64'd0;
 
     //=========================================================================
-    // SECTION MCYCLE / MINSTRET -- two local free-running 64-bit counters
-    // directly in CSR.v (contract 7), not a PMU stub. `mcycle` increments
-    // every cycle, unconditionally (real RISC-V semantics: counts core
-    // clocks, not retired work) with a plain CSR-write override.
-    //
-    // `minstret` is implemented R/W for real (software can read/write it
-    // today), but does NOT yet auto-increment on retirement: this file's
-    // header "KNOWN, DELIBERATE GAP" note (carried over from Task 1, plan
-    // Task 1.1's own CSR.v bullet: "confirmed in Task 4, not guessed here")
-    // explains why CSR.v's port list has no general "an instruction
-    // retired" pulse yet -- CSR.v only ever sees idu_cp0_ex1_sel fire for
-    // CSR/CP0-dispatched instructions specifically, which would undercount
-    // minstret drastically if used as a stand-in. Task 4 (RTU.v) adds the
-    // real retire-commit pulse to this port list and this always-block
-    // gains its `else if (<pulse>) minstret_reg <= minstret_reg + 1;` arm
-    // then -- an anticipated, documented amendment, not a silent gap.
+    // SECTION MCYCLE / MINSTRET -- two 64-bit counters. mcycle increments
+    // every cycle unconditionally. minstret auto-increments on each retired
+    // architectural instruction (rtu_cp0_inst_retire), with WRITE-TAKES-
+    // PRECEDENCE so an explicit minstret write suppresses the writing
+    // instruction's own retire increment (rv64mi-p-instret_overflow; rv12's
+    // M-1 term, a one-shot flag armed by the commit-gated write that eats
+    // exactly the next retire pulse). M4 Task 1 discharges the header's
+    // "KNOWN, DELIBERATE GAP" minstret note.
     //=========================================================================
     reg [63:0] mcycle_reg;
     reg [63:0] minstret_reg;
     wire mcycle_local_en   = csr_wen && (csr_addr == CSR_MCYCLE);
     wire minstret_local_en = csr_wen && (csr_addr == CSR_MINSTRET);
+    wire inst_retire       = rtu_cp0_inst_retire;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
@@ -573,13 +861,126 @@ module CSR #(
             mcycle_reg <= mcycle_reg + 64'd1;
     end
 
+    // minstret write-precedence one-shot (rv12 CSR.v M-1 term). The writer's
+    // own retirement arrives the cycle after the commit-gated EX1 write; the
+    // flag armed by the write eats exactly that next retire pulse.
+    reg minstret_wr_pend;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            minstret_wr_pend <= 1'b0;
+        else if (minstret_local_en)
+            minstret_wr_pend <= 1'b1;
+        else if (inst_retire)
+            minstret_wr_pend <= 1'b0;
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             minstret_reg <= 64'd0;
         else if (minstret_local_en)
             minstret_reg <= csr_wdata;
-        // else: holds -- see the section header; Task 4 adds the increment arm.
+        else if (inst_retire && !minstret_wr_pend)
+            minstret_reg <= minstret_reg + 64'd1;
     end
+
+    //=========================================================================
+    // SECTION MCOUNTEREN / SCOUNTEREN + user counter aliases (M4 Task 1;
+    // donor aq_cp0_hpcp_csr.v). mcounteren/scounteren are 32-bit R/W; the
+    // user RO aliases cycle(0xC00)/instret(0xC02) are gated by the counteren
+    // chain (M always allowed; S gated by mcounteren; U by mcounteren &
+    // scounteren -- donor :266-276). time(0xC01) is deferred to M6 (D-M4-9).
+    //=========================================================================
+    reg [31:0] mcounteren_reg;
+    reg [31:0] scounteren_reg;
+    wire mcounteren_local_en  = csr_wen && (csr_addr == CSR_MCOUNTEREN);
+    wire scounteren_local_en  = csr_wen && (csr_addr == CSR_SCOUNTEREN);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            mcounteren_reg <= 32'd0;
+        else if (mcounteren_local_en)
+            mcounteren_reg <= csr_wdata[31:0];
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            scounteren_reg <= 32'd0;
+        else if (scounteren_local_en)
+            scounteren_reg <= csr_wdata[31:0];
+    end
+
+    //=========================================================================
+    // SECTION SATP (M4 Task 1 storage; the MMU consumes it at Tasks 3-5).
+    // WARL per donor aq_cp0_prtc_csr.v:139-140: only mode bit 63 is writable
+    // when wdata[62:60]==0 (Mode in {0=Bare, 8=Sv39}); a write with an
+    // unsupported mode leaves the WHOLE register unmodified (spec-conformant
+    // WARL). ASID[59:44] and PPN[27:0] stored. satp writes also pulse
+    // cp0_mmu_satp_wen (flushes the TLB, wired at Task 3).
+    //=========================================================================
+    reg [63:0] satp_reg;
+    wire satp_local_en = csr_wen && (csr_addr == CSR_SATP);
+    wire satp_mode_ok  = (csr_wdata[62:60] == 3'b0);   // Mode bit63 only, Bare/Sv39
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            satp_reg <= 64'd0;
+        else if (satp_local_en && satp_mode_ok)
+            satp_reg <= {csr_wdata[63], 3'b0, csr_wdata[59:44], 16'b0, csr_wdata[27:0]};
+    end
+
+    assign cp0_mmu_satp_data = satp_reg;
+    assign cp0_mmu_satp_wen  = satp_local_en && satp_mode_ok;
+    assign cp0_mmu_mxr       = mxr_f;
+    assign cp0_mmu_sum       = sum_f;
+    assign cp0_lsu_mprv      = mprv_f;
+    assign cp0_lsu_mpp       = mpp_field;
+
+    //=========================================================================
+    // SECTION DEBUG TRIGGERS (M4 Task 1: zero-trigger escape hatch, D-M4-5;
+    // real triggers arrive at M7). tselect/tdata1/tdata2/tdata3/tcontrol are
+    // the ZERO-TRIGGER configuration of the debug spec: tselect hardwired 0
+    // and tdata* read back 0, so rv64mi-p-breakpoint's "unsupported type"
+    // skip fires (csrr tdata1 returns 0 != the written mcontrol value). The
+    // addresses exist (writes are accepted-but-ignored, no illegal trap, so
+    // the test's "csrs tcontrol may trap" branch is free to fall through);
+    // the real trigger registers are built at M7. Donor aq_cp0_regs.v:826-831
+    // (addresses 0x7A0-0x7A5).
+    //=========================================================================
+    wire [63:0] tselect_value  = 64'd0;
+    wire [63:0] tdata1_value   = 64'd0;
+    wire [63:0] tdata2_value   = 64'd0;
+    wire [63:0] tdata3_value   = 64'd0;
+    wire [63:0] tcontrol_value = 64'd0;
+
+    //=========================================================================
+    // SECTION PMP (M4 Task 2). Decode pmpcfg0/pmpcfg2/pmpaddr0-7; the storage
+    // is in rtl/PMP.v. Writes: pmpcfg0_wen / pmp_addr_wen[7:0] strobes. Reads:
+    // pmpcfg0/pmpcfg2 -> pmp_cfg0_value (pmpcfg2 reads 0 inside PMP), and
+    // pmpaddr0-7 -> pmp_addr_value selected by pmp_addr_rsel. The current
+    // privilege mode is exported for PMP's M-mode bypass.
+    //=========================================================================
+    assign pmp_cfg0_wen   = csr_wen && (csr_addr == CSR_PMPCFG0);
+    assign pmp_cfg0_wdata = csr_wdata;
+    // A pmpcfg2 write is a valid CSR access but has no effect in the 8-entry
+    // config (entries 8-15 absent); it is simply not strobed into PMP.
+
+    // pmpaddr0-7 = 0x3B0..0x3B7; wen one-hot by (csr_addr - CSR_PMPADDR0).
+    wire [2:0] pmpaddr_off = csr_addr[2:0];   // 0x3B0..0x3B7 -> off 0..7
+    assign pmp_addr_rsel  = pmpaddr_off;
+    assign pmp_addr_wdata = csr_wdata;
+    genvar gp;
+    generate
+        for (gp = 0; gp < 8; gp = gp + 1) begin : g_pmpwen
+            assign pmp_addr_wen[gp] = csr_wen && (csr_addr == (CSR_PMPADDR0 + gp[11:0]));
+        end
+    endgenerate
+
+    // PMP read values come from PMP.v; pmpcfg2 reads 0.
+    wire [63:0] pmpcfg2_value = 64'd0;
+
+    // current privilege mode for PMP's M-mode bypass
+    assign cp0_pmp_priv_mode = pm_r;
+
 
     //=========================================================================
     // SECTION MHCR -- all bits reset 0 except wb/wbr (hardwired 1, RO);
@@ -704,29 +1105,56 @@ module CSR #(
     //=========================================================================
     function automatic [63:0] csr_read_mux(input [11:0] addr);
         case (addr)
-            CSR_MSTATUS:   csr_read_mux = mstatus_value;
-            CSR_MISA:      csr_read_mux = misa_value;
-            CSR_MIE:       csr_read_mux = mie_reg;
-            CSR_MTVEC:     csr_read_mux = mtvec_value;
-            CSR_MSCRATCH:  csr_read_mux = mscratch_reg;
-            CSR_MEPC:      csr_read_mux = mepc_value;
-            CSR_MCAUSE:    csr_read_mux = mcause_value;
-            CSR_MTVAL:     csr_read_mux = mtval_reg;
-            CSR_MIP:       csr_read_mux = mip_value;
-            CSR_MCYCLE:    csr_read_mux = mcycle_reg;
-            CSR_MINSTRET:  csr_read_mux = minstret_reg;
-            CSR_MVENDORID: csr_read_mux = mvendorid_value;
-            CSR_MARCHID:   csr_read_mux = marchid_value;
-            CSR_MIMPID:    csr_read_mux = mimpid_value;
-            CSR_MHARTID:   csr_read_mux = mhartid_value;
-            CSR_MXSTATUS:  csr_read_mux = mxstatus_value;
-            CSR_MHCR:      csr_read_mux = mhcr_value;
-            CSR_MHINT:     csr_read_mux = mhint_value;
-            default:       csr_read_mux = 64'd0;
+            CSR_MSTATUS:    csr_read_mux = mstatus_value;
+            CSR_MISA:       csr_read_mux = misa_value;
+            CSR_MEDELEG:    csr_read_mux = {48'b0, medeleg_reg};
+            CSR_MIDELEG:    csr_read_mux = mideleg_reg;
+            CSR_MIE:        csr_read_mux = mie_reg;
+            CSR_MTVEC:      csr_read_mux = mtvec_value;
+            CSR_MCOUNTEREN: csr_read_mux = {32'b0, mcounteren_reg};
+            CSR_MSCRATCH:   csr_read_mux = mscratch_reg;
+            CSR_MEPC:       csr_read_mux = mepc_value;
+            CSR_MCAUSE:     csr_read_mux = mcause_value;
+            CSR_MTVAL:      csr_read_mux = mtval_reg;
+            CSR_MIP:        csr_read_mux = mip_value;
+            CSR_SSTATUS:    csr_read_mux = sstatus_value;
+            CSR_SIE:        csr_read_mux = sie_value;
+            CSR_STVEC:      csr_read_mux = stvec_value;
+            CSR_SCOUNTEREN: csr_read_mux = {32'b0, scounteren_reg};
+            CSR_SSCRATCH:   csr_read_mux = sscratch_reg;
+            CSR_SEPC:       csr_read_mux = sepc_value;
+            CSR_SCAUSE:     csr_read_mux = scause_value;
+            CSR_STVAL:      csr_read_mux = stval_reg;
+            CSR_SIP:        csr_read_mux = sip_value;
+            CSR_SATP:       csr_read_mux = satp_reg;
+            CSR_MCYCLE:     csr_read_mux = mcycle_reg;
+            CSR_MINSTRET:   csr_read_mux = minstret_reg;
+            CSR_CYCLE:      csr_read_mux = mcycle_reg;
+            CSR_INSTRET:    csr_read_mux = minstret_reg;
+            CSR_TSELECT:    csr_read_mux = tselect_value;
+            CSR_TDATA1:     csr_read_mux = tdata1_value;
+            CSR_TDATA2:     csr_read_mux = tdata2_value;
+            CSR_TDATA3:     csr_read_mux = tdata3_value;
+            CSR_TCONTROL:   csr_read_mux = tcontrol_value;
+            CSR_PMPCFG0:    csr_read_mux = pmp_cfg0_value;
+            CSR_PMPCFG2:    csr_read_mux = pmpcfg2_value;
+            CSR_MVENDORID:  csr_read_mux = mvendorid_value;
+            CSR_MARCHID:    csr_read_mux = marchid_value;
+            CSR_MIMPID:     csr_read_mux = mimpid_value;
+            CSR_MHARTID:    csr_read_mux = mhartid_value;
+            CSR_MXSTATUS:   csr_read_mux = mxstatus_value;
+            CSR_MHCR:       csr_read_mux = mhcr_value;
+            CSR_MHINT:      csr_read_mux = mhint_value;
+            default:        csr_read_mux = 64'd0;
         endcase
     endfunction
 
-    wire [63:0] csr_rdata = csr_read_mux(csr_addr);
+    // pmpaddr0-7 (0x3B0..0x3B7) read from PMP.v (selected by pmp_addr_rsel);
+    // the case-mux default returns 0 for them, so mux it in here.
+    wire pmpaddr_addr_sel = (csr_addr >= CSR_PMPADDR0)
+                         && (csr_addr <= (CSR_PMPADDR0 + 12'd7));
+    wire [63:0] csr_rdata = pmpaddr_addr_sel ? pmp_addr_value
+                                             : csr_read_mux(csr_addr);
 
     // Same three-op RMW mux as the donor (CP0 note B1, aq_cp0_iui.v:
     // 494-500: csrrw_rs1=rs1; csrrs_rs1=rdata|rs1; csrrc_rs1=rdata&~rs1).
@@ -789,14 +1217,35 @@ module CSR #(
     assign cp0_rtu_ex1_inst_len = idu_cp0_ex1_inst_len;
 
     // Synchronous exceptions CP0 itself detects: illegal instruction (any
-    // CP0-dispatched op IDU already flagged illegal), ecall (M-mode only --
-    // cause 11, no other priv level exists to ecall from), ebreak (cause 3).
-    // Standard RISC-V cause encoding; neither is an interrupt.
-    assign cp0_rtu_ex1_expt_vld = ex1_illegal || is_ecall || is_ebreak;
+    // CP0-dispatched op IDU already flagged illegal), ecall (per-priv cause),
+    // ebreak (cause 3). Standard RISC-V cause encoding; none is an interrupt.
+    //-------------------------------------------------------------------------
+    // M4 Task 1: CSR access qualification (donor aq_cp0_iui.v:602-619).
+    // addr[9:8] encodes the minimum privilege (00=U,01=S,11=M; 10 reserved).
+    // Access below the minimum priv is illegal; a write to a read-only CSR
+    // (addr[11:10]==11) is illegal; S-mode satp access with TVM=1 is illegal.
+    //-------------------------------------------------------------------------
+    wire [1:0] csr_min_priv   = csr_addr[9:8];
+    wire csr_priv_bad = is_csr_op &&
+                        ((csr_min_priv == 2'b10)                              // reserved
+                      || (pm_r == PRIV_U && csr_min_priv != 2'b00)            // U: U-only
+                      || (pm_r == PRIV_S && csr_min_priv == 2'b11));          // S: not M
+    wire csr_ro_write = is_csr_op && (csr_addr[11:10] == 2'b11) && csr_wen_raw;
+    wire satp_tvm_illegal = is_csr_op && (csr_addr == CSR_SATP)
+                          && (pm_r == PRIV_S) && tvm_f;
+    wire csr_access_illegal = csr_priv_bad || csr_ro_write || satp_tvm_illegal;
+
+    // Per-privilege ecall cause (U=8, S=9, M=11).
+    wire [4:0] ecall_vec = (pm_r == PRIV_M) ? CAUSE_MACHINE_ECALL
+                         : (pm_r == PRIV_S) ? CAUSE_SUPERVISOR_ECALL
+                                            : CAUSE_USER_ECALL;
+
+    assign cp0_rtu_ex1_expt_vld = ex1_illegal || is_ecall || is_ebreak
+                                || csr_access_illegal || xret_illegal;
     assign cp0_rtu_ex1_expt_int = 1'b0;
-    assign cp0_rtu_ex1_expt_vec = ex1_illegal ? 5'd2  :
-                                  is_ecall     ? 5'd11 :
-                                  is_ebreak    ? 5'd3  : 5'd0;
+    assign cp0_rtu_ex1_expt_vec = (ex1_illegal || csr_access_illegal || xret_illegal) ? CAUSE_ILLEGAL :
+                                  is_ecall     ? ecall_vec :
+                                  is_ebreak    ? CAUSE_BREAKPOINT : 5'd0;
 
     //=========================================================================
     // SECTION MHCR / MXSTATUS FAN-OUT -- replaces FetchSink's harness config

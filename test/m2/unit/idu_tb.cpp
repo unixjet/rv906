@@ -143,6 +143,10 @@ static const uint32_t OP_LUI = 0x37, OP_AUIPC = 0x17, OP_JAL = 0x6F, OP_JALR = 0
 static const uint32_t OP_BRANCH = 0x63, OP_SYSTEM = 0x73, OP_OPIMM32 = 0x1B, OP_OP32 = 0x3B;
 static const uint32_t OP_MISCMEM = 0x0F;
 static const uint32_t OP_FP = 0x53, OP_AMO = 0x2F, OP_VEC = 0x57, OP_CUSTOM0 = 0x0B;
+// CP0 FUNC encodings (rvproc_pkg.sv CP0_FUNC_*) needed by the M4 decode checks.
+static const uint32_t CP0_FUNC_SRET   = 0x00082;
+static const uint32_t CP0_FUNC_WFI    = 0x00102;
+static const uint32_t CP0_FUNC_SFENCE = 0x00044;
 
 static uint32_t addi(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x0, rd, OP_OPIMM); }
 static uint32_t add_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x00, rs2, rs1, 0x0, rd, OP_OP); }
@@ -348,14 +352,22 @@ static void test_illegal_closed_list(void) {
           && dut->idu_lsu_ex1_sel == 0,
           "reserved AMO funct5: illegal (M3 audit; donor decd.v lists only the 9)");
 
+    // M4: sfence.vma / sret / wfi now decode as legal CP0 ops (privilege-
+    // based legality -- TSR/TW/TVM/U-mode -- is checked in CSR.v, not here).
     present(sfence_vma_()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "sfence.vma: illegal (needs real MMU, M4)");
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 0
+          && dut->idu_cp0_ex1_func == CP0_FUNC_SFENCE,
+          "sfence.vma: legal, dispatches to CP0 (M4)");
 
     present(sret_()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "sret: illegal (no S-mode in M2)");
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 0
+          && dut->idu_cp0_ex1_func == CP0_FUNC_SRET,
+          "sret: legal, dispatches to CP0 (M4)");
 
     present(wfi_()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "wfi: illegal (not modeled in M2)");
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 0
+          && dut->idu_cp0_ex1_func == CP0_FUNC_WFI,
+          "wfi: legal, dispatches to CP0 (M4)");
 
     present(dret_()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "dret: illegal (no debug unit in M2)");
@@ -363,7 +375,7 @@ static void test_illegal_closed_list(void) {
     // reserved-encoding malformed ecall (rs1 != 0)
     present(enc_i(0, 5, 0x0, 0, OP_SYSTEM)); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "ecall with rs1!=0: illegal (malformed)");
-    test_result("T10 illegal decode closed list: FP/vector/custom/sfence.vma/sret/wfi/dret trap (AMO now legal, M3)");
+    test_result("T10 illegal decode closed list: FP/vector/custom/dret trap; sfence/sret/wfi legal (M4), AMO legal (M3)");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----

@@ -87,7 +87,17 @@ module MMU (
     output wire                     mmu_lsu_sec,
     output wire                     mmu_lsu_sh,
     output wire                     mmu_lsu_page_fault,
-    output wire                     mmu_lsu_access_fault
+    output wire                     mmu_lsu_access_fault,
+
+    //=========================================================================
+    // CP0 -> MMU : M4 Task 1 privilege/translation controls (storage in
+    // CSR.v; given meaning at Tasks 3-5). satp + MXR/SUM + current priv.
+    //=========================================================================
+    input  wire [63:0]              cp0_mmu_satp_data,
+    input  wire                     cp0_mmu_satp_wen,
+    input  wire                     cp0_mmu_mxr,
+    input  wire                     cp0_mmu_sum,
+    input  wire [1:0]               cp0_yy_priv_mode
 );
 
     //=========================================================================

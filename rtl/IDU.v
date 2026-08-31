@@ -706,6 +706,22 @@ module IDU (
                 d32_func    = CP0_FUNC_MRET;
                 d32_illegal = (inst[19:15] != 5'd0) || (inst[11:7] != 5'd0);
             end
+            // M4: sret / wfi share funct7=0001000, funct3=000, split by rs2
+            // (rs2=2 sret, rs2=5 wfi). Privilege-based legality (TSR/TW/U-
+            // mode) is checked in CSR.v, not here.
+            15'b000100000011100: begin
+                d32_eu      = EU_CP0;
+                d32_func    = (inst[24:20] == 5'd5) ? CP0_FUNC_WFI : CP0_FUNC_SRET;
+                d32_illegal = (inst[19:15] != 5'd0) || (inst[11:7] != 5'd0);
+            end
+            // M4: sfence.vma (funct7=0001001). rs1=VA, rs2=ASID; rv906 over-
+            // invalidates (whole TLB), so the operands are ignored; legality
+            // (U-mode / S-with-TVM) is checked in CSR.v.
+            15'b000100100011100: begin
+                d32_eu      = EU_CP0;
+                d32_func    = CP0_FUNC_SFENCE;
+                d32_illegal = (inst[11:7] != 5'd0);
+            end
             15'b???????00111100: begin  // csrrw
                 d32_eu = EU_CP0; d32_func = CP0_FUNC_CSRRW;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i;
@@ -734,9 +750,9 @@ module IDU (
                 d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i; d32_dst0_vld = 1'b1;
             end
             default: d32_illegal = 1'b1;   // FP/vector/AMO-LR-SC/custom-0/
-                                            // sfence.vma/sret/wfi/dret/any
-                                            // unallocated encoding (5.1's
-                                            // closed illegal-decode list)
+                                            // dret/any unallocated encoding
+                                            // (5.1's closed illegal-decode list;
+                                            // sret/wfi/sfence.vma decoded above, M4)
         endcase
     end
 

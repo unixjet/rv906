@@ -468,6 +468,7 @@ module RVProc #(
     wire                     rtu_yy_xx_flush;
     wire [PC_WIDTH-1:0]      rtu_cp0_epc;
     wire [63:0]              rtu_cp0_tval;
+    wire                     rtu_cp0_inst_retire;   // M4 Task 1: minstret inc
 
     //=========================================================================
     // RTU <-> IDU : the exclusive bypass network (fwd0/1/2 + wb0/1, IDU
@@ -507,6 +508,27 @@ module RVProc #(
     wire [1:0]               cp0_lsu_dcache_pref_dist;
     // M3b Task E: MHINT.amr (CSR -> LSU AMR)
     wire [1:0]               cp0_lsu_amr;
+    // M4 Task 2: PMP register interface (CSR <-> PMP). The pmpcfg/pmpaddr
+    // storage lives in PMP.v; CSR.v decodes/strobes/reads back.
+    wire                     pmp_cfg0_wen;
+    wire [63:0]              pmp_cfg0_wdata;
+    wire [7:0]               pmp_addr_wen;
+    wire [63:0]              pmp_addr_wdata;
+    wire [2:0]               pmp_addr_rsel;
+    wire [63:0]              pmp_cfg0_value;
+    wire [63:0]              pmp_addr_value;
+    wire [1:0]               cp0_pmp_priv_mode;
+    wire                     pmp_fetch_deny;
+    wire                     pmp_data_deny;
+    // M4 Task 1: privilege + MMU controls (CSR -> MMU/LSU; the MMU/LSU give
+    // them meaning at M4 Tasks 3-5).
+    wire [1:0]               cp0_yy_priv_mode;
+    wire [63:0]              cp0_mmu_satp_data;
+    wire                     cp0_mmu_satp_wen;
+    wire                     cp0_mmu_mxr;
+    wire                     cp0_mmu_sum;
+    wire                     cp0_lsu_mprv;
+    wire [1:0]               cp0_lsu_mpp;
 
     //=========================================================================
     // ICache instance
@@ -709,7 +731,13 @@ module RVProc #(
         .mmu_lsu_sec            (mmu_lsu_sec),
         .mmu_lsu_sh             (mmu_lsu_sh),
         .mmu_lsu_page_fault     (mmu_lsu_page_fault),
-        .mmu_lsu_access_fault   (mmu_lsu_access_fault)
+        .mmu_lsu_access_fault   (mmu_lsu_access_fault),
+
+        .cp0_mmu_satp_data      (cp0_mmu_satp_data),
+        .cp0_mmu_satp_wen       (cp0_mmu_satp_wen),
+        .cp0_mmu_mxr            (cp0_mmu_mxr),
+        .cp0_mmu_sum            (cp0_mmu_sum),
+        .cp0_yy_priv_mode       (cp0_yy_priv_mode)
     );
 
     //=========================================================================
@@ -985,6 +1013,9 @@ module RVProc #(
         .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
         .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
         .cp0_lsu_amr             (cp0_lsu_amr),
+        .cp0_lsu_mprv            (cp0_lsu_mprv),
+        .cp0_lsu_mpp             (cp0_lsu_mpp),
+        .cp0_yy_priv_mode        (cp0_yy_priv_mode),
 
         .axi_d_awvalid           (axi_d_awvalid),
         .axi_d_awready           (axi_d_awready),
@@ -1112,6 +1143,7 @@ module RVProc #(
         .rtu_yy_xx_dbgon         (),
         .rtu_cp0_epc             (rtu_cp0_epc),
         .rtu_cp0_tval            (rtu_cp0_tval),
+        .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
 
         .rtu_ifu_chgflw_vld      (rtu_ifu_chgflw_vld),
         .rtu_ifu_chgflw_pc       (rtu_ifu_chgflw_pc),
@@ -1188,6 +1220,7 @@ module RVProc #(
         .rtu_yy_xx_flush         (rtu_yy_xx_flush),
         .rtu_cp0_epc             (rtu_cp0_epc),
         .rtu_cp0_tval            (rtu_cp0_tval),
+        .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
 
         .cp0_ifu_icache_en       (cp0_ifu_icache_en),
         .cp0_ifu_iwpe            (cp0_ifu_iwpe),
@@ -1210,6 +1243,21 @@ module RVProc #(
         .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
         .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
         .cp0_lsu_amr             (cp0_lsu_amr),
+        .pmp_cfg0_wen            (pmp_cfg0_wen),
+        .pmp_cfg0_wdata          (pmp_cfg0_wdata),
+        .pmp_addr_wen            (pmp_addr_wen),
+        .pmp_addr_wdata          (pmp_addr_wdata),
+        .pmp_addr_rsel           (pmp_addr_rsel),
+        .pmp_cfg0_value          (pmp_cfg0_value),
+        .pmp_addr_value          (pmp_addr_value),
+        .cp0_pmp_priv_mode       (cp0_pmp_priv_mode),
+        .cp0_yy_priv_mode        (cp0_yy_priv_mode),
+        .cp0_mmu_satp_data       (cp0_mmu_satp_data),
+        .cp0_mmu_satp_wen        (cp0_mmu_satp_wen),
+        .cp0_mmu_mxr             (cp0_mmu_mxr),
+        .cp0_mmu_sum             (cp0_mmu_sum),
+        .cp0_lsu_mprv            (cp0_lsu_mprv),
+        .cp0_lsu_mpp             (cp0_lsu_mpp),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
         .cp0_lsu_dcache_clean    (cp0_lsu_dcache_clean),
         .lsu_cp0_clean_done      (lsu_cp0_clean_done),
@@ -1219,6 +1267,34 @@ module RVProc #(
         .mtip                    (mtip),
         .msip                    (msip),
         .meip                    (meip)
+    );
+
+    //=========================================================================
+    // PMP instance (M4 Task 2): 8-entry physical memory protection. The
+    // pmpcfg/pmpaddr storage lives here; CSR.v decodes/strobes/reads back.
+    // The fetch/data deny outputs are consumed by the MMU/LSU at Tasks 3-6;
+    // until then they are computed but unused (no PMP regions configured at
+    // reset, so M-mode accesses pass and behavior is unchanged).
+    //=========================================================================
+    PMP u_pmp (
+        .clk                (clk),
+        .rst_n              (rst_n),
+        .pmpcfg0_wen        (pmp_cfg0_wen),
+        .pmpcfg0_wdata      (pmp_cfg0_wdata),
+        .pmpaddr_wen        (pmp_addr_wen),
+        .pmpaddr_wdata      (pmp_addr_wdata),
+        .pmp_cfg0_value     (pmp_cfg0_value),
+        .pmpaddr_rsel       (pmp_addr_rsel),
+        .pmp_addr_value     (pmp_addr_value),
+        .priv_mode          (cp0_pmp_priv_mode),
+        .chk_fetch_pa       ({PC_WIDTH{1'b0}}),
+        .chk_fetch_vld      (1'b0),
+        .chk_data_pa        ({PC_WIDTH{1'b0}}),
+        .chk_load           (1'b0),
+        .chk_store          (1'b0),
+        .chk_data_vld       (1'b0),
+        .pmp_fetch_deny     (pmp_fetch_deny),
+        .pmp_data_deny      (pmp_data_deny)
     );
 
     //=========================================================================

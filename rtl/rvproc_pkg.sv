@@ -268,6 +268,87 @@ parameter [11:0] CSR_MHCR     = 12'h7C1;
 // M3b Task D (PFB stride prefetch controls live here).
 parameter [11:0] CSR_MHINT    = 12'h7C5;
 
+// M4 Task 2: PMP CSR addresses (privileged ISA standard, confirmed donor
+// aq_pmp_top.v:82-99). pmpcfg0 (entries 0-7 cfg bytes), pmpcfg2 (entries 8-15,
+// reads 0 / writes ignored in the 8-entry config), pmpaddr0-7.
+parameter [11:0] CSR_PMPCFG0   = 12'h3A0;
+parameter [11:0] CSR_PMPCFG2   = 12'h3A2;
+parameter [11:0] CSR_PMPADDR0  = 12'h3B0;   // pmpaddr0..7 = 0x3B0..0x3B7
+
+//-----------------------------------------------------------------------------
+// M4: privilege (M/S/U) CSR addresses -- standard RISC-V privileged ISA
+// (S-mode bank + delegation + counters + satp), pinned per the M4 design doc
+// §2.1 S8. Debug-trigger CSRs (T-Head aq_cp0_regs.v:826-831).
+//-----------------------------------------------------------------------------
+// S-mode bank
+parameter [11:0] CSR_SSTATUS    = 12'h100;
+parameter [11:0] CSR_SIE        = 12'h104;
+parameter [11:0] CSR_STVEC      = 12'h105;
+parameter [11:0] CSR_SCOUNTEREN = 12'h106;
+parameter [11:0] CSR_SSCRATCH   = 12'h140;
+parameter [11:0] CSR_SEPC       = 12'h141;
+parameter [11:0] CSR_SCAUSE     = 12'h142;
+parameter [11:0] CSR_STVAL      = 12'h143;
+parameter [11:0] CSR_SIP        = 12'h144;
+parameter [11:0] CSR_SATP       = 12'h180;
+// M-mode delegation + counter-enable
+parameter [11:0] CSR_MEDELEG    = 12'h302;
+parameter [11:0] CSR_MIDELEG    = 12'h303;
+parameter [11:0] CSR_MCOUNTEREN = 12'h306;
+// User read-only counter aliases (Zicntr)
+parameter [11:0] CSR_CYCLE      = 12'hC00;
+parameter [11:0] CSR_TIME       = 12'hC01;   // storage deferred to M6 (D-M4-9)
+parameter [11:0] CSR_INSTRET    = 12'hC02;
+// Debug triggers (M4: zero-trigger escape hatch, D-M4-5; real triggers M7)
+parameter [11:0] CSR_TSELECT    = 12'h7A0;
+parameter [11:0] CSR_TDATA1     = 12'h7A1;
+parameter [11:0] CSR_TDATA2     = 12'h7A2;
+parameter [11:0] CSR_TDATA3     = 12'h7A3;
+parameter [11:0] CSR_TCONTROL   = 12'h7A5;
+
+// mstatus / sstatus bit positions (privileged ISA standard layout; donor
+// aq_cp0_trap_csr.v:486-494). RV64: SD=63, MBE/SBE=37/36 (tied 0), SXL/UXL
+// =35:34/33:32 (RO 2'b10), TSR=22, TW=21, TVM=20, MXR=19, SUM=18, MPRV=17,
+// XS=16:15, FS=14:13, MPP=12:11, VS=10:9 (tied 0), SPP=8, MPIE=7, UBE=6
+// (tied 0), SPIE=5, MIE=3, UPIE=4 (tied 0), SIE=1.
+parameter MSTATUS_SD_BIT    = 63;
+parameter MSTATUS_TSR_BIT   = 22;
+parameter MSTATUS_TW_BIT    = 21;
+parameter MSTATUS_TVM_BIT   = 20;
+parameter MSTATUS_MXR_BIT   = 19;
+parameter MSTATUS_SUM_BIT   = 18;
+parameter MSTATUS_MPRV_BIT  = 17;
+parameter MSTATUS_FS_HI     = 14;   // FS[1:0] = [14:13]
+parameter MSTATUS_FS_LO     = 13;
+parameter MSTATUS_MPP_HI    = 12;   // MPP[1:0] = [12:11]
+parameter MSTATUS_MPP_LO    = 11;
+parameter MSTATUS_SPP_BIT   = 8;
+parameter MSTATUS_MPIE_BIT  = 7;
+parameter MSTATUS_SPIE_BIT  = 5;
+parameter MSTATUS_MIE_BIT   = 3;
+parameter MSTATUS_SIE_BIT   = 1;
+
+// Privilege levels (aq_cp0_trap_csr.v pm encoding: U=00, S=01, M=11).
+parameter [1:0] PRIV_U = 2'b00;
+parameter [1:0] PRIV_S = 2'b01;
+parameter [1:0] PRIV_M = 2'b11;
+
+// Exception cause codes used by the M4 trap/privilege logic.
+parameter CAUSE_MISALIGNED_FETCH = 5'd0;
+parameter CAUSE_FETCH_ACCESS     = 5'd1;
+parameter CAUSE_ILLEGAL          = 5'd2;
+parameter CAUSE_BREAKPOINT       = 5'd3;
+parameter CAUSE_MISALIGNED_LOAD  = 5'd4;
+parameter CAUSE_LOAD_ACCESS      = 5'd5;
+parameter CAUSE_MISALIGNED_STORE = 5'd6;
+parameter CAUSE_STORE_ACCESS     = 5'd7;
+parameter CAUSE_USER_ECALL       = 5'd8;
+parameter CAUSE_SUPERVISOR_ECALL = 5'd9;
+parameter CAUSE_MACHINE_ECALL    = 5'd11;
+parameter CAUSE_FETCH_PAGE_FAULT = 5'd12;
+parameter CAUSE_LOAD_PAGE_FAULT  = 5'd13;
+parameter CAUSE_STORE_PAGE_FAULT = 5'd15;
+
 // MHCR bit positions -- confirmed aq_cp0_ext_csr.v:670,694,696-725: the RHS
 // concat list of `mhcr_value[63:0] = {45'b0, sck[2:0], 3'b0, l0btbe, 3'b0,
 // wbr, ibpe, btbe, bpe, rse, wb, wa, de, ie}` gives (LSB = last-listed term)
@@ -378,8 +459,11 @@ parameter [2:0] WB_INT_TYPE_LSU   = 3'd4;
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_ECALL   = 20'h00012;  // cfig.h:455
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_EBREAK  = 20'h00022;  // cfig.h:456
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_MRET    = 20'h00042;  // cfig.h:457
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_SRET    = 20'h00082;  // cfig.h:458 (M4)
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_WFI     = 20'h00102;  // cfig.h:459 (M4)
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_FENCE   = 20'h00028;  // cfig.h:461
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_FENCEI  = 20'h00024;  // cfig.h:462
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_SFENCE  = 20'h00044;  // cfig.h:463 (M4)
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRW   = 20'h00011;  // cfig.h:469
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRS   = 20'h00021;  // cfig.h:470
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRC   = 20'h00041;  // cfig.h:471
