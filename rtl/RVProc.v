@@ -505,6 +505,8 @@ module RVProc #(
     // M3b Task D: MHINT D-cache prefetch controls (CSR -> LSU PFB)
     wire                     cp0_lsu_dcache_pref_en;
     wire [1:0]               cp0_lsu_dcache_pref_dist;
+    // M3b Task E: MHINT.amr (CSR -> LSU AMR)
+    wire [1:0]               cp0_lsu_amr;
 
     //=========================================================================
     // ICache instance
@@ -982,6 +984,7 @@ module RVProc #(
         .cp0_lsu_wa              (cp0_lsu_wa),
         .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
         .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
+        .cp0_lsu_amr             (cp0_lsu_amr),
 
         .axi_d_awvalid           (axi_d_awvalid),
         .axi_d_awready           (axi_d_awready),
@@ -1206,6 +1209,7 @@ module RVProc #(
         .cp0_lsu_wa              (cp0_lsu_wa),
         .cp0_lsu_dcache_pref_en  (cp0_lsu_dcache_pref_en),
         .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
+        .cp0_lsu_amr             (cp0_lsu_amr),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
         .cp0_lsu_dcache_clean    (cp0_lsu_dcache_clean),
         .lsu_cp0_clean_done      (lsu_cp0_clean_done),

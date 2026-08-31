@@ -195,6 +195,9 @@ module LSU #(
     // :861,:868) feeding the PFB stride prefetcher below.
     input  wire                     cp0_lsu_dcache_pref_en,
     input  wire [1:0]               cp0_lsu_dcache_pref_dist,
+    // M3b Task E: MHINT.amr (ext_csr.v:881) enabling the AMR streaming-store
+    // write-allocate disabler below (00 = off, the reset default).
+    input  wire [1:0]               cp0_lsu_amr,
 
     //=========================================================================
     // AXI Master Interface - DCache (ch[1]) -- copied verbatim from
@@ -646,12 +649,13 @@ module LSU #(
     // SECTION main FSM sequencing + AG/DCS latches.
     //-------------------------------------------------------------------------
     wire dc_hit_c        = |u_dc_resp_hit_way;
-    wire store_wa_miss_c = dc_is_store_r && !dc_hit_c && !dc_wa_r;   // contract 6: wa=0 default
+    wire store_wa_miss_c = dc_is_store_r && !dc_hit_c && !dc_wa_eff;   // contract 6: wa=0 default;
+    // M3b Task E: dc_wa_eff folds in the AMR's live write-allocate disable.
     // M3b dc_wait_lfb_r retry: same decision, but off the LATCHED dc_hit_r
     // (this op's own, already-resolved response) instead of the live
     // dc_hit_c wire, which by retry time may reflect unrelated background-
     // refill traffic on the shared (unscoped) DCache.v response.
-    wire store_wa_miss_r = dc_is_store_r && !dc_hit_r && !dc_wa_r;
+    wire store_wa_miss_r = dc_is_store_r && !dc_hit_r && !dc_wa_eff;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -1251,6 +1255,43 @@ module LSU #(
     // Prefetch create: mutually exclusive with the demand create above by
     // pfb_grant_c's !lfb_defer_fire term (donor create mux, lfb.v:673).
     wire pfb_create_fire = pfb_req && !lfb_full;
+
+    //-------------------------------------------------------------------------
+    // SECTION AMR -- M3b Task E: streaming-store write-allocate disabler
+    // (donor aq_lsu_amr.v, see rtl/AMR.v for the port and adaptation notes).
+    // Trained by cacheable stores at ST_DCS (donor dc_amr_*, aq_lsu_dc.v:
+    // 1906-1926); once a store-size-stride stream is confirmed it raises
+    // amr_dc_wa_dis, gating write-allocate off for subsequent store misses.
+    //-------------------------------------------------------------------------
+    // Training event: one cacheable store DC-stage lookup (store version of
+    // pfb_ld_vld_c; dc_is_store_r is func[0], so AMO/LR/SC are excluded --
+    // the donor's !dc_lock_trans -- and drains are internal, not stores).
+    wire dc_amr_st_req_c = (state == ST_DCS) && u_dc_resp_vld && !dc_wait_lfb_r
+                           && dc_touched_array_r && dc_is_store_r && dc_ca_r
+                           && !dc_is_drain_r;
+    // Cancel: a NON-cacheable store passing through resets the detector
+    // (donor dc_amr_cancel, aq_lsu_dc.v:1912). Non-cacheable stores do not
+    // touch the array, so the decision strobe is the immediate branch.
+    wire dc_amr_cancel_c = (state == ST_DCS) && !dc_wait_lfb_r && dc_is_store_r
+                           && !dc_is_drain_r && !dc_ca_r
+                           && (!dc_touched_array_r || u_dc_resp_vld);
+    wire        dc_amr_st_miss_c = !dc_hit_c;
+    wire [4:0]  dc_amr_st_size_c = 5'd1 << dc_size_r;   // bytes (donor hint_size)
+
+    wire amr_dc_wa_dis;
+    AMR u_amr (
+        .clk(clk), .rst_n(rst_n),
+        .cp0_lsu_amr(cp0_lsu_amr),
+        .cp0_lsu_dcache_en(cp0_lsu_dcache_en),
+        .cp0_lsu_sync_req(clean_active),
+        .dc_amr_st_req(dc_amr_st_req_c), .dc_amr_cancel(dc_amr_cancel_c),
+        .dc_amr_st_miss(dc_amr_st_miss_c), .dc_amr_st_size(dc_amr_st_size_c),
+        .dc_amr_st_addr(dc_addr_r[39:0]),
+        .amr_dc_wa_dis(amr_dc_wa_dis)
+    );
+
+    // Effective write-allocate (donor dcache_wa = cp0_wa & !amr_dc_wa_dis).
+    wire dc_wa_eff = dc_wa_r & ~amr_dc_wa_dis;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -2013,7 +2054,14 @@ module LSU #(
     // writing lsu_tb.cpp: a wa=1 store-miss would otherwise mark its own
     // STB entry `was_hit=0` and drain via the direct-AXI bypass instead of
     // writing into the way that was JUST allocated for it.
-    wire store_line_resident = dc_hit_r || (dc_ca_r && dc_wa_r);
+    // M3b Task E: derive residency from the LATCHED FRZ decision
+    // (frz_is_direct_r=1 for a non-allocating store miss) instead of
+    // recomputing dc_wa_eff here: the AMR's FUNC state could change between
+    // this store's DC decision and its REPLY, and stb_was_hit MUST agree
+    // with the path the store actually took (refill-allocated vs direct
+    // write), else a later STB drain would write the cache for a line that
+    // was never allocated (or skip a line that was).
+    wire store_line_resident = dc_hit_r || (dc_ca_r && !frz_is_direct_r);
 
     wire reply_fire        = (state == ST_REPLY) && reply_can_complete && !dc_is_drain_r;
     wire reply_is_load      = reply_fire && !dc_is_store_r;

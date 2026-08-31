@@ -56,6 +56,7 @@ static int g_cp0_lsu_dcache_en  = 1;   // this bench always runs "post-boot"
 // every pre-Task-D test runs with the prefetcher fully disabled.
 static int g_cp0_lsu_pref_en    = 0;
 static int g_cp0_lsu_pref_dist  = 2;   // MHINT reset value
+static int g_cp0_lsu_amr        = 0;   // M3b Task E: MHINT.amr reset value
 static uint16_t g_ex1_pc        = 0;
 // AXI read latency (cycles from AR accept to R valid). Default 2 keeps the
 // legacy tests' timing; the non-blocking / hit-under-miss tests raise it so
@@ -196,6 +197,7 @@ static void drive_csr(void)
     dut->cp0_lsu_wa        = g_cp0_lsu_wa;
     dut->cp0_lsu_dcache_pref_en   = g_cp0_lsu_pref_en;
     dut->cp0_lsu_dcache_pref_dist = g_cp0_lsu_pref_dist;
+    dut->cp0_lsu_amr     = g_cp0_lsu_amr;
     dut->iu_lsu_ex1_cur_pc = g_ex1_pc;   // M3b Task D: PFB trainer's PC tag
     dut->rtu_lsu_expt_ack  = 0;
     dut->rtu_lsu_expt_exit = 0;
@@ -973,6 +975,96 @@ static void test_pfb_stride_prefetch(void)
     test_result("T11 PFB stride prefetch: trains, prefetches ahead, hits; off=quiet");
 }
 
+// T12 (M3b Task E): AMR streaming-store write-allocate disabler (donor
+// aq_lsu_amr.v, gated by MHINT.amr). A contiguous streaming-sd sequence
+// (stride 8 == store size) trains the detector; once confirmed (amr=2'b01:
+// 4 lines), write-allocate is disabled and subsequent store misses write
+// straight through WITHOUT allocating:
+//   (a) with amr=2'b01 only the training window's lines are allocated
+//       (exactly one refill read per allocated line, 5 lines),
+//   (b) a line inside the allocated region hits with correct data,
+//   (c) a line past the training window was never allocated: a load there
+//       misses (fresh read) but still returns the direct-written data,
+//   (d) with amr=0 the SAME sequence allocates every line (10 reads).
+static void test_amr_streaming_store(void)
+{
+    g_cp0_lsu_pref_en = 0;      // PFB off: stores don't train it anyway
+    g_cp0_lsu_wa      = 1;      // write-allocate on, so AMR has something to disable
+    g_cp0_lsu_amr     = 1;      // 2'b01: 4-line confirmation threshold
+    g_ex1_pc          = 0x5678;
+
+    const uint64_t BASE3  = 0x00000000800C0000ULL;
+    const int NSTORES = 80;     // 10 lines of sd (8 stores per line)
+    // No golden-memory pre-write: the stores themselves must populate the
+    // data (allocated lines via refill+merge, non-allocated lines via the
+    // AMR direct write), so a broken write path cannot hide behind a stale
+    // pre-seeded value.
+
+    // ---- amr=2'b01: only the training window allocates ----
+    int reads_before = g_slave.reads;
+    for (int i = 0; i < NSTORES; i++) {
+        LsuResult r = do_op(F_SD, BASE3 + (uint64_t)i * 8, 0,
+                            0x1111111111111111ULL + (uint64_t)i, 0);
+        check(r.cmplt && !r.expt_vld, "streaming sd completes (amr on)",
+              r.cmplt && !r.expt_vld, 1);
+        settle(3);
+    }
+    settle(60);
+    // amr=2'b01: line_cnt_done fires once line_cnt reaches 3 (donor
+    // threshold, amr.v:281,289) -- after the 3rd line-completion event
+    // (store 25), so the FSM is in FUNC from store 26 onward. First-of-line
+    // stores 0, 8, 16, 24 (lines 0..3) all miss while still in CALS/CHCK
+    // and allocate; line 4's first store (32) already sees FUNC and writes
+    // straight through -> exactly 4 refill reads.
+    check(g_slave.reads == reads_before + 4,
+          "amr on: only the training window's 4 lines were allocated",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 4));
+
+    // Allocated region: line 2 hits with correct data, no new read.
+    int rb = g_slave.reads;
+    LsuResult h = do_op(F_LD, BASE3 + 16 * 8, 0, 0, 5);   // line 2, dword 0
+    check(h.cmplt && h.wb_data == 0x1111111111111111ULL + 16,
+          "allocated line hits with correct data",
+          h.wb_data, 0x1111111111111111ULL + 16);
+    check(g_slave.reads == rb, "... as a cache HIT (no read)",
+          (uint64_t)g_slave.reads, (uint64_t)rb);
+    settle(5);
+
+    // Non-allocated region: line 7 missed the allocation window; a load
+    // misses again (fresh read) but returns the direct-written data.
+    rb = g_slave.reads;
+    LsuResult m = do_op(F_LD, BASE3 + 56 * 8, 0, 0, 5);   // line 7, dword 0
+    check(m.cmplt && m.wb_data == 0x1111111111111111ULL + 56,
+          "non-allocated line still returns the direct-written data",
+          m.wb_data, 0x1111111111111111ULL + 56);
+    check(g_slave.reads == rb + 1,
+          "... via a fresh read (line was never allocated)",
+          (uint64_t)g_slave.reads, (uint64_t)(rb + 1));
+    settle(5);
+
+    // ---- amr=0 control: identical sequence allocates every line ----
+    g_cp0_lsu_amr = 0;
+    settle(10);
+    const uint64_t BASE4 = 0x00000000800D0000ULL;
+    reads_before = g_slave.reads;
+    for (int i = 0; i < NSTORES; i++) {
+        LsuResult r = do_op(F_SD, BASE4 + (uint64_t)i * 8, 0,
+                            0x2222222222222222ULL + (uint64_t)i, 0);
+        check(r.cmplt && !r.expt_vld, "streaming sd completes (amr off)",
+              r.cmplt && !r.expt_vld, 1);
+        settle(3);
+    }
+    settle(60);
+    check(g_slave.reads == reads_before + 10,
+          "amr off: all 10 lines allocated (one read each)",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 10));
+
+    g_cp0_lsu_wa  = 0;   // restore reset defaults
+    g_cp0_lsu_amr = 0;
+    g_ex1_pc      = 0;
+    test_result("T12 AMR streaming stores: wa disabled after training; off=allocate");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -994,6 +1086,7 @@ int main(int argc, char **argv)
     test_lfb_full_backpressure();   // M3b Task A rework: 8-entry LFB-full backpressure
     test_vb_decoupled_dirty_writeback();   // M3b Task B/C: single-entry VB decoupling
     test_pfb_stride_prefetch();            // M3b Task D: PFB stride prefetch + MHINT
+    test_amr_streaming_store();            // M3b Task E: AMR write-allocate disabler
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

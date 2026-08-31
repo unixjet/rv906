@@ -139,7 +139,7 @@ $(MMU_BIN): $(MMU_RTL) $(CURDIR)/mmu_tb.cpp
 #-----------------------------------------------------------------------------
 LSU_OBJ = $(ROOT)/obj/unit/lsu
 LSU_BIN = $(BIN_DIR)/lsu_tb
-LSU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v $(ROOT)/rtl/PFB.v $(ROOT)/rtl/LSU.v
+LSU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v $(ROOT)/rtl/PFB.v $(ROOT)/rtl/AMR.v $(ROOT)/rtl/LSU.v
 
 .PHONY: lsu
 lsu: $(LSU_BIN)
@@ -155,7 +155,7 @@ $(LSU_BIN): $(LSU_RTL) $(CURDIR)/lsu_tb.cpp
 #-----------------------------------------------------------------------------
 LR_SC_OBJ = $(ROOT)/obj/unit/lr_sc
 LR_SC_BIN = $(BIN_DIR)/lr_sc_tb
-LR_SC_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v $(ROOT)/rtl/PFB.v $(ROOT)/rtl/LSU.v
+LR_SC_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/SRAM.v $(ROOT)/rtl/DCache.v $(ROOT)/rtl/PFB.v $(ROOT)/rtl/AMR.v $(ROOT)/rtl/LSU.v
 
 .PHONY: lr_sc
 lr_sc: $(LR_SC_BIN)

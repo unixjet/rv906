@@ -179,6 +179,8 @@ module CSR #(
     // :861,:868) routed to the LSU's PFB.
     output wire                     cp0_lsu_dcache_pref_en,
     output wire [1:0]               cp0_lsu_dcache_pref_dist,
+    // M3b Task E: MHINT.amr to the LSU's AMR (ext_csr.v:881).
+    output wire [1:0]               cp0_lsu_amr,
     // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1): FENCE/FENCE.I
     // hold in EX1 while this is low -- stores must reach their completion
     // point before the fence's I-side invalidate (or any later observer) may
@@ -828,6 +830,8 @@ module CSR #(
     // M3b Task D: MHINT prefetch controls to the LSU's PFB (ext_csr.v:861/868)
     assign cp0_lsu_dcache_pref_en   = mhint_dcache_pref_en;
     assign cp0_lsu_dcache_pref_dist = mhint_dcache_pref_dist;
+    // M3b Task E: MHINT.amr to the LSU's AMR (ext_csr.v:881)
+    assign cp0_lsu_amr              = mhint_amr;
 
     assign cp0_xx_mrvbr = RESET_VECTOR[PC_WIDTH-1:0];
 
