@@ -361,6 +361,13 @@ module LSU #(
     wire ag_misalign = (ag_size == 2'b01 && ag_addr[0])
                      || (ag_size == 2'b10 && (|ag_addr[1:0]))
                      || (ag_size == 2'b11 && (|ag_addr[2:0]));
+    // M4 trap-at-issue needs the store/AMO/SC-vs-load class at AG, before the
+    // DC-stage dc_is_store_r/sc_addr_set/amo_active are latched. AMO = the
+    // funct7 opcode byte 0x01 (ag_is_plain_ld's own test), SC = its two FUNC
+    // encodings (ag_is_plain_ld's exclusions). LR is a load (vec 4).
+    wire ag_is_amo_c = (idu_lsu_ex1_func[19:12] == 8'h01);
+    wire ag_is_sc_c  = (idu_lsu_ex1_func == LSU_FUNC_SC_W)
+                    || (idu_lsu_ex1_func == LSU_FUNC_SC_D);
     // contract 3: `cp0_lsu_mm` is NEVER consulted here -- always trap.
     wire _cp0_lsu_mm_unused = cp0_lsu_mm;
 
@@ -649,6 +656,16 @@ module LSU #(
     wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
                        && !rf_port_busy && !lfb_cmplt_fire;
 
+    // M4 misalign fix (contract 3 + donor aq_lsu_ag.v, which raises misalign
+    // at AG, NOT at the reply): a misaligned access must trap at its ISSUE
+    // cycle. Raising it late at ST_REPLY let the front end keep dispatching
+    // the following instructions before the trap landed (they executed and
+    // the handler returned into an already-advanced stream -> the
+    // rv64mi-p-{ld,lh}-misaligned / rv64ui-p-ma_data hang). Trap-at-issue
+    // means the flush kills every younger instruction. misalign_issue is the
+    // AG-stage exception pulse; the access never enters the DC FSM.
+    wire misalign_issue = issue_real && ag_misalign;
+
     wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign)
                         : issue_drain ? stb_was_hit[drain_pick]
                         : 1'b0;
@@ -698,7 +715,7 @@ module LSU #(
         end else begin
             case (state)
                 ST_IDLE: begin
-                    if (issue_real) begin
+                    if (issue_real && !ag_misalign) begin
                         dc_is_store_r   <= ag_is_store;
                         dc_plain_ld_r   <= ag_is_plain_ld;
                         dc_sign_ext_r   <= ag_sign_ext;
@@ -2209,7 +2226,8 @@ module LSU #(
     wire miss_done_latched = 1'b1;   // FRZ always fully drains before REPLY is entered
 
     assign lsu_rtu_ex1_cmplt_dp   = ((state == ST_REPLY) && reply_can_complete && !dc_is_drain_r)
-                                    || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // M3b: deferred-load
+                                    || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx])   // M3b: deferred-load
+                                    || misalign_issue;   // M4: misalign traps at AG-issue
                                     // completion; a PREFETCH entry drains silently (no instruction)
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
     // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
@@ -2288,13 +2306,17 @@ module LSU #(
     // M3 Task 1: LR.W / SC.W foundation outputs
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
-    assign lsu_rtu_expt_vld = reply_fire && dc_misalign_r;
-    // Misaligned SC/AMO take the STORE-misalign vector (cause 6 is
-    // "Store/AMO address misaligned"): both are stores per the A spec even
-    // though they ride the load-like path in this LSU (sc_addr_set is
-    // latched at ST_DCS, amo_active spans the AMO's REPLY).
-    assign lsu_rtu_expt_vec = (dc_is_store_r || sc_addr_set || amo_active) ? 5'd6 : 5'd4;
-    assign lsu_rtu_tval     = dc_addr_r;
+    assign lsu_rtu_expt_vld = misalign_issue || (reply_fire && dc_misalign_r);
+    // Misaligned SC/AMO/store take the STORE-misalign vector (cause 6 is
+    // "Store/AMO address misaligned"); loads/LR take cause 4. At AG-issue the
+    // DC-stage dc_is_store_r/sc_addr_set/amo_active are not yet latched, so
+    // the trap-at-issue leg classifies off the live AG func (ag_is_amo_c /
+    // ag_is_sc_c above); the reply leg (now unreachable for misalign but kept
+    // structurally) uses the latched class.
+    assign lsu_rtu_expt_vec = misalign_issue
+                            ? ((ag_is_store || ag_is_amo_c || ag_is_sc_c) ? 5'd6 : 5'd4)
+                            : ((dc_is_store_r || sc_addr_set || amo_active) ? 5'd6 : 5'd4);
+    assign lsu_rtu_tval     = misalign_issue ? ag_addr : dc_addr_r;
 
     // No async bus-error path is modeled for M2 (the behavioral AXI slave
     // in this test harness never returns a non-OKAY response) -- wired but
