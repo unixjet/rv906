@@ -62,6 +62,17 @@ static uint16_t g_ex1_pc        = 0;
 // legacy tests' timing; the non-blocking / hit-under-miss tests raise it so
 // a refill is observably "in flight" while other ops proceed.
 static int g_axi_rd_lat         = 2;
+// M4 Task 5: mmu_lsu_pa_vld stall injection (SECTION AG WAIT-STATE test) --
+// while >0, drive_mmu() holds mmu_lsu_pa_vld=0 (a translation-in-flight
+// walk) instead of its default always-same-cycle-1 answer; decremented once
+// per tick() (not per drive_mmu() call -- drive_mmu() runs twice a cycle).
+// Defaults to 0 so every pre-Task-5 test's timing is bit-identical.
+static int  g_pa_vld_stall_cycles     = 0;
+static bool g_mmu_inject_page_fault   = false;
+static bool g_mmu_inject_access_fault = false;
+// M4 Task 5: RTU front-end flush broadcast, driven by drive_csr() every
+// cycle from this latch -- a test pulses it with flush_pulse() below.
+static bool g_flush_fe = false;
 
 //-----------------------------------------------------------------------------
 // Golden memory (sparse -- test addresses are deliberately scattered).
@@ -177,7 +188,6 @@ static void drive_mmu(void)
     uint64_t ppn = dut->lsu_mmu_va;   // PAGE NUMBER (ag_addr[63:12]), not a byte VA
     // Identity map: page in, page out (rtl/MMU.v D-side, donor aq_lsu_ag.v:201).
     dut->mmu_lsu_pa           = (uint32_t)(ppn & 0x0FFFFFFFULL);
-    dut->mmu_lsu_pa_vld       = 1;
     // PMA cacheability: reconstruct the page-aligned PA and check the
     // DRAM range (contract 5) -- mirrors pma_cacheable() in rtl/MMU.v.
     bool cacheable            = ((ppn << 12) >= 0x0000000080000000ULL);
@@ -186,8 +196,19 @@ static void drive_mmu(void)
     dut->mmu_lsu_buf          = cacheable ? 1 : 0;
     dut->mmu_lsu_sec          = 0;
     dut->mmu_lsu_sh           = 0;
-    dut->mmu_lsu_page_fault   = 0;
-    dut->mmu_lsu_access_fault = 0;
+    // M4 Task 5: pa_vld stall / fault injection (see g_pa_vld_stall_cycles's
+    // own header comment). Every pre-Task-5 test leaves both at their
+    // defaults (0/false), so this reproduces the old always-1/never-fault
+    // body exactly.
+    if (g_pa_vld_stall_cycles > 0) {
+        dut->mmu_lsu_pa_vld       = 0;
+        dut->mmu_lsu_page_fault   = 0;
+        dut->mmu_lsu_access_fault = 0;
+    } else {
+        dut->mmu_lsu_pa_vld       = 1;
+        dut->mmu_lsu_page_fault   = g_mmu_inject_page_fault   ? 1 : 0;
+        dut->mmu_lsu_access_fault = g_mmu_inject_access_fault ? 1 : 0;
+    }
 }
 
 static void drive_csr(void)
@@ -201,6 +222,7 @@ static void drive_csr(void)
     dut->iu_lsu_ex1_cur_pc = g_ex1_pc;   // M3b Task D: PFB trainer's PC tag
     dut->rtu_lsu_expt_ack  = 0;
     dut->rtu_lsu_expt_exit = 0;
+    dut->rtu_yy_xx_flush_fe = g_flush_fe ? 1 : 0;   // M4 Task 5 (D1)
 }
 
 static void idle_issue(void)
@@ -244,6 +266,10 @@ static void tick(void)
     dut->clk = 0;
     dut->eval();
     g_cycles++;
+    // M4 Task 5: decrement once per full tick (drive_mmu() itself runs
+    // twice a cycle -- see its own header note), so N settle-ticks of
+    // pa_vld=0 means exactly N cycles, not N/2.
+    if (g_pa_vld_stall_cycles > 0) g_pa_vld_stall_cycles--;
 }
 
 static void settle(int n) { for (int i = 0; i < n; i++) { idle_issue(); tick(); } }
@@ -260,6 +286,16 @@ static void reset_dut(void)
     dut->axi_d_awready = 0; dut->axi_d_wready = 0; dut->axi_d_bvalid = 0; dut->axi_d_bresp = 0;
     dut->axi_d_arready = 0; dut->axi_d_rvalid = 0; dut->axi_d_rresp = 0; dut->axi_d_rlast = 0;
     for (int i = 0; i < 16; i++) dut->axi_d_rdata[i] = 0;
+    // M4 Task 5: the PTW servant channel and the flush broadcast -- idle by
+    // default, a test drives them directly.
+    dut->mmu_lsu_data_req      = 0;
+    dut->mmu_lsu_data_req_addr = 0;
+    dut->mmu_lsu_data_req_size = 0;
+    dut->rtu_yy_xx_flush_fe    = 0;
+    g_pa_vld_stall_cycles      = 0;
+    g_mmu_inject_page_fault    = false;
+    g_mmu_inject_access_fault  = false;
+    g_flush_fe                 = false;
     g_slave.reset();
     for (int i = 0; i < 5; i++) tick();
     dut->rst_n = 1;
@@ -346,6 +382,98 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
 }
 
 static inline uint64_t LD(uint64_t addr) { return do_op(F_LD, addr, 0, 0, 5).wb_data; }
+
+// M4 Task 5: like do_op, but correctly models IDU HOLDING the EX1-resident
+// operands unchanged across a stall, instead of do_op's single-cycle-sel
+// pattern (which only matches a REAL protocol when the op is accepted the
+// very cycle it is offered -- true for every op before Task 5, false for a
+// DTLB miss). D1: "IDU keeps driving idu_lsu_ex1_ex1_src*_data live from
+// EX1 registers" while `adv` is held off by `lsu_idu_full`; sel/dp_sel drop
+// (both gated on !lsu_idu_full in the real IDU) but the data does not.
+static LsuResult do_op_held(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src2,
+                            unsigned dst0, int guard = 500)
+{
+    int waited = 0;
+    while (dut->lsu_idu_full && waited < guard) { idle_issue(); tick(); waited++; }
+
+    dut->idu_lsu_ex1_func       = func;
+    dut->idu_lsu_ex1_src0_data  = src0;
+    dut->idu_lsu_ex1_src0_ready = 1;
+    dut->idu_lsu_ex1_src1_data  = src1;
+    dut->idu_lsu_ex1_src1_ready = 1;
+    dut->idu_lsu_ex1_src2_data  = src2;
+    dut->idu_lsu_ex1_src2_ready = 1;
+    dut->idu_lsu_ex1_dst0_reg   = dst0;
+    dut->idu_lsu_ex1_dp_sel     = 1;
+    dut->idu_lsu_ex1_sel        = 1;
+    tick();
+
+    LsuResult r;
+    for (int i = 0; i < guard; i++) {
+        // sel/dp_sel drop the moment lsu_idu_full reads 1 (the real gate);
+        // every OTHER field (func/src*/dst0) stays exactly as first driven.
+        if (dut->lsu_idu_full) {
+            dut->idu_lsu_ex1_dp_sel = 0;
+            dut->idu_lsu_ex1_sel    = 0;
+        }
+        if (dut->lsu_rtu_ex1_cmplt_dp) {
+            r.cmplt    = true;
+            r.wb_vld   = dut->lsu_rtu_wb_vld != 0;
+            r.wb_data  = dut->lsu_rtu_wb_data;
+            r.wb_preg  = dut->lsu_rtu_wb_preg;
+            r.expt_vld = dut->lsu_rtu_expt_vld != 0;
+            r.expt_vec = dut->lsu_rtu_expt_vec;
+            r.tval     = dut->lsu_rtu_tval;
+            r.cycles   = i + 1;
+            tick();
+            idle_issue();
+            return r;
+        }
+        tick();
+    }
+    r.timed_out = true;
+    idle_issue();
+    return r;
+}
+
+// M4 Task 5: PTW servant probe/answer driver -- asserts group 5's
+// mmu_lsu_data_req/_addr/_size (as MMU.v's own walker would) and waits for
+// lsu_mmu_data_vld, then drops the request the cycle after (MMU.v's own
+// "return to idle is an acknowledge" protocol, SECTION PTW SERVANT).
+struct PtwResult {
+    bool     cmplt = false, bus_error = false;
+    uint64_t data = 0;
+    int      cycles = 0;
+    bool     timed_out = false;
+};
+
+static PtwResult ptw_probe(uint64_t addr, int guard = 200)
+{
+    int waited = 0;
+    while (dut->lsu_idu_full && waited < guard) { idle_issue(); tick(); waited++; }
+
+    dut->mmu_lsu_data_req      = 1;
+    dut->mmu_lsu_data_req_addr = addr;
+    dut->mmu_lsu_data_req_size = 1;
+
+    PtwResult r;
+    for (int i = 0; i < guard; i++) {
+        idle_issue();
+        tick();
+        if (dut->lsu_mmu_data_vld) {
+            r.cmplt     = true;
+            r.data      = dut->lsu_mmu_data;
+            r.bus_error = dut->lsu_mmu_bus_error != 0;
+            r.cycles    = i + 1;
+            dut->mmu_lsu_data_req = 0;
+            tick();
+            return r;
+        }
+    }
+    r.timed_out = true;
+    dut->mmu_lsu_data_req = 0;
+    return r;
+}
 
 // Issue one EX1 dispatch and return immediately WITHOUT waiting for
 // completion (non-blocking). Used by the hit-under-miss tests to put a
@@ -1120,6 +1248,174 @@ static void test_stb_forward_under_miss(void)
     test_result("T13 STB forward under miss: store parks, retries, data visible");
 }
 
+// T14 (M4 Task 5, D1): a DTLB miss (mmu_lsu_pa_vld=0 for N cycles) parks
+// the op via ag_wait_r instead of entering the DC pipe; once the walk lands
+// (pa_vld=1, same VA held throughout by IDU's own EX1-register hold,
+// modeled here by do_op_held), the op issues and completes exactly as it
+// would have on an immediate answer.
+static void test_ag_wait_state_dtlb_miss(void)
+{
+    const uint64_t A = 0x00000000800F1000ULL;   // fresh line, unused elsewhere
+
+    g_pa_vld_stall_cycles = 4;
+    LsuResult sd = do_op_held(F_SD, A, 0, 0xCAFEBABECAFEBABEULL, 0);
+    check(sd.cmplt && !sd.expt_vld, "SD completes after a 4-cycle DTLB-miss wait",
+          sd.cmplt && !sd.expt_vld, 1);
+    check((uint64_t)sd.cycles >= 4, "completion took at least the stalled cycles",
+          (uint64_t)sd.cycles, 4);
+    settle(20);
+
+    g_pa_vld_stall_cycles = 3;
+    LsuResult ld = do_op_held(F_LD, A, 0, 0, 5);
+    check(ld.cmplt && !ld.expt_vld && ld.wb_data == 0xCAFEBABECAFEBABEULL,
+          "LD after its own DTLB-miss wait reads back the exact SD pattern",
+          ld.wb_data, 0xCAFEBABECAFEBABEULL);
+    settle(20);
+    test_result("T14 AG wait-state: DTLB miss parks the op, issues once pa_vld lands");
+}
+
+// T15 (M4 Task 5, S12): a DTLB PAGE_FAULT/ACCESS_FAULT rides the SAME cycle
+// pa_vld=1 arrives -- trap-at-issue, same shape as the existing misalign
+// fix: vec 13/15 (page fault load/store), vec 5/7 (access fault load/
+// store), tval=VA, and -- the correctness property that matters most here
+// -- the faulting access must never touch the array (a faulting STORE must
+// never actually write memory).
+static void test_mmu_fault_trap_at_issue(void)
+{
+    const uint64_t A = 0x00000000800F2000ULL;   // fresh line, unused elsewhere
+
+    g_mmu_inject_page_fault = true;
+    LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+    check(ld.cmplt && ld.expt_vld && !ld.wb_vld,
+          "DTLB page-fault load traps at issue, no writeback",
+          ld.cmplt && ld.expt_vld && !ld.wb_vld, 1);
+    check(ld.expt_vec == 13, "page-fault LOAD takes vec 13", ld.expt_vec, 13);
+    check(ld.tval == A, "tval is the faulting VA", ld.tval, A);
+    g_mmu_inject_page_fault = false;
+    settle(10);
+
+    g_mmu_inject_page_fault = true;
+    LsuResult sd = do_op(F_SD, A, 0, 0x1122334455667788ULL, 0);
+    check(sd.cmplt && sd.expt_vld, "DTLB page-fault STORE traps at issue",
+          sd.cmplt && sd.expt_vld, 1);
+    check(sd.expt_vec == 15, "page-fault STORE takes vec 15", sd.expt_vec, 15);
+    g_mmu_inject_page_fault = false;
+    settle(10);
+
+    // The faulted store above must never have actually written memory --
+    // read it back (now with a clean translation) and confirm it's still 0.
+    LsuResult ld2 = do_op(F_LD, A, 0, 0, 5);
+    check(ld2.cmplt && !ld2.expt_vld && ld2.wb_data == 0,
+          "the faulted store never actually wrote memory", ld2.wb_data, 0);
+
+    g_mmu_inject_access_fault = true;
+    LsuResult ld3 = do_op(F_LD, A, 8, 0, 5);
+    check(ld3.cmplt && ld3.expt_vld && ld3.expt_vec == 5,
+          "DTLB access-fault LOAD takes vec 5", ld3.expt_vec, 5);
+    g_mmu_inject_access_fault = false;
+    settle(10);
+
+    test_result("T15 MMU DTLB fault traps at issue (vec 13/15/5), never touches the array");
+}
+
+// T16 (M4 Task 5, D3): the PTW servant. The load-bearing property (design
+// doc S4/D3): PROBE THE ARRAY FIRST. A PTE-shaped value stored through the
+// normal pipe is DIRTY in the array (not yet written back) -- the servant
+// must answer with that dirty value, not a stale bus read. A cold line
+// falls through to exactly one direct AXI read.
+static void test_ptw_servant(void)
+{
+    const uint64_t LINE     = 0x00000000800B0000ULL;   // fresh line, cold
+    const uint64_t PROBE_A  = LINE + 0x10;              // dwoff=2 within the line
+    const uint64_t PTE_VAL  = 0x00000000200000CFULL;    // a plausible leaf PTE (V,R,W,X,A,D)
+
+    // wa=1 so the store actually ALLOCATES the line into the array (contract
+    // 6's reset default is wa=0 -- a cold store-miss there bypasses the
+    // array with a direct AXI write, which would make this "hit" scenario
+    // a miss instead and defeat the whole point of the test).
+    g_cp0_lsu_wa = 1;
+    LsuResult sd = do_op(F_SD, PROBE_A, 0, PTE_VAL, 0);
+    check(sd.cmplt && !sd.expt_vld, "PTE-shaped store completes", sd.cmplt, 1);
+    settle(5);
+    g_cp0_lsu_wa = 0;   // restore reset default
+
+    int reads_before = g_slave.reads;
+    PtwResult hit = ptw_probe(PROBE_A);
+    check(hit.cmplt && !hit.timed_out, "PTW probe of a dirty line completes", hit.cmplt, 1);
+    check(hit.data == PTE_VAL,
+          "PTW probe returns the DIRTY array value, not a stale bus read",
+          hit.data, PTE_VAL);
+    check(!hit.bus_error, "array-hit answer carries no bus error", hit.bus_error, 0);
+    check((uint64_t)g_slave.reads == (uint64_t)reads_before,
+          "the array hit never touched the AXI bus",
+          (uint64_t)g_slave.reads, (uint64_t)reads_before);
+
+    // Cold line, backed by a known value in golden memory only -- the
+    // servant must fall through to a direct AXI read.
+    const uint64_t LINE2    = 0x00000000800F0000ULL;   // fresh line, unused elsewhere
+    const uint64_t PROBE_A2 = LINE2 + 0x18;             // dwoff=3
+    const uint64_t MEM_VAL  = 0x0123456789ABCDEFULL;
+    for (int i = 0; i < 8; i++) mem_wr(PROBE_A2 + i, (uint8_t)(MEM_VAL >> (i * 8)));
+
+    reads_before = g_slave.reads;
+    PtwResult miss = ptw_probe(PROBE_A2);
+    check(miss.cmplt && !miss.timed_out, "PTW probe of a cold line completes", miss.cmplt, 1);
+    check(miss.data == MEM_VAL, "PTW bus-read fallback returns the correct doubleword",
+          miss.data, MEM_VAL);
+    check(!miss.bus_error, "clean bus read carries no error", miss.bus_error, 0);
+    check((uint64_t)g_slave.reads == (uint64_t)(reads_before + 1),
+          "the array miss fell through to exactly one AXI read",
+          (uint64_t)g_slave.reads, (uint64_t)(reads_before + 1));
+
+    settle(10);
+    test_result("T16 PTW servant: array-probe-first coherence, then bus-read fallback");
+}
+
+// T17 (M4 Task 5, D1): RTU's flush broadcast clears ag_wait_r. A DTLB miss
+// that never gets answered (a huge stall) parks the op; the flush must
+// drop it outright (it never touched the array/STB -- still ST_IDLE) so a
+// fresh, unrelated op issues cleanly afterward with no ghost completion.
+static void test_ag_wait_flush(void)
+{
+    const uint64_t A = 0x0000000080050000ULL;
+
+    g_pa_vld_stall_cycles = 500;   // never answers on its own
+    while (dut->lsu_idu_full) { idle_issue(); tick(); }
+    dut->idu_lsu_ex1_func       = F_LD;
+    dut->idu_lsu_ex1_src0_data  = A;
+    dut->idu_lsu_ex1_src0_ready = 1;
+    dut->idu_lsu_ex1_src1_data  = 0;
+    dut->idu_lsu_ex1_src1_ready = 1;
+    dut->idu_lsu_ex1_src2_data  = 0;
+    dut->idu_lsu_ex1_src2_ready = 1;
+    dut->idu_lsu_ex1_dst0_reg   = 5;
+    dut->idu_lsu_ex1_dp_sel     = 1;
+    dut->idu_lsu_ex1_sel        = 1;
+    tick();
+    idle_issue();
+
+    settle(5);
+    check(dut->lsu_idu_full != 0, "op is parked (lsu_idu_full) mid DTLB-miss wait",
+          (uint64_t)dut->lsu_idu_full, 1);
+
+    g_flush_fe = true;
+    tick();
+    g_flush_fe = false;
+
+    settle(5);
+    check(dut->lsu_idu_full == 0, "ag_wait_r cleared by the flush -- LSU is free again",
+          (uint64_t)dut->lsu_idu_full, 0);
+
+    g_pa_vld_stall_cycles = 0;
+    settle(5);
+
+    LsuResult ld = do_op(F_LD, A, 8, 0, 6);
+    check(ld.cmplt && !ld.expt_vld, "a fresh op after the flush issues cleanly",
+          ld.cmplt && !ld.expt_vld, 1);
+
+    test_result("T17 AG wait-state: RTU flush drops a parked DTLB-miss op");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -1143,6 +1439,10 @@ int main(int argc, char **argv)
     test_pfb_stride_prefetch();            // M3b Task D: PFB stride prefetch + MHINT
     test_amr_streaming_store();            // M3b Task E: AMR write-allocate disabler
     test_stb_forward_under_miss();         // M3b Task F: store-under-miss consolidation
+    test_ag_wait_state_dtlb_miss();        // M4 Task 5, D1: AG wait-state on a DTLB miss
+    test_mmu_fault_trap_at_issue();        // M4 Task 5, S12: DTLB fault traps at issue
+    test_ptw_servant();                    // M4 Task 5, D3: PTW servant, array-probe-first
+    test_ag_wait_flush();                  // M4 Task 5, D1: RTU flush drops a parked op
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

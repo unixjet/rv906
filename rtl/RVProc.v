@@ -216,6 +216,27 @@ module RVProc #(
     wire                     mmu_lsu_sh;
     wire                     mmu_lsu_page_fault;
     wire                     mmu_lsu_access_fault;
+    wire                     lsu_mmu_abort;
+
+    //=========================================================================
+    // M4 Task 5: the PTW memory-read servant channel (MMU.v <-> LSU.v,
+    // group 5's frozen six wires) and the PMP check channels (MMU.v <->
+    // PMP.v). Dead-tied at Task 4 (MMU.v's own header note); wired for real
+    // here.
+    //=========================================================================
+    wire                     mmu_lsu_data_req;
+    wire [PC_WIDTH-1:0]      mmu_lsu_data_req_addr;
+    wire                     mmu_lsu_data_req_size;
+    wire [63:0]              lsu_mmu_data;
+    wire                     lsu_mmu_data_vld;
+    wire                     lsu_mmu_bus_error;
+
+    wire [PC_WIDTH-1:0]      mmu_pmp_fetch_pa;
+    wire                     mmu_pmp_fetch_vld;
+    wire [PC_WIDTH-1:0]      mmu_pmp_data_pa;
+    wire                     mmu_pmp_load;
+    wire                     mmu_pmp_store;
+    wire                     mmu_pmp_data_vld;
 
     //=========================================================================
     // IFU <-> BPU seam (see BPU.v's header for the port rationale).
@@ -733,6 +754,25 @@ module RVProc #(
         .mmu_lsu_page_fault     (mmu_lsu_page_fault),
         .mmu_lsu_access_fault   (mmu_lsu_access_fault),
 
+        // M4 Task 5: the PTW memory-read servant, LSU.v's real body now.
+        .mmu_lsu_data_req       (mmu_lsu_data_req),
+        .mmu_lsu_data_req_addr  (mmu_lsu_data_req_addr),
+        .mmu_lsu_data_req_size  (mmu_lsu_data_req_size),
+        .lsu_mmu_data           (lsu_mmu_data),
+        .lsu_mmu_data_vld       (lsu_mmu_data_vld),
+        .lsu_mmu_bus_error      (lsu_mmu_bus_error),
+        .lsu_mmu_abort          (lsu_mmu_abort),
+
+        // M4 Task 5: PMP check channels, PMP.v's real instance now.
+        .mmu_pmp_fetch_pa       (mmu_pmp_fetch_pa),
+        .mmu_pmp_fetch_vld      (mmu_pmp_fetch_vld),
+        .pmp_mmu_fetch_deny     (pmp_fetch_deny),
+        .mmu_pmp_data_pa        (mmu_pmp_data_pa),
+        .mmu_pmp_load           (mmu_pmp_load),
+        .mmu_pmp_store          (mmu_pmp_store),
+        .mmu_pmp_data_vld       (mmu_pmp_data_vld),
+        .pmp_mmu_data_deny      (pmp_data_deny),
+
         .cp0_mmu_satp_data      (cp0_mmu_satp_data),
         .cp0_mmu_satp_wen       (cp0_mmu_satp_wen),
         .cp0_mmu_mxr            (cp0_mmu_mxr),
@@ -992,6 +1032,7 @@ module RVProc #(
 
         .rtu_lsu_expt_ack        (rtu_lsu_expt_ack),
         .rtu_lsu_expt_exit       (rtu_lsu_expt_exit),
+        .rtu_yy_xx_flush_fe      (rtu_yy_xx_flush_fe),
 
         .lsu_mmu_va              (lsu_mmu_va),
         .lsu_mmu_va_vld          (lsu_mmu_va_vld),
@@ -1006,6 +1047,14 @@ module RVProc #(
         .mmu_lsu_sh              (mmu_lsu_sh),
         .mmu_lsu_page_fault      (mmu_lsu_page_fault),
         .mmu_lsu_access_fault    (mmu_lsu_access_fault),
+        .lsu_mmu_abort           (lsu_mmu_abort),
+
+        .mmu_lsu_data_req        (mmu_lsu_data_req),
+        .mmu_lsu_data_req_addr   (mmu_lsu_data_req_addr),
+        .mmu_lsu_data_req_size   (mmu_lsu_data_req_size),
+        .lsu_mmu_data            (lsu_mmu_data),
+        .lsu_mmu_data_vld        (lsu_mmu_data_vld),
+        .lsu_mmu_bus_error       (lsu_mmu_bus_error),
 
         .cp0_lsu_dcache_en       (cp0_lsu_dcache_en),
         .cp0_lsu_mm              (cp0_lsu_mm),
@@ -1270,11 +1319,16 @@ module RVProc #(
     );
 
     //=========================================================================
-    // PMP instance (M4 Task 2): 8-entry physical memory protection. The
-    // pmpcfg/pmpaddr storage lives here; CSR.v decodes/strobes/reads back.
-    // The fetch/data deny outputs are consumed by the MMU/LSU at Tasks 3-6;
-    // until then they are computed but unused (no PMP regions configured at
-    // reset, so M-mode accesses pass and behavior is unchanged).
+    // PMP instance (M4 Task 2, wired for real at Task 5): 8-entry physical
+    // memory protection. The pmpcfg/pmpaddr storage lives here; CSR.v
+    // decodes/strobes/reads back. chk_fetch_*/chk_data_*/chk_load/chk_store
+    // now come from MMU.v's own PMP check channels (SECTION 7 of MMU.v --
+    // time-shared among the mach/bare identity path, the TLB-hit live
+    // re-check, and the walker's per-level PT-page check, D9/P14); the deny
+    // outputs feed straight back into MMU.v's pmp_mmu_fetch_deny/
+    // pmp_mmu_data_deny inputs (see the u_mmu instance above). No PMP
+    // regions are configured at reset (M-mode default flg=0111), so the
+    // OFF-path battery is unaffected by this wiring becoming real.
     //=========================================================================
     PMP u_pmp (
         .clk                (clk),
@@ -1287,12 +1341,12 @@ module RVProc #(
         .pmpaddr_rsel       (pmp_addr_rsel),
         .pmp_addr_value     (pmp_addr_value),
         .priv_mode          (cp0_pmp_priv_mode),
-        .chk_fetch_pa       ({PC_WIDTH{1'b0}}),
-        .chk_fetch_vld      (1'b0),
-        .chk_data_pa        ({PC_WIDTH{1'b0}}),
-        .chk_load           (1'b0),
-        .chk_store          (1'b0),
-        .chk_data_vld       (1'b0),
+        .chk_fetch_pa       (mmu_pmp_fetch_pa),
+        .chk_fetch_vld      (mmu_pmp_fetch_vld),
+        .chk_data_pa        (mmu_pmp_data_pa),
+        .chk_load           (mmu_pmp_load),
+        .chk_store          (mmu_pmp_store),
+        .chk_data_vld       (mmu_pmp_data_vld),
         .pmp_fetch_deny     (pmp_fetch_deny),
         .pmp_data_deny      (pmp_data_deny)
     );

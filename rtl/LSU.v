@@ -165,6 +165,12 @@ module LSU #(
     //=========================================================================
     input  wire                     rtu_lsu_expt_ack,
     input  wire                     rtu_lsu_expt_exit,
+    // M4 Task 5 (D1): RTU's front-end flush broadcast -- clears ag_wait_r
+    // (SECTION AG below) so a parked DTLB-miss op that turns out to be on
+    // the wrong path is dropped rather than replayed once the walk lands.
+    // Matches CSR.v's/IDU.v's own consumption of this same RTU.v broadcast
+    // (`assign rtu_yy_xx_flush_fe = retire_flush_fe;`, RTU.v:903).
+    input  wire                     rtu_yy_xx_flush_fe,
 
     //=========================================================================
     // LSU -> MMU / MMU -> LSU : the DTLB request/response (contract 2),
@@ -183,6 +189,23 @@ module LSU #(
     input  wire                     mmu_lsu_sh,
     input  wire                     mmu_lsu_page_fault,
     input  wire                     mmu_lsu_access_fault,
+    // M4 Task 5 (D1): the walk-abort pin for THIS port (donor's
+    // lsu_mmu_abort0/1 collapsed to one -- rv906's single-outstanding DTLB
+    // request). Driven straight off the same flush broadcast: any in-flight
+    // walk this port started is for a VA that is about to be squashed.
+    output wire                     lsu_mmu_abort,
+
+    //=========================================================================
+    // M4 Task 5 (S4/D3): the PTW memory-read servant (donor aq_lsu_mcic.v,
+    // rv12 P3 precedent) -- MMU.v's group-5 six-wire channel. See SECTION
+    // PTW SERVANT below for the full contract.
+    //=========================================================================
+    input  wire                     mmu_lsu_data_req,
+    input  wire [PC_WIDTH-1:0]      mmu_lsu_data_req_addr,
+    input  wire                     mmu_lsu_data_req_size,
+    output wire [63:0]              lsu_mmu_data,
+    output wire                     lsu_mmu_data_vld,
+    output wire                     lsu_mmu_bus_error,
 
     //=========================================================================
     // CSR -> LSU : MHCR.de/wa + MXSTATUS.mm (matches CSR.v's output group
@@ -382,12 +405,59 @@ module LSU #(
     // made the MMU do the >>12 -- observably equivalent but not
     // clone-faithful; corrected against the donor 2026-08-23.
     assign lsu_mmu_va        = ag_addr[12 +: MMU_VA_WIDTH];      // = ag_addr[63:12]
-    assign lsu_mmu_va_vld    = ag_valid;
+    // M4 Task 5 (D1): stays level-valid across a DTLB-miss wait too --
+    // `ag_wait_r` below (declared ahead of use, matching this file's own
+    // forward-reference style throughout) -- so the walk sees a stable
+    // request for its whole duration; ag_addr itself does not move while
+    // waiting (IDU holds the EX1 register: adv=0 while lsu_idu_full=1).
+    assign lsu_mmu_va_vld    = ag_valid || ag_wait_r;
     // M4 Task 1: effective data-access privilege (donor aq_lsu_ag.v:674-675:
     // MPRV redirects loads/stores to MPP's privilege). While MPRV=0 this is
     // the current mode (M-mode = 2'b11 for the existing battery).
     assign lsu_mmu_priv_mode = cp0_lsu_mprv ? cp0_lsu_mpp : cp0_yy_priv_mode;
     assign lsu_mmu_st_inst   = ag_is_store;
+
+    //-------------------------------------------------------------------------
+    // SECTION AG WAIT-STATE (M4 Task 5, D1) -- a DTLB miss (mmu_lsu_pa_vld=0
+    // the cycle this op would otherwise issue) cannot enter the DC pipe: the
+    // PA that touches_array/ag_dc_tag/ag_dc_index depend on isn't ready yet.
+    // `ag_wait_r` parks the op AT ST_IDLE (never touching the array/STB) for
+    // as many cycles as the walk takes; `mmu_lsu_pa_vld` finally landing
+    // (SAME va, held live above) lets `issue_real` (below) proceed exactly
+    // as it would have same-cycle on the M2/M3 stub's always-same-cycle
+    // answer -- the OFF path (satp Bare/M-mode, MMU.v's own mach_path) is
+    // untouched: `mmu_lsu_pa_vld` is combinationally 1 there every cycle,
+    // so `ag_mmu_wait_start` below never fires and `ag_wait_r` never sets.
+    //-------------------------------------------------------------------------
+    reg ag_wait_r;
+    // "would issue but for the MMU" -- every OTHER admission gate issue_real
+    // already applies (state/clean/rf_port/lfb_cmplt/ptw_sv, the last two
+    // declared ahead in SECTION PTW SERVANT, same forward-reference style),
+    // OR'ing in ag_wait_r itself so a parked op keeps re-checking every cycle.
+    wire ag_issue_ready = (state == ST_IDLE) && (ag_valid || ag_wait_r)
+                         && !clean_active && !rf_port_busy && !lfb_cmplt_fire
+                         && !ptw_sv_busy;
+    wire ag_mmu_wait_start = ag_issue_ready && !mmu_lsu_pa_vld;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            ag_wait_r <= 1'b0;
+        else if (rtu_yy_xx_flush_fe)
+            ag_wait_r <= 1'b0;   // D1: the parked op is squashed outright --
+                                 // it never touched the array/STB (still
+                                 // ST_IDLE), so there is nothing to unwind.
+        else if (ag_mmu_wait_start)
+            ag_wait_r <= 1'b1;
+        else if (ag_issue_ready && mmu_lsu_pa_vld)
+            ag_wait_r <= 1'b0;   // issuing (or trapping-at-issue) NOW
+    end
+
+    // Cancel this port's in-flight walk on the same broadcast that clears
+    // ag_wait_r -- MMU.v's SECTION 6.7 VPN+type-match fault-delivery gate
+    // already drops a stale fault/refill answer once lsu_mmu_va_vld falls,
+    // so `lsu_mmu_abort` only needs to say "this port is being flushed",
+    // not track the walk's own state.
+    assign lsu_mmu_abort = rtu_yy_xx_flush_fe;
 
     // Full 40-bit PA: MMU's translated page number + AG's own (untranslated)
     // page offset (contract 2; identity-mapped in M2, but this module does
@@ -635,6 +705,157 @@ module LSU #(
     );
 
     //-------------------------------------------------------------------------
+    // SECTION PTW SERVANT (M4 Task 5, D3, S4/S12) -- the MMU has no memory
+    // port of its own; every hardware page-table read arrives on group 5's
+    // frozen six-wire channel (mmu_lsu_data_req/_addr/_size) and leaves on
+    // its answer side (lsu_mmu_data/_vld/_bus_error). Donor aq_lsu_mcic.v is
+    // a 310-line array/bus server with its own gated clock and a T-Head
+    // diagnostic path this project already dropped (D-M4-5); this section
+    // keeps the PROPERTY the design doc calls load-bearing (D3), not the
+    // module:
+    //
+    //   *** PROBE THE D-CACHE FIRST, AND THAT IS A CORRECTNESS RULE. ***
+    //   Page tables are written by CACHEABLE stores (the v-env's software
+    //   A/D update, rv64si-p-dirty's own fault handler does `sw` to set
+    //   A/D then sfence.vma + retry), and this D-cache is WRITE-BACK
+    //   (contract 6) -- a PTE line can be DIRTY in the array at walk time.
+    //   A walker that only reads the bus reads a STALE PTE and never sees
+    //   the just-set A/D bit, looping the fault forever. Probe first, fall
+    //   through to a direct AXI read only on an array miss.
+    //
+    //   *** THE SERVANT NEVER RUNS CONCURRENTLY WITH ANYTHING ELSE THAT
+    //   TOUCHES THE ARRAY OR THE AXI READ CHANNEL -- BY CONSTRUCTION. ***
+    //   `ptw_sv_idle_free` gates the ONE cycle a new probe may start on
+    //   every condition the main issue mux (SECTION IDLE-cycle issue mux,
+    //   below) already uses to know the array/AXI-read port is free:
+    //   state==ST_IDLE (excludes ST_FRZ's blocking-miss use), !any_stb_vld
+    //   (a drained STB makes the array-only probe coherent without STB
+    //   forwarding -- D3's own text), !clean_active (FENCE.I's walk),
+    //   !rf_port_busy (a background LFB refill's array-port phases), and
+    //   !lfb_any_vld (stronger than rf_port_busy alone: excludes a
+    //   background refill's OWN AXI-read phase too, MS_REFILL_READ/
+    //   MS_DIRECT_READ, which rf_port_busy deliberately does NOT cover --
+    //   hit-under-miss lets a new array lookup proceed there, but this
+    //   servant also needs the AXI read channel on a probe miss, so it
+    //   must wait out the WHOLE background transaction, not just its
+    //   array-port phases). The reverse direction is closed two ways: (1)
+    //   `issue_real`/`issue_drain` (below) both gate on `!ptw_sv_busy`, so
+    //   a genuinely new instruction cannot steal the array/AXI channel out
+    //   from under an in-flight walk (the walk just holds `state`==ST_IDLE
+    //   throughout, since it never touches the main FSM's own `state`);
+    //   (2) the FENCE.I clean walk's own CL_IDLE arm (SECTION CLEAN,
+    //   below) additionally requires `ptw_sv_state == PTW_SV_IDLE` before
+    //   starting, closing the one window `clean_active` alone could not --
+    //   clean_active only gates ptw_sv at the MOMENT of a NEW probe, not
+    //   for the rest of an already-in-flight walk's own multi-cycle
+    //   ANSW/BUS span, during which `state` is still ST_IDLE.
+    //
+    //   *** SINGLE OUTSTANDING, ENFORCED HERE. *** The walker itself issues
+    //   one PT read at a time (MMU.v SECTION 6's own "single walk at a
+    //   time"), but this servant does not trust that: a new probe is only
+    //   accepted from PTW_SV_IDLE, so a second `mmu_lsu_data_req` raised
+    //   mid-walk changes nothing.
+    //
+    //   *** RETURN TO IDLE IS AN ACKNOWLEDGE, NOT A COUNT. *** MMU.v holds
+    //   `mmu_lsu_data_req` up for the whole of its own *_DATA state and
+    //   drops it the cycle AFTER `lsu_mmu_data_vld` pulses (MMU.v's own
+    //   `ptw_data_req`); PTW_SV_DONE waits for that fall before re-arming,
+    //   so a level held one cycle longer cannot make this servant answer
+    //   the same request twice.
+    //-------------------------------------------------------------------------
+    localparam [1:0] PTW_SV_IDLE = 2'd0,   // no walk request accepted
+                     PTW_SV_ANSW  = 2'd1,   // the array is answering THIS cycle
+                     PTW_SV_BUS   = 2'd2,   // array missed -- direct AXI read
+                     PTW_SV_DONE  = 2'd3;   // answered -- waiting for the req to fall
+    reg [1:0]           ptw_sv_state;
+    reg [PC_WIDTH-1:0]  ptw_sv_addr_r;
+    reg                 ptw_sv_ar_sent;
+
+    wire ptw_sv_busy = (ptw_sv_state != PTW_SV_IDLE);
+
+    // any_stb_vld/clean_active/rf_port_busy/lfb_any_vld/issue_real/
+    // issue_drain are all declared further down this file -- forward
+    // reference, same style this file already uses throughout (e.g.
+    // ag_needs_slot_c in lsu_idu_full's own definition).
+    wire ptw_sv_idle_free = (state == ST_IDLE) && !any_stb_vld && !clean_active
+                           && !rf_port_busy && !lfb_any_vld
+                           && !issue_real && !issue_drain;
+    wire ptw_sv_probe_fire = (ptw_sv_state == PTW_SV_IDLE) && mmu_lsu_data_req
+                            && ptw_sv_idle_free;
+
+    // The array probe itself reads mmu_lsu_data_req_addr directly (not yet
+    // latched into ptw_sv_addr_r -- that latch happens on the SAME edge);
+    // way_sel=0 is DCache.v's own "ordinary hit-check" read mode (its
+    // header's "way-select dual purpose" contract).
+    wire [DCACHE_TAG_WIDTH-1:0] ptw_sv_req_tag   = mmu_lsu_data_req_addr[39:13];
+    wire [DCACHE_INDEX_W-1:0]   ptw_sv_req_index = mmu_lsu_data_req_addr[12:6];
+    // Once latched, the same fields read off ptw_sv_addr_r for the (unused
+    // this cycle, but kept symmetric) tag/index and for the doubleword
+    // select below.
+    wire [2:0] ptw_sv_dwoff = ptw_sv_addr_r[5:3];
+    // mmu_lsu_data_req_size (donor: constant 1, "every PT read is 8B",
+    // MMU.v:618) carries no information THIS servant needs -- every read
+    // always fetches the full 64B line and picks the doubleword out by
+    // address (ptw_sv_dwoff), the same "consumer picks out the bytes it
+    // needs" simplification every other direct-read use in this file
+    // already takes. Received, not silently dropped.
+    wire _mmu_lsu_data_req_size_unused = mmu_lsu_data_req_size;
+
+    wire ptw_sv_axi_active = (ptw_sv_state == PTW_SV_BUS);
+    // Direct AXI reads always fetch the full 64B LINE (arsize=6, matching
+    // every other read use in this file -- "the consumer picks out the
+    // doubleword it actually needs"), aligned DOWN from the (8B-aligned,
+    // not necessarily 64B-aligned) PTE address MMU.v's walker built.
+    wire [ADDR_WIDTH-1:0] ptw_sv_line_addr =
+        {{(ADDR_WIDTH-PC_WIDTH){1'b0}}, ptw_sv_addr_r[PC_WIDTH-1:6], 6'b0};
+
+    wire ptw_sv_hit_answer = (ptw_sv_state == PTW_SV_ANSW) && u_dc_resp_vld
+                            && (|u_dc_resp_hit_way);
+    wire ptw_sv_miss_c     = (ptw_sv_state == PTW_SV_ANSW) && u_dc_resp_vld
+                            && !(|u_dc_resp_hit_way);
+    wire ptw_sv_bus_answer = ptw_sv_axi_active && axi_d_rvalid && axi_d_rready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ptw_sv_state   <= PTW_SV_IDLE;
+            ptw_sv_addr_r  <= {PC_WIDTH{1'b0}};
+            ptw_sv_ar_sent <= 1'b0;
+        end else begin
+            case (ptw_sv_state)
+                PTW_SV_IDLE: if (ptw_sv_probe_fire) begin
+                    ptw_sv_addr_r <= mmu_lsu_data_req_addr;
+                    ptw_sv_state  <= PTW_SV_ANSW;
+                end
+                PTW_SV_ANSW: begin
+                    if (ptw_sv_hit_answer)
+                        ptw_sv_state <= PTW_SV_DONE;
+                    else if (ptw_sv_miss_c) begin
+                        ptw_sv_ar_sent <= 1'b0;
+                        ptw_sv_state   <= PTW_SV_BUS;
+                    end
+                end
+                PTW_SV_BUS: begin
+                    if (axi_d_arvalid && axi_d_arready && ptw_sv_axi_active)
+                        ptw_sv_ar_sent <= 1'b1;
+                    if (ptw_sv_bus_answer) ptw_sv_state <= PTW_SV_DONE;
+                end
+                PTW_SV_DONE: if (!mmu_lsu_data_req) ptw_sv_state <= PTW_SV_IDLE;
+                default: ptw_sv_state <= PTW_SV_IDLE;
+            endcase
+        end
+    end
+
+    // The answer, read combinationally off whichever source resolved it --
+    // ONE-CYCLE pulses (not held through PTW_SV_DONE), matching MMU.v's own
+    // consumption (`if (lsu_mmu_data_vld) pte_flop <= lsu_mmu_data`, once).
+    wire [63:0] ptw_sv_hit_dword = u_dc_resp_rdata[{ptw_sv_dwoff, 6'b0} +: 64];
+    wire [63:0] ptw_sv_bus_dword = axi_d_rdata[{ptw_sv_dwoff, 6'b0} +: 64];
+
+    assign lsu_mmu_data_vld  = ptw_sv_hit_answer || ptw_sv_bus_answer;
+    assign lsu_mmu_data      = ptw_sv_hit_answer ? ptw_sv_hit_dword : ptw_sv_bus_dword;
+    assign lsu_mmu_bus_error = ptw_sv_bus_answer && (axi_d_rresp != 2'b00);
+
+    //-------------------------------------------------------------------------
     // SECTION IDLE-cycle issue mux: a real instruction (ag_valid) takes
     // priority over an opportunistic drain (drain_want), matching this
     // task's own "STB drains unconditionally... but must not starve the
@@ -649,12 +870,17 @@ module LSU #(
     // deadlocks (rv64ui-p-ld_st). Cacheable drains use the state FSM
     // (ST_DCS->ST_REPLY), not the FRZ sub-FSM, so they interleave safely
     // with the background refill's AXI phases.
-    wire issue_real  = (state == ST_IDLE) && ag_valid && !clean_active
-                       && !rf_port_busy && !lfb_cmplt_fire;   // misaligned accesses still
-                                                           // enter the pipe (see below) --
-                                                           // they just never touch the array.
+    // M4 Task 5 (D1): issue_real now additionally requires mmu_lsu_pa_vld --
+    // `ag_issue_ready` (SECTION AG WAIT-STATE above) is every OTHER gate
+    // this wire used to spell out directly PLUS the `ag_wait_r` OR-term, so
+    // a parked op keeps re-evaluating every cycle. On the OFF path
+    // (mach_path, MMU.v SECTION 7) mmu_lsu_pa_vld is combinationally 1
+    // every cycle, so issue_real is bit-identical to its pre-Task-5 form
+    // there -- ag_wait_r never sets, this AND-term is always satisfied the
+    // same cycle ag_issue_ready is.
+    wire issue_real  = ag_issue_ready && mmu_lsu_pa_vld;
     wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
-                       && !rf_port_busy && !lfb_cmplt_fire;
+                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
 
     // M4 misalign fix (contract 3 + donor aq_lsu_ag.v, which raises misalign
     // at AG, NOT at the reply): a misaligned access must trap at its ISSUE
@@ -666,7 +892,14 @@ module LSU #(
     // AG-stage exception pulse; the access never enters the DC FSM.
     wire misalign_issue = issue_real && ag_misalign;
 
-    wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign)
+    // M4 Task 5 (S12): a DTLB PAGE_FAULT/ACCESS_FAULT rides the SAME cycle
+    // pa_vld=1 arrives (MMU.v's own contract: "Faults arrive WITH pa_vld").
+    // Trap-at-issue, exactly like misalign_issue: the access never enters
+    // the DC FSM, so no array/STB state is ever created for it.
+    wire mmu_fault_issue = issue_real && !ag_misalign
+                          && (mmu_lsu_page_fault || mmu_lsu_access_fault);
+
+    wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign && !mmu_fault_issue)
                         : issue_drain ? stb_was_hit[drain_pick]
                         : 1'b0;
 
@@ -715,7 +948,10 @@ module LSU #(
         end else begin
             case (state)
                 ST_IDLE: begin
-                    if (issue_real && !ag_misalign) begin
+                    // M4 Task 5: a DTLB fault (mmu_fault_issue) traps at
+                    // issue exactly like a misaligned access -- excluded
+                    // here so it never enters ST_DCS/touches the array.
+                    if (issue_real && !ag_misalign && !mmu_fault_issue) begin
                         dc_is_store_r   <= ag_is_store;
                         dc_plain_ld_r   <= ag_is_plain_ld;
                         dc_sign_ext_r   <= ag_sign_ext;
@@ -864,15 +1100,17 @@ module LSU #(
             // Latch the LR address/size on issue_real (IDLE->DCS transition).
             // Use ag_addr (virtual address) for LR/SC comparison. A
             // MISALIGNED LR traps and must install NO reservation (donor
-            // gates lm_set on !expt_ack/!expt_exit, aq_lsu_lm.v:129).
+            // gates lm_set on !expt_ack/!expt_exit, aq_lsu_lm.v:129). M4
+            // Task 5: a DTLB-faulting LR traps at issue too (mmu_fault_issue)
+            // and must install no reservation for the same reason.
             if (issue_real && (idu_lsu_ex1_func == LSU_FUNC_LR_W
                                || idu_lsu_ex1_func == LSU_FUNC_LR_D)) begin
-                if (!ag_misalign) begin
+                if (!ag_misalign && !mmu_fault_issue) begin
                     lr_addr_r <= ag_addr[55:0];
                     lr_size_r <= ag_size;
                     lr_addr_set <= 1'b1;
                 end
-                dc_is_lr_r <= !ag_misalign;
+                dc_is_lr_r <= !ag_misalign && !mmu_fault_issue;
             end else if (lsu_rtu_ex1_cmplt_dp || issue_real) begin
                 // tag tracks the in-flight transaction (drains never set it)
                 dc_is_lr_r <= 1'b0;
@@ -937,8 +1175,17 @@ module LSU #(
             amo_op_r     <= 5'd0;
             amo_is_dw_r  <= 1'b0;
         end else begin
-            // Latch AMO operands at issue_real
-            if (issue_real && amo_is_amo) begin
+            // Latch AMO operands at issue_real. M4 Task 5 amendment: guard
+            // on !ag_misalign && !mmu_fault_issue too -- either trap fires
+            // at ISSUE (misalign_issue/mmu_fault_issue) and this AMO never
+            // reaches ST_REPLY, so the existing "clear at REPLY" arm below
+            // would never fire and amo_active would stay stuck at 1,
+            // corrupting the NEXT completing LSU op's writeback mux (the
+            // exact "stuck flag" failure mode the M3 audit comment below
+            // already describes for the FRZ-miss case). A misaligned AMO
+            // could already hit this before Task 5 introduced mmu_fault -
+            // fixed here rather than left to be found by the new fault path.
+            if (issue_real && amo_is_amo && !ag_misalign && !mmu_fault_issue) begin
                 amo_active  <= 1'b1;
                 amo_src0_r  <= idu_lsu_ex1_src2_data;
                 amo_op_r    <= amo_op;
@@ -971,7 +1218,7 @@ module LSU #(
                                              // port (vpeek/commit), else the IDU
                                              // would hand off an op the LSU can't
                                              // take this cycle.
-                          || lfb_cmplt_fire; // M3b: the deferred-load completion
+                          || lfb_cmplt_fire  // M3b: the deferred-load completion
                                              // takes the ST_IDLE issue slot this
                                              // cycle (see issue_real/issue_drain's
                                              // own !lfb_cmplt_fire term) -- without
@@ -979,6 +1226,15 @@ module LSU #(
                                              // advances EX1 past an op LSU is
                                              // about to silently refuse, dropping
                                              // it forever (rv64ui-p-ld_st hang).
+                          || ag_wait_r       // M4 Task 5 (D1): a DTLB miss parks
+                                             // this EX1-resident op until the walk
+                                             // lands -- IDU must hold it (adv=0),
+                                             // not advance past it.
+                          || ptw_sv_busy;    // M4 Task 5 (D3): the array/AXI-read
+                                             // port is committed to a PTE fetch
+                                             // this cycle (this port's own walk OR
+                                             // an ITLB walk sharing the same
+                                             // servant) -- see SECTION PTW SERVANT.
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
     // flight AND no deferred load outstanding. state==ST_IDLE implies no
     // AG-issued op is in flight (issue_real leaves IDLE the cycle it fires)
@@ -1718,7 +1974,13 @@ module LSU #(
             clean_todo  <= {WAYS{1'b0}};
         end else case (clean_state)
             CL_IDLE: begin
-                if (cp0_lsu_dcache_clean && (state == ST_IDLE) && !any_stb_vld) begin
+                // M4 Task 5: also wait for the PTW servant to be idle -- it
+                // occupies the array/AXI-read port for a multi-cycle walk
+                // while `state` stays ST_IDLE throughout (SECTION PTW
+                // SERVANT's own gating only stops IT from STARTING during
+                // an active clean walk; this is the other direction).
+                if (cp0_lsu_dcache_clean && (state == ST_IDLE) && !any_stb_vld
+                    && (ptw_sv_state == PTW_SV_IDLE)) begin
                     clean_state <= CL_SET_READ;
                     clean_set   <= {DCACHE_INDEX_W{1'b0}};
                 end
@@ -1802,12 +2064,22 @@ module LSU #(
                         || miss_state == MS_VPEEK_WAIT || miss_state == MS_COMMIT_ISSUE
                         || miss_state == MS_COMMIT_WAIT));
 
-    assign u_dc_req_vld       = touches_array || frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit || clean_req;
+    // M4 Task 5: ptw_sv_probe_fire adds a fourth array requester (SECTION
+    // PTW SERVANT, above) -- a plain read (way_sel=0, wr=0, alloc=0), so it
+    // needs an explicit arm only where the existing fallback (ag_is_store,
+    // driven by whatever is live in IDU's EX1 register regardless of
+    // whether THIS cycle's array use is even a real instruction's) would
+    // otherwise leak a stale write. ptw_sv_probe_fire is mutually exclusive
+    // with frz_issue_*/clean_req/issue_drain by construction (its own
+    // ptw_sv_idle_free gate), so it only needs to beat the ag_is_store
+    // fallback, not the other arms.
+    assign u_dc_req_vld       = touches_array || frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit || clean_req || ptw_sv_probe_fire;
     assign u_dc_req_way_sel   = frz_issue_vpeek ? victim_way_r : (frz_issue_commit ? victim_way_r
                                 : clean_issue_peek ? clean_way_oh
                                 : (issue_drain ? stb_way[drain_pick] : {WAYS{1'b0}}));
     assign u_dc_req_wr        = frz_issue_commit ? 1'b1 : ((frz_issue_lfb_peek || frz_issue_vpeek) ? 1'b0
-                                : (issue_drain ? 1'b1 : ag_is_store));
+                                : (ptw_sv_probe_fire ? 1'b0
+                                : (issue_drain ? 1'b1 : ag_is_store)));
     assign u_dc_req_alloc     = frz_issue_commit;
     assign u_dc_req_wdata      = frz_issue_commit ? frz_rdata_r
                                 : (issue_drain ? ({448'b0, stb_data[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 64))
@@ -1815,11 +2087,14 @@ module LSU #(
     assign u_dc_req_wstrb      = frz_issue_commit ? 64'hFFFF_FFFF_FFFF_FFFF
                                 : (issue_drain ? ({56'b0, stb_byte_vld[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 8))
                                 : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8)));
-    assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (issue_drain ? 1'b1 : ag_is_store);
+    assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (ptw_sv_probe_fire ? 1'b0
+                                : (issue_drain ? 1'b1 : ag_is_store));
     assign u_dc_req_index      = frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit ? frz_eff_index
                                 : clean_req ? clean_set
+                                : ptw_sv_probe_fire ? ptw_sv_req_index
                                 : (issue_drain ? stb_index[drain_pick] : ag_dc_index);
     assign u_dc_req_tag        = frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit ? frz_eff_tag
+                                : ptw_sv_probe_fire ? ptw_sv_req_tag
                                 : (issue_drain ? stb_tag[drain_pick] : ag_dc_tag);
 
     //-------------------------------------------------------------------------
@@ -1851,8 +2126,18 @@ module LSU #(
     assign axi_d_wlast   = axi_d_wvalid;
     assign axi_d_bready  = 1'b1;
 
-    assign axi_d_arvalid = axi_r_active && !axi_r_ar_sent;
-    assign axi_d_araddr  = axi_r_addr_r;
+    // M4 Task 5: ptw_sv_axi_active (SECTION PTW SERVANT, above) shares this
+    // single physical AR/R channel with the FRZ/LFB refill's own axi_r_*
+    // read sub-sequence. The two are mutually exclusive BY CONSTRUCTION,
+    // never arbitrated: ptw_sv only starts a walk while state==ST_IDLE &&
+    // !lfb_any_vld (ptw_sv_idle_free, above), and lfb_any_vld=1 for the
+    // WHOLE of any FRZ/LFB refill's own AXI-read phase (an LFB entry is
+    // occupied from activation through completion) -- so axi_r_active and
+    // ptw_sv_axi_active can never both be 1 the same cycle. A plain OR-mux
+    // is therefore exact, not an arbitration choice.
+    assign axi_d_arvalid = (axi_r_active && !axi_r_ar_sent)
+                          || (ptw_sv_axi_active && !ptw_sv_ar_sent);
+    assign axi_d_araddr  = axi_r_active ? axi_r_addr_r : ptw_sv_line_addr;
     assign axi_d_arlen   = 8'd0;
     assign axi_d_arsize  = 3'd6;
     assign axi_d_arburst = 2'b01;
@@ -2227,7 +2512,8 @@ module LSU #(
 
     assign lsu_rtu_ex1_cmplt_dp   = ((state == ST_REPLY) && reply_can_complete && !dc_is_drain_r)
                                     || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx])   // M3b: deferred-load
-                                    || misalign_issue;   // M4: misalign traps at AG-issue
+                                    || misalign_issue   // M4: misalign traps at AG-issue
+                                    || mmu_fault_issue;  // M4 Task 5: DTLB fault, same shape
                                     // completion; a PREFETCH entry drains silently (no instruction)
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
     // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
@@ -2306,17 +2592,34 @@ module LSU #(
     // M3 Task 1: LR.W / SC.W foundation outputs
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
-    assign lsu_rtu_expt_vld = misalign_issue || (reply_fire && dc_misalign_r);
+    assign lsu_rtu_expt_vld = misalign_issue || mmu_fault_issue
+                             || (reply_fire && dc_misalign_r);
     // Misaligned SC/AMO/store take the STORE-misalign vector (cause 6 is
     // "Store/AMO address misaligned"); loads/LR take cause 4. At AG-issue the
     // DC-stage dc_is_store_r/sc_addr_set/amo_active are not yet latched, so
     // the trap-at-issue leg classifies off the live AG func (ag_is_amo_c /
     // ag_is_sc_c above); the reply leg (now unreachable for misalign but kept
     // structurally) uses the latched class.
+    //
+    // M4 Task 5 (S12, design doc S4.2): the MMU-fault vec ladder, same
+    // AG-stage store/AMO/SC classification. Page fault outranks access
+    // fault the same way the donor's own ladder orders them (donor
+    // aq_lsu_ag.v:1381-1415: the page-fault arm is checked before the
+    // access-fault arm) -- moot here in practice since MMU.v only ever
+    // raises one of mmu_lsu_page_fault/_access_fault per access, but stated
+    // rather than left to be discovered.
+    wire mmu_fault_is_store = ag_is_store || ag_is_amo_c || ag_is_sc_c;
+    wire [4:0] mmu_fault_vec = mmu_lsu_page_fault
+                              ? (mmu_fault_is_store ? 5'd15 : 5'd13)
+                              : (mmu_fault_is_store ? 5'd7  : 5'd5);
     assign lsu_rtu_expt_vec = misalign_issue
                             ? ((ag_is_store || ag_is_amo_c || ag_is_sc_c) ? 5'd6 : 5'd4)
+                            : mmu_fault_issue
+                            ? mmu_fault_vec
                             : ((dc_is_store_r || sc_addr_set || amo_active) ? 5'd6 : 5'd4);
-    assign lsu_rtu_tval     = misalign_issue ? ag_addr : dc_addr_r;
+    // tval = the faulting VA for both trap-at-issue exceptions (design doc
+    // S4.2: "LSU encodes data causes... tval = faulting VA").
+    assign lsu_rtu_tval     = (misalign_issue || mmu_fault_issue) ? ag_addr : dc_addr_r;
 
     // No async bus-error path is modeled for M2 (the behavioral AXI slave
     // in this test harness never returns a non-OKAY response) -- wired but
