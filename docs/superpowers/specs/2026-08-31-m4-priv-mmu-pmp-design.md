@@ -114,6 +114,16 @@ protection and delegation real. Concretely:
 - **D-M4-8**: NA4 stays dead (donor aq_pmp_comp_hit.v:101 ties it 0) —
   donor-faithful; pmpaddr.S doesn't probe access blocking.
 - **D-M4-9**: time CSR deferred to M6.
+- **D-M4-10** (Task 4, more-correct-than-donor like D-M4-1/3/8): SUM never
+  excuses a supervisor FETCH from a U page. The donor's walker S→U arm is
+  `pte_u && supv && !sum` unconditionally (aq_mmu_ptw.v:678) — under SUM=1
+  it wrongly lets S-mode EXECUTE from a U page too. The privileged spec is
+  explicit SUM governs loads/stores only, never execution. rv906 qualifies
+  the excuse to data accesses (`!(sum && !fetch)`), applied identically at
+  the walker (MMU.v SECTION 6.3) and the TLB-hit predicate (SECTION 4) —
+  matches rv12's identical, already-shipped fix (its own D-M4-9, a
+  different numbering scheme; rv12 applies it at both its uTLB hit arm and
+  its walker). mmu_tb T19 pins both SUM values.
 
 ## 3. References
 

@@ -76,6 +76,21 @@ parameter MMU_VA_WIDTH   = 52;
 parameter MMU_PA_WIDTH   = 28;
 parameter MMU_PROT_WIDTH = 5;
 
+// M4 Task 4: TLB geometry (design doc D11 -- a single 128-entry
+// fully-associative flop array replaces C906's uTLB+jTLB two-level
+// structure; donor aq_mmu_jtlb.v tag/data words transcribed for the field
+// shapes, entry count/replacement per D11's own wording).
+parameter MMU_TLB_ENTRIES = 128;
+parameter MMU_VPN_WIDTH   = 27;   // Sv39 VA[38:12]
+parameter MMU_ASID_WIDTH  = 16;
+parameter MMU_PGS_WIDTH   = 3;    // one-hot {1G,2M,4K}
+parameter MMU_FLG_WIDTH   = 12;   // {pma[4:0],D,A,U,X,W,R,V} -- PMP is
+                                   // live-rechecked per access (not cached
+                                   // in the TLB entry), so donor's 4-bit
+                                   // PMP slice is dropped from the cached
+                                   // word (rv12 MMU_FLG_W precedent: same
+                                   // 12-bit shape, same reasoning).
+
 //-----------------------------------------------------------------------------
 // M1: L1 instruction cache geometry (`ICACHE_32K`, IFU notes S3)
 //-----------------------------------------------------------------------------
