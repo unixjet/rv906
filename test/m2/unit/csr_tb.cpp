@@ -75,6 +75,7 @@ static const uint32_t CP0_FUNC_CSRRC   = 0x00041;
 static const uint32_t CP0_FUNC_CSRRWI  = 0x00211;
 static const uint32_t CP0_FUNC_CSRRSI  = 0x00221;
 static const uint32_t CP0_FUNC_CSRRCI  = 0x00241;
+static const uint32_t CP0_FUNC_SFENCE  = 0x00044;   // M4 Task 7 (rvproc_pkg.sv)
 
 //-----------------------------------------------------------------------------
 // DUT plumbing
@@ -103,6 +104,7 @@ static void tie_idle_inputs(void) {
     dut->ifu_cp0_icache_inv_done= 0;
     dut->lsu_cp0_stb_empty      = 1;   // LSU quiescent so FENCE/FENCE.I complete
     dut->lsu_cp0_clean_done     = 0;
+    dut->mmu_cp0_sfence_done    = 0;
     dut->bht_cp0_inv_done       = 0;
     dut->mtip = 0;
     dut->msip = 0;
@@ -567,6 +569,161 @@ static void test_fence_no_op(void) {
     test_result("T14 FENCE/FENCE.I: fence completes; fence.i serializes clean+inv+refetch");
 }
 
+// sfence.vma sequencer (M4 Task 7; donor aq_cp0_fence_inst.v FNC_IDLE->
+// FNC_CMMU->FNC_IICA->FNC_CMPLT, :146-194 -- full donor citation and the
+// three rv906-specific deviations (STB-drain wait, near-1-cycle MMU ack,
+// wait-then-wipe mid-walk hazard) are documented at CSR.v's sfence_state
+// block itself). This bench drives CSR.v's cp0_mmu_sfence_vld/
+// mmu_cp0_sfence_done handshake ports directly, the same way
+// test_fence_no_op() stands in for FENCE.I's lsu_cp0_clean_done/
+// ifu_cp0_icache_inv_done handshakes -- MMU.v's own sfence_apply/
+// sfence_pend_r logic is exercised separately in mmu_tb.cpp.
+static void test_sfence_launch_ack_complete(void) {
+    dut->idu_cp0_ex1_sel       = 1;
+    dut->idu_cp0_ex1_func      = CP0_FUNC_SFENCE;
+    dut->idu_cp0_ex1_illegal   = 0;
+    dut->idu_cp0_ex1_src1_data = 0;
+    dut->idu_cp0_ex1_dst0_reg  = 0;
+    dut->idu_cp0_ex1_src0_data = 0;
+    dut->idu_cp0_ex1_opcode    = 0;
+    dut->lsu_cp0_stb_empty     = 1;
+    dut->mmu_cp0_sfence_done   = 0;
+    dut->eval();
+    check(dut->cp0_mmu_sfence_vld == 1,
+          "sfence: launch pulses cp0_mmu_sfence_vld same cycle (SF_IDLE->SF_WAIT)");
+    check(dut->cp0_rtu_ex1_cmplt_dp == 0, "sfence: held (cmplt_dp low) while MMU ack pending");
+    check(dut->cp0_rtu_ex1_chgflw  == 0,
+          "sfence: no chgflw ever (donor FNC_CMPLT->FNC_IDLE has no PC-redirect output)");
+    tick();                                    // SF_IDLE -> SF_WAIT
+    check(dut->cp0_mmu_sfence_vld == 0,
+          "sfence: cp0_mmu_sfence_vld is a one-cycle launch pulse, not held through SF_WAIT");
+    dut->mmu_cp0_sfence_done = 1;               // MMU acks (near-1-cycle, D11 single flop-array TLB)
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 0,
+          "sfence: still held the cycle MMU asserts done (SF_WAIT, transitions next edge)");
+    tick();                                    // SF_WAIT -> SF_CMPLT
+    dut->mmu_cp0_sfence_done = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 1, "sfence: cmplt_dp asserted at SF_CMPLT");
+    check(dut->cp0_rtu_ex1_chgflw  == 0, "sfence: no chgflw at completion either");
+    check(dut->cp0_rtu_ex1_wb_vld  == 0, "sfence: no GPR writeback");
+    check(dut->cp0_rtu_ex1_expt_vld== 0, "sfence: not an exception (legal M-mode sfence)");
+    tick();                                    // SF_CMPLT -> SF_IDLE
+    dut->idu_cp0_ex1_sel = 0;
+    test_result("T23a sfence.vma: M-mode launch/ack/complete handshake, one-cycle vld pulse, no chgflw");
+}
+
+static void test_sfence_stb_wait(void) {
+    // Deliberate rv906 deviation from the donor (no STB-drain precondition
+    // in aq_cp0_fence_inst.v's FNC_CMMU): rv906's PTW servant probes the
+    // D-cache array with no STB-forwarding path (D3), so sfence must wait
+    // for the STB to drain before the MMU invalidate can be trusted coherent.
+    dut->idu_cp0_ex1_sel       = 1;
+    dut->idu_cp0_ex1_func      = CP0_FUNC_SFENCE;
+    dut->idu_cp0_ex1_illegal   = 0;
+    dut->idu_cp0_ex1_src1_data = 0;
+    dut->idu_cp0_ex1_dst0_reg  = 0;
+    dut->idu_cp0_ex1_src0_data = 0;
+    dut->idu_cp0_ex1_opcode    = 0;
+    dut->lsu_cp0_stb_empty     = 0;             // STB has pending stores
+    dut->mmu_cp0_sfence_done   = 0;
+    dut->eval();
+    check(dut->cp0_mmu_sfence_vld == 0,
+          "sfence: no MMU pulse while STB non-empty (quiescence wait)");
+    check(dut->cp0_rtu_ex1_cmplt_dp == 0, "sfence: held while STB non-empty");
+    tick();
+    check(dut->cp0_mmu_sfence_vld == 0, "sfence: still waiting (STB still non-empty)");
+    dut->lsu_cp0_stb_empty = 1;                 // STB drains
+    dut->eval();
+    check(dut->cp0_mmu_sfence_vld == 1,
+          "sfence: launches the same cycle the STB empties, no extra delay");
+    tick();                                     // SF_IDLE -> SF_WAIT
+    dut->mmu_cp0_sfence_done = 1;
+    dut->eval();
+    tick();                                     // SF_WAIT -> SF_CMPLT
+    dut->mmu_cp0_sfence_done = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 1, "sfence: completes normally after the STB-drain wait");
+    tick();
+    dut->idu_cp0_ex1_sel = 0;
+    test_result("T23b sfence.vma: quiescence wait on lsu_cp0_stb_empty before MMU launch");
+}
+
+static void test_sfence_mid_walk_hold(void) {
+    // Models the mid-walk hazard resolution (MMU.v's sfence_apply only
+    // fires once ptw_st==PTW_IDLE): from CSR.v's side this is just an
+    // arbitrarily long mmu_cp0_sfence_done delay -- the sequencer must hold
+    // (not time out, not double-pulse) for as long as it takes.
+    dut->idu_cp0_ex1_sel       = 1;
+    dut->idu_cp0_ex1_func      = CP0_FUNC_SFENCE;
+    dut->idu_cp0_ex1_illegal   = 0;
+    dut->idu_cp0_ex1_src1_data = 0;
+    dut->idu_cp0_ex1_dst0_reg  = 0;
+    dut->idu_cp0_ex1_src0_data = 0;
+    dut->idu_cp0_ex1_opcode    = 0;
+    dut->lsu_cp0_stb_empty     = 1;
+    dut->mmu_cp0_sfence_done   = 0;
+    dut->eval();
+    check(dut->cp0_idu_fencei_full == 1,
+          "sfence: cp0_idu_fencei_full asserted (IDU dispatch stall) while sequencer active");
+    tick();                                     // SF_IDLE -> SF_WAIT
+    for (int i = 0; i < 5; i++) {               // a PTW walk still in flight
+        dut->mmu_cp0_sfence_done = 0;
+        dut->eval();
+        check(dut->cp0_rtu_ex1_cmplt_dp == 0,
+              "sfence: hold persists arbitrarily long until MMU ack (mid-walk hazard)");
+        check(dut->cp0_idu_fencei_full == 1,
+              "sfence: dispatch stays stalled throughout the wait");
+        tick();
+    }
+    dut->mmu_cp0_sfence_done = 1;               // walk finishes, MMU wipes and acks
+    dut->eval();
+    tick();                                     // SF_WAIT -> SF_CMPLT
+    dut->mmu_cp0_sfence_done = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_cmplt_dp == 1,
+          "sfence: completes once the in-flight walk finishes and MMU finally acks");
+    tick();
+    dut->idu_cp0_ex1_sel = 0;
+    test_result("T23c sfence.vma: hold survives a multi-cycle MMU ack delay (mid-walk hazard)");
+}
+
+static void test_sfence_tvm_illegal(void) {
+    // Reach S-mode: write mstatus.MPP=S(2'b01, bits[12:11]) + TVM=1(bit20)
+    // from M-mode, then mret pops pm_r <= mpp_field.
+    csr_write(CSR_MSTATUS, (1ULL << 11) | (1ULL << 20));
+    DispatchResult r_mret = dispatch(CP0_FUNC_MRET, 0, 0, 0);
+    check(r_mret.chgflw, "sfence/tvm setup: mret to S-mode issues chgflw");
+    check(dut->cp0_yy_priv_mode == 1, "sfence/tvm setup: now in S-mode (PRIV_S=01)",
+          dut->cp0_yy_priv_mode, 1);
+
+    DispatchResult r = dispatch(CP0_FUNC_SFENCE, 0, 0, 0);
+    check(r.expt_vld, "sfence: S-mode with TVM=1 raises an exception (illegal instruction)");
+    check(r.expt_vec == 2, "sfence: TVM-blocked sfence traps as illegal instruction (vec 2)",
+          r.expt_vec, 2);
+    check(dut->cp0_mmu_sfence_vld == 0,
+          "sfence: TVM-blocked sfence never pulses the MMU (no invalidate on an illegal op)");
+    check(!r.chgflw, "sfence: illegal-instruction trap carries no CSR-side chgflw");
+
+    // Restore M-mode for any later test: mret only ever narrows privilege
+    // (mret_priv_illegal requires pm_r==M to begin with), so the only way
+    // back to M from S is a real trap. medeleg_reg defaults to 0 (never
+    // written in this bench), so any vec forces pm_wdata=PRIV_M
+    // unconditionally (donor: non-delegated trap always captures to M).
+    dut->idu_cp0_ex1_sel    = 0;
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_vec = 2;
+    dut->rtu_yy_xx_expt_int = 0;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    check(dut->cp0_yy_priv_mode == 3, "sfence/tvm teardown: non-delegated trap forces pm_r back to M",
+          dut->cp0_yy_priv_mode, 3);
+    csr_write(CSR_MSTATUS, (uint64_t)3 << 11);   // MPP=M(11), TVM=0 (clean slate for later tests)
+    check(((csr_read(CSR_MSTATUS) >> 20) & 1) == 0, "sfence/tvm teardown: TVM back to 0");
+    test_result("T23d sfence.vma: S-mode + TVM=1 traps illegal, no MMU invalidate pulse");
+}
+
 static void test_mie_mip_masking(void) {
     dut->mtip = 1; dut->msip = 0; dut->meip = 0;
     uint64_t mip = csr_read(CSR_MIP);
@@ -777,6 +934,10 @@ int main(int argc, char **argv) {
     test_ecall_ebreak_illegal();
     test_fetch_fault_priority();
     test_fence_no_op();
+    test_sfence_launch_ack_complete();
+    test_sfence_stb_wait();
+    test_sfence_mid_walk_hold();
+    test_sfence_tvm_illegal();
     test_mie_mip_masking();
     test_mhcr_fanout();
     test_mxstatus_mm_rw_unconsumed();

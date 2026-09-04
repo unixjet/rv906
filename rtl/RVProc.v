@@ -552,6 +552,9 @@ module RVProc #(
     wire                     cp0_mmu_satp_wen;
     wire                     cp0_mmu_mxr;
     wire                     cp0_mmu_sum;
+    // M4 Task 7: sfence.vma whole-TLB invalidate handshake (CSR <-> MMU).
+    wire                     cp0_mmu_sfence_vld;
+    wire                     mmu_cp0_sfence_done;
     wire                     cp0_lsu_mprv;
     wire [1:0]               cp0_lsu_mpp;
 
@@ -783,6 +786,8 @@ module RVProc #(
         .cp0_mmu_satp_wen       (cp0_mmu_satp_wen),
         .cp0_mmu_mxr            (cp0_mmu_mxr),
         .cp0_mmu_sum            (cp0_mmu_sum),
+        .cp0_mmu_sfence_vld     (cp0_mmu_sfence_vld),
+        .mmu_cp0_sfence_done    (mmu_cp0_sfence_done),
         .cp0_yy_priv_mode       (cp0_yy_priv_mode)
     );
 
@@ -1317,6 +1322,8 @@ module RVProc #(
         .cp0_mmu_satp_wen        (cp0_mmu_satp_wen),
         .cp0_mmu_mxr             (cp0_mmu_mxr),
         .cp0_mmu_sum             (cp0_mmu_sum),
+        .cp0_mmu_sfence_vld      (cp0_mmu_sfence_vld),
+        .mmu_cp0_sfence_done     (mmu_cp0_sfence_done),
         .cp0_lsu_mprv            (cp0_lsu_mprv),
         .cp0_lsu_mpp             (cp0_lsu_mpp),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),

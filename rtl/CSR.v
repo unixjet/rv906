@@ -217,6 +217,14 @@ module CSR #(
     output wire                     cp0_mmu_satp_wen,
     output wire                     cp0_mmu_mxr,
     output wire                     cp0_mmu_sum,
+    // CSR -> MMU / MMU -> CSR : sfence.vma whole-TLB invalidate handshake
+    // (Task 7). cp0_mmu_sfence_vld is the single-cycle launch pulse (held
+    // off IDU dispatch until the STB is quiescent, see SF_IDLE/SF_WAIT
+    // above); mmu_cp0_sfence_done pulses back once the invalidate has
+    // actually applied (immediately if the PTW is idle, else once any
+    // in-flight walk drains to PTW_IDLE -- MMU.v's tlb_inv_all site).
+    output wire                     cp0_mmu_sfence_vld,
+    input  wire                     mmu_cp0_sfence_done,
     output wire                     cp0_lsu_mprv,
     output wire [1:0]               cp0_lsu_mpp,
     // LSU -> CSR : store-buffer/pipe quiescence (Task 10.1): FENCE/FENCE.I
@@ -399,6 +407,63 @@ module CSR #(
                       || wfi_priv_illegal || sfence_priv_illegal;
     wire mret_fire = is_mret && !mret_priv_illegal;
     wire sret_fire = is_sret && !sret_priv_illegal;
+
+    // sfence.vma sequencer (M4 Task 7; donor aq_cp0_fence_inst.v FNC_IDLE
+    // ->FNC_CMMU->FNC_IICA->FNC_CMPLT, :146-194). Donor's FNC_CMMU asserts
+    // special_fence_mmu_req and waits for special_op_done (the jTLB's
+    // multi-cycle counter-walk invalidate); rv906's D11 single flop-array
+    // TLB clears all 128 entries in one cycle (tlb_inv_all, MMU.v:258), so
+    // the wait-for-done half collapses to a 1-cycle round trip UNLESS a PTW
+    // walk is in flight (see below). The donor's follow-on FNC_IICA
+    // (I-cache invalidate) is dropped per D-M4-6: rv906's ICache is
+    // physically tagged, so a VA->PA remap can never leave a stale I$ line
+    // mis-associated with the wrong PA -- no invalidate is needed. No
+    // chgflw either: aq_cp0_fence_inst.v has no PC-redirect output at all
+    // for this path (FNC_CMPLT->FNC_IDLE is unconditional, :188-189).
+    //
+    // Quiescence: unlike the donor -- whose FNC_CMMU is entered directly
+    // from FNC_IDLE with no STB-drain wait -- rv906 holds on
+    // `lsu_cp0_stb_empty` first, same as FENCE/FENCE.I. This is a
+    // documented, deliberate DEVIATION (not a donor mirror): rv906's PTW
+    // servant probes the D-cache array directly with no STB-forwarding
+    // path (D3), so a pending store not yet visible to that probe could
+    // let the walker read a stale PTE; draining the STB first (as rv12
+    // does ahead of its own three-micro-op sfence.vma) is what keeps the
+    // probe-only channel coherent. The donor doesn't need this because its
+    // PTW walker IS routed through the full D-cache pipe with STB
+    // forwarding.
+    //
+    // Mid-walk hazard (MMU.v SECTION 6's own flagged gap, closed here):
+    // the donor avoids a stale in-flight walk racing the invalidate by
+    // ABORTING it outright (PTW_ABT/ABT_DATA drain when tlboper preempts,
+    // aq_mmu_ptw.v). rv906 doesn't build an abort-drain path; instead the
+    // MMU-side handshake (mmu_cp0_sfence_done) only fires once the PTW has
+    // returned to PTW_IDLE, so any walk that read pre-invalidate PTE data
+    // is forced to finish (and write its -- now stale but harmless --
+    // result) strictly BEFORE the invalidate pulse fires and wipes it.
+    // Wait-then-wipe is equivalent to abort-then-drain for correctness,
+    // without the extra FSM states.
+    wire sfence_fire = is_sfence && !sfence_priv_illegal;
+    localparam [1:0] SF_IDLE = 2'b00, SF_WAIT = 2'b01, SF_CMPLT = 2'b10;
+    reg [1:0] sfence_state;
+    wire sfence_quiesce_wait = sfence_fire && !lsu_cp0_stb_empty;
+    wire sfence_launch = sfence_fire && !sfence_quiesce_wait
+                        && (sfence_state == SF_IDLE);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) sfence_state <= SF_IDLE;
+        else case (sfence_state)
+            SF_IDLE:  if (sfence_launch)         sfence_state <= SF_WAIT;
+            SF_WAIT:  if (mmu_cp0_sfence_done)   sfence_state <= SF_CMPLT;
+            SF_CMPLT:                            sfence_state <= SF_IDLE;
+            default:                             sfence_state <= SF_IDLE;
+        endcase
+    end
+    // EX1 hold: from the quiesce wait through the WAIT state; released at
+    // SF_CMPLT so completion fires exactly that one cycle (fencei_state's
+    // FI_CMPLT pattern).
+    wire sfence_hold = sfence_quiesce_wait || sfence_launch
+                      || (sfence_state == SF_WAIT);
+    assign cp0_mmu_sfence_vld = sfence_launch;
 
     //=========================================================================
     // SECTION PRIVILEGE MODE + DELEGATION (M4 Task 1). pm register + the
@@ -1224,8 +1289,10 @@ module CSR #(
     // through the clean/invalidate walks -- cmplt_dp must NOT heartbeat
     // while held, otherwise RTU would retire the fence before its ordering
     // guarantee is established.
-    assign cp0_rtu_ex1_cmplt_dp = ex1_active && !fence_hold;
-    assign cp0_idu_fencei_full  = fence_hold;
+    assign cp0_rtu_ex1_cmplt_dp = ex1_active && !fence_hold && !sfence_hold;
+    // Port name predates M4 (FENCE.I-only originally); it now stalls IDU
+    // dispatch for the sfence.vma sequencer too, same mechanism.
+    assign cp0_idu_fencei_full  = fence_hold || sfence_hold;
     // Task 7.3: the completing CSR instruction's length. CP0 completes in
     // EX1 (single cycle), so the completing instruction IS the live EX1
     // instruction -- no latching needed.

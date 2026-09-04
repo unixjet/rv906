@@ -98,6 +98,13 @@ module MMU (
     input  wire                     cp0_mmu_mxr,
     input  wire                     cp0_mmu_sum,
     input  wire [1:0]               cp0_yy_priv_mode,
+    // CSR -> MMU / MMU -> CSR : sfence.vma whole-TLB invalidate handshake
+    // (Task 7). Mirrors CSR.v's cp0_mmu_sfence_vld/mmu_cp0_sfence_done --
+    // see the sfence_apply/sfence_pend site near tlb_inv_all below for the
+    // mid-walk-hazard resolution (wait-for-PTW-idle instead of the donor's
+    // abort-drain, aq_mmu_ptw.v's PTW_ABT/ABT_DATA).
+    input  wire                     cp0_mmu_sfence_vld,
+    output wire                     mmu_cp0_sfence_done,
 
     //=========================================================================
     // M4 Task 4: PTW memory-read servant channel -- contract shape mirrors
@@ -252,10 +259,11 @@ module MMU (
 
     // Invalidate-all trigger: a satp write flushes the whole TLB (donor
     // "satp write flushes uTLBs", per-port aq_mmu_regs finding). Task 7's
-    // sfence.vma sequencer ORs its own pulse into this SAME trigger later
+    // sfence.vma sequencer ORs its own pulse into this SAME trigger
     // (D-M4-6: every sfence flavor over-invalidates the whole array, so no
-    // separate ASID/VA-scoped invalidate machinery is ever needed).
-    wire tlb_inv_all = satp_write_flush;
+    // separate ASID/VA-scoped invalidate machinery is ever needed) via
+    // sfence_apply, defined below near the PTW state reg it gates on.
+    wire tlb_inv_all = satp_write_flush || sfence_apply;
 
     reg [TLB_IDX_W-1:0] tlb_rr_ptr;   // round-robin replacement pointer (D11)
 
@@ -422,9 +430,12 @@ module MMU (
     //     simplification, since a stale walk free-runs to completion and
     //     either installs a harmless TLB entry or is silently dropped, at
     //     most costing a few bounded stall cycles (<=9, one 3-level walk)
-    //     on the NEXT translation request. No sfence-mid-walk hazard
-    //     exists yet either (Task 7 builds sfence; SECTION 5's note covers
-    //     the satp-write case that DOES exist today).
+    //     on the NEXT translation request. The sfence-mid-walk hazard
+    //     (Task 7) is closed WITHOUT an abort-drain path: sfence_apply
+    //     (above, next to ptw_st's declaration) only fires once ptw_st has
+    //     returned to PTW_IDLE, i.e. any stale walk is left to finish (its
+    //     refill lands, if at all, strictly before that idle cycle) and
+    //     the very next tlb_inv_all wipes whatever it installed.
     //   * Single arbiter between the two ports feeding one walker (D3/D4:
     //     "one outstanding 3-level PTW served through the LSU") -- D-side
     //     wins ties (a load/store is further along the pipe than the NEXT
@@ -445,6 +456,27 @@ module MMU (
                      PTW_DATA_VLD = 4'd12;
 
     reg [3:0] ptw_st;
+
+    // M4 Task 7: sfence.vma mid-walk hazard resolution (closes MMU.v
+    // SECTION 5's own flagged gap; see CSR.v's sfence sequencer comment
+    // for the full wait-then-wipe vs. the donor's abort-drain writeup).
+    // cp0_mmu_sfence_vld is a single-cycle launch pulse; if the PTW isn't
+    // idle that cycle, latch it in sfence_pend_r and keep re-checking
+    // every cycle until ptw_st returns to PTW_IDLE (i.e. any in-flight
+    // walk -- which may have read pre-invalidate PTE data -- has finished
+    // and, if it refilled a now-stale entry, that entry is wiped by THIS
+    // SAME tlb_inv_all pulse: refill writes only happen at PTW_DATA_VLD,
+    // strictly one state before PTW_IDLE, so a stale write can never land
+    // on the same or a later cycle than the invalidate that follows it).
+    reg  sfence_pend_r;
+    wire sfence_apply = (cp0_mmu_sfence_vld || sfence_pend_r)
+                      && (ptw_st == PTW_IDLE);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                                    sfence_pend_r <= 1'b0;
+        else if (cp0_mmu_sfence_vld && ptw_st != PTW_IDLE) sfence_pend_r <= 1'b1;
+        else if (sfence_apply)                          sfence_pend_r <= 1'b0;
+    end
+    assign mmu_cp0_sfence_done = sfence_apply;
 
     //-------------------------------------------------------------------------
     // 6.1  Request/arbitration and the accepted request's latched fields
