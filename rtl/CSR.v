@@ -449,10 +449,19 @@ module CSR #(
     wire sfence_quiesce_wait = sfence_fire && !lsu_cp0_stb_empty;
     wire sfence_launch = sfence_fire && !sfence_quiesce_wait
                         && (sfence_state == SF_IDLE);
+    // NB: mmu_cp0_sfence_done is combinational off cp0_mmu_sfence_vld
+    // (MMU.v's sfence_apply) whenever the PTW is already idle -- the
+    // common case -- so it can pulse on the VERY SAME cycle sfence_launch
+    // fires, before this FSM has registered the SF_IDLE->SF_WAIT move.
+    // Catch that same-cycle completion here (go straight to SF_CMPLT),
+    // else the done pulse is missed entirely (SF_WAIT never sees a
+    // done -- the MMU already serviced it and won't pulse again) and
+    // sfence_hold parks the pipe forever.
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) sfence_state <= SF_IDLE;
         else case (sfence_state)
-            SF_IDLE:  if (sfence_launch)         sfence_state <= SF_WAIT;
+            SF_IDLE:  if (sfence_launch)
+                          sfence_state <= mmu_cp0_sfence_done ? SF_CMPLT : SF_WAIT;
             SF_WAIT:  if (mmu_cp0_sfence_done)   sfence_state <= SF_CMPLT;
             SF_CMPLT:                            sfence_state <= SF_IDLE;
             default:                             sfence_state <= SF_IDLE;
