@@ -668,7 +668,16 @@ module IU (
                                                 : {{(64-PC_WIDTH){1'b0}}, bju_pc_now};
     wire [63:0] ag_rs2_live = idu_iu_ex1_src2_data;
     wire [63:0] ag_result_live = ag_rs1_live + ag_rs2_live;
-    wire [PC_WIDTH-1:0] bju_target_now = ag_result_live[PC_WIDTH-1:0];
+    // JALR's target (rs1+imm) can have an odd LSB (imm[0] is a real encoded
+    // bit); the spec requires clearing it before use. Donor aq_iu_bju.v:810
+    // applies the identical clear on its final next-pc bus
+    // (`{bju_next_pc_update[38:0],1'b0}`); rv906 has no separate raw-target
+    // consumer (no RAS-vs-JALR compare wired, see S4.2/S4.3 note below), so
+    // clearing here at the single target source is equivalent and covers
+    // every downstream user (bju_target_pc/bju_next_pc AND bju_not_pred_pc).
+    // JAL/branch targets are already even, so the unconditional clear is a
+    // no-op for them.
+    wire [PC_WIDTH-1:0] bju_target_now = {ag_result_live[PC_WIDTH-1:1], 1'b0};
     wire [PC_WIDTH-1:0] bju_not_pred_pc_now =
         idu_iu_ex1_bht_pred[1] ? bju_inc_pc_live : bju_target_now;
 
