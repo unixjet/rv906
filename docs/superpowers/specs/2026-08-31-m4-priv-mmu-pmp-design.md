@@ -124,6 +124,23 @@ protection and delegation real. Concretely:
   matches rv12's identical, already-shipped fix (its own D-M4-9, a
   different numbering scheme; rv12 applies it at both its uTLB hit arm and
   its walker). mmu_tb T19 pins both SUM values.
+- **D-M4-11** (Task 8 sequencing, deviates from rv12 P19's *mechanism*, not
+  its *goal*): rv906 never built a stub-then-flip structure for M4's new
+  CSR decode. The literal "stub" the plan's Task 8 describes (M1's inline
+  bare-physical-mapping block in RVProc.v) was already replaced by the
+  real `MMU` instance at **M2 Task 7** -- see RVProc.v:17-19's header note
+  -- long before M4 existed. From M4 Task 1 onward, CSR.v's privilege
+  decode (`csr_access_illegal`, satp/pmpaddr/pmpcfg/medeleg/mideleg CSR
+  arms) was built live/real in place, task by task, and every task's
+  standard-gate run (unit suite, sweep 86/87, atomics 19/19) exercised
+  p-env's boot writes to those exact CSRs against the real decode -- there
+  was never an interval where they were "silently absorbed" for M4 to
+  later flip. G1 (OFF-path: full M2/M3 battery bit-identical MMU-off) is
+  therefore satisfied continuously by construction rather than by one
+  swap commit: satp resets to MODE=0 (Bare) and no M2/M3 test ever writes
+  it to Sv39, so every task's gate run already IS the G1 measurement.
+  Task 8 closes with no RTL changes; see the re-confirmation run recorded
+  in the Task 8 commit message.
 
 ## 3. References
 
@@ -213,15 +230,17 @@ protection and delegation real. Concretely:
 | 5 | LSU servant + integration (S4/S12) | lsu_tb servant + AG-wait rows; rv64si-p-dirty MPRV arms |
 | 6 | IFU integration (S13) | rv64si-p-ma_fetch; directed fetch-fault |
 | 7 | sfence.vma carrier (S6/S14) | rv64si-p-dirty; v-env sfence discipline |
-| 8 | THE SWAP (S1) | G1 OFF-path identity (battery bit-identical MMU-off) |
+| 8 | THE SWAP (S1) -- **closed by construction, no RTL** (D-M4-11) | G1 OFF-path identity (battery bit-identical MMU-off) |
 | 9 | test/m4 infra + directed set (S15) | build only |
 | 10 | Acceptance + close-out | all gates |
 
-Sequencing rules (rv12 P19 inherited): new-CSR decode acceptance flips ONLY
-at the swap commit (task 8); p-env boots write pmpaddr/pmpcfg/satp/
-medeleg/mideleg today and must keep "silently absorbed" until then. Tasks
-that move cycle counts land strictly before or after the G1 measurement
-commit.
+Sequencing rules (rv12 P19 inherited, mechanism deviated -- D-M4-11): rv12
+flips new-CSR decode acceptance at one swap commit; rv906 built CSR.v's
+decode live from Task 1 onward (the literal RVProc.v stub was already gone
+since M2 Task 7), so G1 was satisfied continuously by every task's gate
+run rather than by a single flip. Tasks that move cycle counts land
+strictly before or after the G1 measurement commit (n/a for M4 -- no task
+changed cycle counts).
 
 ## 6. Verification design
 
