@@ -126,7 +126,7 @@ RV64UA_V_TESTS = \
 #-----------------------------------------------------------------------------
 # List 4: MMU_TESTS -- directed MMU shapes (added in Task 9).
 #-----------------------------------------------------------------------------
-MMU_TESTS =
+MMU_TESTS = mmu_ptwalk mmu_pmp mmu_pmpstore mmu_misalign mmu_ldst_samepage mmu_amo
 
 SI_ELFS  = $(addprefix $(BUILD_DIR)/rv64si-p-,$(addsuffix .elf,$(SI_TESTS)))
 MI_ELFS  = $(addprefix $(BUILD_DIR)/rv64mi-p-,$(addsuffix .elf,$(MI_TESTS)))

@@ -368,18 +368,37 @@ module LSU #(
     wire        ag_valid    = idu_lsu_ex1_sel;
     wire        ag_dp_unused = idu_lsu_ex1_dp_sel;   // received, not wired to a
                                                        // side effect -- see header
-    wire        ag_is_store = idu_lsu_ex1_func[0];
-    wire        ag_sign_ext = idu_lsu_ex1_func[1];
-    wire [1:0]  ag_size     = idu_lsu_ex1_func[3:2];   // 00=B,01=H,10=W,11=D
+
+    // M4 Task 5 fix (D1 corrected): IDU does NOT hold EX1 across an AG wait
+    // (adv is gated on ctrl_ex1_eu_full, which reads lsu_idu_full's OLD value
+    // on the very cycle ag_wait_r sets -- one cycle too late to block the
+    // reload; verified against IDU.v's ctrl_ex1_eu_full/adv chain). So the
+    // live idu_lsu_ex1_* wires drift to the NEXT decoded op while a walk is
+    // outstanding. Mirror the donor's own fix instead of IDU's: donor
+    // aq_lsu_ag.v:323 `ag_req_buffer` (valid-gated at :1713
+    // `lsu_full_stall = ag_req_buffer_vld`) latches the parked request in
+    // LSU, not in IDU. `ag_wait_*_r` below is that buffer; `ag_*_eff` is the
+    // buffer/live mux every downstream consumer of the AG-stage fields reads
+    // through (transparently the live wire when ag_wait_r=0, so the M2/M3
+    // same-cycle-hit path is untouched).
+    wire [FUNC_WIDTH-1:0] ag_func_eff = ag_wait_r ? ag_wait_func_r : idu_lsu_ex1_func;
+
+    wire        ag_is_store = ag_func_eff[0];
+    wire        ag_sign_ext = ag_func_eff[1];
+    wire [1:0]  ag_size     = ag_func_eff[3:2];   // 00=B,01=H,10=W,11=D
     // M3b: plain-load detector (not store / AMO / LR / SC). Only a plain
     // cacheable load miss is deferred into the LFB for a non-blocking refill;
     // store/AMO/LR/SC keep the blocking FRZ path this cut.
     wire        ag_is_plain_ld = !ag_is_store
-                      && (idu_lsu_ex1_func[19:12] != 8'h01)               // not AMO
-                      && (idu_lsu_ex1_func != LSU_FUNC_LR_W) && (idu_lsu_ex1_func != LSU_FUNC_LR_D)
-                      && (idu_lsu_ex1_func != LSU_FUNC_SC_W) && (idu_lsu_ex1_func != LSU_FUNC_SC_D);
+                      && (ag_func_eff[19:12] != 8'h01)               // not AMO
+                      && (ag_func_eff != LSU_FUNC_LR_W) && (ag_func_eff != LSU_FUNC_LR_D)
+                      && (ag_func_eff != LSU_FUNC_SC_W) && (ag_func_eff != LSU_FUNC_SC_D);
 
-    wire [63:0] ag_addr = idu_lsu_ex1_src0_data + idu_lsu_ex1_src1_data;
+    wire [63:0] ag_addr_live = idu_lsu_ex1_src0_data + idu_lsu_ex1_src1_data;
+    wire [63:0] ag_addr      = ag_wait_r ? ag_wait_addr_r : ag_addr_live;
+    wire [63:0] ag_src2_data_eff = ag_wait_r ? ag_wait_src2_data_r : idu_lsu_ex1_src2_data;
+    wire [GPR_IDX_WIDTH-1:0] ag_dst0_reg_eff = ag_wait_r ? ag_wait_dst0_reg_r : idu_lsu_ex1_dst0_reg;
+    wire        ag_inst_len_eff = ag_wait_r ? ag_wait_inst_len_r : idu_lsu_ex1_inst_len;
 
     wire ag_misalign = (ag_size == 2'b01 && ag_addr[0])
                      || (ag_size == 2'b10 && (|ag_addr[1:0]))
@@ -388,9 +407,9 @@ module LSU #(
     // DC-stage dc_is_store_r/sc_addr_set/amo_active are latched. AMO = the
     // funct7 opcode byte 0x01 (ag_is_plain_ld's own test), SC = its two FUNC
     // encodings (ag_is_plain_ld's exclusions). LR is a load (vec 4).
-    wire ag_is_amo_c = (idu_lsu_ex1_func[19:12] == 8'h01);
-    wire ag_is_sc_c  = (idu_lsu_ex1_func == LSU_FUNC_SC_W)
-                    || (idu_lsu_ex1_func == LSU_FUNC_SC_D);
+    wire ag_is_amo_c = (ag_func_eff[19:12] == 8'h01);
+    wire ag_is_sc_c  = (ag_func_eff == LSU_FUNC_SC_W)
+                    || (ag_func_eff == LSU_FUNC_SC_D);
     // contract 3: `cp0_lsu_mm` is NEVER consulted here -- always trap.
     wire _cp0_lsu_mm_unused = cp0_lsu_mm;
 
@@ -408,8 +427,11 @@ module LSU #(
     // M4 Task 5 (D1): stays level-valid across a DTLB-miss wait too --
     // `ag_wait_r` below (declared ahead of use, matching this file's own
     // forward-reference style throughout) -- so the walk sees a stable
-    // request for its whole duration; ag_addr itself does not move while
-    // waiting (IDU holds the EX1 register: adv=0 while lsu_idu_full=1).
+    // request for its whole duration. `ag_addr` is itself the buffer/live
+    // mux (SECTION AG above) so this stays the SAME va for the whole wait
+    // even though IDU does NOT hold EX1 across the wait (verified against
+    // IDU.v's adv/ctrl_ex1_eu_full chain -- EX1 reloads the very cycle the
+    // miss is detected, one cycle before ag_wait_r itself sets).
     assign lsu_mmu_va_vld    = ag_valid || ag_wait_r;
     // M4 Task 1: effective data-access privilege (donor aq_lsu_ag.v:674-675:
     // MPRV redirects loads/stores to MPP's privilege). While MPRV=0 this is
@@ -452,6 +474,34 @@ module LSU #(
             ag_wait_r <= 1'b0;   // issuing (or trapping-at-issue) NOW
     end
 
+    // The actual buffer (donor aq_lsu_ag.v:323 `ag_req_buffer`): IDU does
+    // NOT hold EX1 across the wait (see SECTION AG's `ag_*_eff` comment), so
+    // the live idu_lsu_ex1_* wires drift to a DIFFERENT instruction while
+    // `ag_wait_r` is set. Snapshot every field this port's own issue/DC-latch
+    // logic still needs once the walk resolves -- ONLY on the entry edge
+    // (`ag_mmu_wait_start` while `ag_wait_r` is still 0 this cycle): since
+    // `ag_wait_r` is itself one of `ag_issue_ready`'s OR-terms,
+    // `ag_mmu_wait_start` stays asserted on EVERY cycle of a multi-cycle
+    // wait, not just the transition into it -- gating the capture on the
+    // bare level (as opposed to the edge) re-snapshots the live (and by
+    // then drifted) idu_lsu_ex1_* wires every one of those cycles instead
+    // of latching once, corrupting the buffered VA/func mid-walk. No reset
+    // needed: dead whenever ag_wait_r=0.
+    reg [63:0]              ag_wait_addr_r;
+    reg [FUNC_WIDTH-1:0]    ag_wait_func_r;
+    reg [63:0]              ag_wait_src2_data_r;
+    reg [GPR_IDX_WIDTH-1:0] ag_wait_dst0_reg_r;
+    reg                     ag_wait_inst_len_r;
+    always @(posedge clk) begin
+        if (ag_mmu_wait_start && !ag_wait_r) begin
+            ag_wait_addr_r      <= ag_addr_live;
+            ag_wait_func_r      <= idu_lsu_ex1_func;
+            ag_wait_src2_data_r <= idu_lsu_ex1_src2_data;
+            ag_wait_dst0_reg_r  <= idu_lsu_ex1_dst0_reg;
+            ag_wait_inst_len_r  <= idu_lsu_ex1_inst_len;
+        end
+    end
+
     // Cancel this port's in-flight walk on the same broadcast that clears
     // ag_wait_r -- MMU.v's SECTION 6.7 VPN+type-match fault-delivery gate
     // already drops a stale fault/refill answer once lsu_mmu_va_vld falls,
@@ -478,7 +528,7 @@ module LSU #(
         endcase
     end
     wire [7:0]  ag_byte_mask = ag_byte_mask_raw << ag_byte_off;
-    wire [63:0] ag_store_data_positioned = idu_lsu_ex1_src2_data << ({61'b0, ag_byte_off} * 8);
+    wire [63:0] ag_store_data_positioned = ag_src2_data_eff << ({61'b0, ag_byte_off} * 8);
 
     //-------------------------------------------------------------------------
     // BYTE-MASK EXPANSION (LSU note A4/A5 -- shared by store-into-STB merge
@@ -965,8 +1015,8 @@ module LSU #(
                         dc_tag_r        <= ag_dc_tag;
                         dc_ca_r         <= mmu_lsu_ca;
                         dc_misalign_r   <= ag_misalign;
-                        dc_dst0_reg_r   <= idu_lsu_ex1_dst0_reg;
-                        dc_inst_len_r   <= idu_lsu_ex1_inst_len;
+                        dc_dst0_reg_r   <= ag_dst0_reg_eff;
+                        dc_inst_len_r   <= ag_inst_len_eff;
                         dc_pc_r         <= iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
@@ -1187,7 +1237,7 @@ module LSU #(
             // fixed here rather than left to be found by the new fault path.
             if (issue_real && amo_is_amo && !ag_misalign && !mmu_fault_issue) begin
                 amo_active  <= 1'b1;
-                amo_src0_r  <= idu_lsu_ex1_src2_data;
+                amo_src0_r  <= ag_src2_data_eff;
                 amo_op_r    <= amo_op;
                 amo_is_dw_r <= amo_dw;
             end
@@ -1212,6 +1262,34 @@ module LSU #(
     wire [63:0] amo_new_c = amo_alu_compute(amo_old_c, amo_src0_r, amo_op_r, amo_is_dw_r);
 
     assign lsu_idu_full = (state != ST_IDLE) || clean_active
+                          || ag_wait_r        // M4 Task 5 fix: a parked DTLB-miss
+                                             // op holds ST_IDLE (by design, D1 --
+                                             // it never touches the array/STB), so
+                                             // without this term lsu_idu_full reads
+                                             // 0 while the walk is outstanding and
+                                             // IDU advances EX1 past it -- the
+                                             // comment at line ~412 ("ag_addr itself
+                                             // does not move while waiting... IDU
+                                             // holds the EX1 register") was never
+                                             // actually enforced. idu_lsu_ex1_func/
+                                             // src0_data/src1_data (hence ag_addr,
+                                             // ag_is_store) drift to whatever LATER
+                                             // instruction IDU next dispatches, so
+                                             // the eventual mmu_fault_issue for the
+                                             // ORIGINAL op reports the wrong PC
+                                             // (bju_pcgen_pc has also raced ahead)
+                                             // and the wrong load/store vec class
+                                             // (rv64si-p-dirty TESTNUM 3: expected
+                                             // STORE_PAGE_FAULT at 0x1e0, got
+                                             // LOAD_PAGE_FAULT at 0x1f4 -- the PC/
+                                             // class of an unrelated later load).
+                                             // Donor's analogous "buffered op"
+                                             // flag (aq_lsu_ag.v:323 ag_req_buffer,
+                                             // valid-gated at :1713 lsu_full_stall
+                                             // = ag_req_buffer_vld) always blocks
+                                             // new dispatch while a park is live;
+                                             // ag_wait_r is rv906's single-flop
+                                             // equivalent of that buffer-valid bit.
                           || (stb_full && ag_needs_slot_c)
                           || rf_port_busy   // M3b: don't accept a new op while a
                                              // background refill owns the D-cache
@@ -2531,7 +2609,7 @@ module LSU #(
     // PREVIOUS transaction's length -- every load/store then advanced the
     // IU pcgen tracker by the wrong amount (rv64uc-p-rvc pcgen drift,
     // scrambled branch PCs from test 18 onward).
-    assign lsu_rtu_ex1_inst_len   = idu_lsu_ex1_inst_len;
+    assign lsu_rtu_ex1_inst_len   = ag_inst_len_eff;
 
     assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign)
                              || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // prefetch drains silently
