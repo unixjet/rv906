@@ -85,6 +85,14 @@ module IFU (
     output wire [31:0]              ifu_idu_id_inst,
     output wire                     ifu_idu_id_inst_vld,
     output wire [1:0]               ifu_idu_id_bht_pred,   // rides w/ the instr, ibuf.v:1357-1358
+    // M4 Task 6 (S13, D2): fetch-exception tags, riding alongside the
+    // instruction exactly the way ifu_idu_id_bht_pred does (SECTION IBUF's
+    // ibuf_fault_tag[] mirrors ibuf_tag[]'s own push/pop indexing). Set
+    // when this "instruction" is actually a synthetic fault marker
+    // (SECTION IPACK) -- IDU forces it to CP0/EU_CP0 dispatch, mirroring
+    // the illegal-instruction path, and CSR.v traps vec 12/1.
+    output wire                     ifu_idu_id_fault_pgflt,
+    output wire                     ifu_idu_id_fault_accflt,
     input  wire                     idu_ifu_id_stall,
 
     //=========================================================================
@@ -465,24 +473,21 @@ module IFU (
     // here, not an oversight; likewise `iu_ifu_pc_mispred` is consumed
     // directly by BPU.v (RAS pointer resync, Task 7), not by IFU.v's own
     // pipeline -- confirmed absent from aq_ifu_pcgen.v's port list.
-    // `icache_ipack_acc_err`/`_pgflt` have nowhere to go (no exception path
-    // to IDU exists yet, SECTION IPACK below) -- genuinely unused, not
-    // dropped by oversight. `pred_ibuf_br_taken0/1` WERE in this bucket
-    // through Task 8 (BPU.v tied both to 0 with no BHT built) -- TASK 9:
-    // now real, consumed by `ibuf_tag[]`'s push logic above, removed from
-    // this bucket. (`h1_32bit_vld` WAS in this bucket through Task 3/5 --
-    // see BUG FIX #3 in SECTION IPACK below for why it is genuinely
-    // consumed now.)
-    wire _unused_ok = &{1'b0, pred_ctrl_stall, icache_ctrl_stall, iu_ifu_pc_mispred,
-                         icache_ipack_acc_err, icache_ipack_pgflt};
+    // `pred_ibuf_br_taken0/1` WERE in this bucket through Task 8 (BPU.v
+    // tied both to 0 with no BHT built) -- TASK 9: now real, consumed by
+    // `ibuf_tag[]`'s push logic above, removed from this bucket.
+    // (`h1_32bit_vld` WAS in this bucket through Task 3/5 -- see BUG FIX #3
+    // in SECTION IPACK below for why it is genuinely consumed now.)
+    // M4 Task 6: `icache_ipack_acc_err`/`_pgflt` moved OUT of this bucket --
+    // genuinely consumed now, SECTION IPACK below.
+    wire _unused_ok = &{1'b0, pred_ctrl_stall, icache_ctrl_stall, iu_ifu_pc_mispred};
 
     //=========================================================================
     // SECTION: IPACK  (aq_ifu_ipack.v + _entry.v -- 3 flop entries, ported
     // near-verbatim). ICG cells dropped (umbrella spec S6.3, no clock
-    // gating cells); acc_err/pgflt/halt_info fields dropped since IFU.v's
-    // frozen port list has NO exception path to IDU in M1 (no
-    // ifu_idu_id_expt_*/halt_info ports -- confirmed by re-reading the port
-    // list above; exception plumbing is an M2 IDU-side addition).
+    // gating cells); halt_info fields dropped (no DTU debug-trigger channel
+    // exists). M4 Task 6: acc_err/pgflt ARE now consumed -- see the fault
+    // injection below (design doc S13/D2).
     // `icache_ipack_unalign` IS kept: it is fetch-alignment plumbing (which
     // halfword of the ICache's 32-bit read sits at the requested PC), not
     // fault reporting, and is load-bearing for correct entry1/entry2
@@ -505,6 +510,48 @@ module IFU (
 
     wire icache_inst_vld   = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
     wire ipack_align_create = icache_inst_vld && !icache_ipack_unalign;                        // ipack.v:255
+
+    //-------------------------------------------------------------------------
+    // M4 Task 6 (S13, D2): FETCH-FAULT INJECTION. `icache_ipack_acc_err`/
+    // `_pgflt` ride WITH `icache_ipack_inst_vld` (ICache.v:459-460 FORCES
+    // icache_hit -- hence icache_ipack_inst_vld -- true on a fault; the
+    // "instruction" word itself is undefined array garbage). Rather than
+    // let that garbage flow through the bit-pattern-driven h0/h1/h2
+    // splicer below (which decides 16b-vs-32b/entry-count purely from the
+    // instruction bits it sees -- undefined behavior on undefined input),
+    // a fault OVERRIDES this cycle's contribution with a synthetic 32-bit
+    // NOP (`ADDI x0,x0,0` = 32'h00000013, entry1=0x0013 [1:0]=11 "starts a
+    // 32-bit instr", entry2=0x0000): a well-formed, deterministic shape
+    // the EXISTING splicer handles completely unmodified, always retiring
+    // via `ipack_one_32bit_vld`'s first term (h1_32bit_vld && entry2_vld,
+    // BUG FIX #3 below) PROVIDED no straddle-carry (h0_vld) is pending --
+    // see the entry0_vld always block below for why that's guaranteed.
+    // The synthetic bits never architecturally execute (IDU forces this
+    // exact shape to CP0/EU_CP0 dispatch below, mirroring the illegal-
+    // instruction override) -- their only job is to occupy a clean,
+    // predictable slot in the halfword pipe long enough to carry the
+    // fault-tag registers (entry1_fault_pgflt_r/_accflt_r, below) to IBUF.
+    //
+    // STRADDLE EDGE CASE (documented limitation, not silently dropped):
+    // if h0_vld is ALREADY set (a 32-bit instruction's first half was
+    // fetched successfully last cycle and is still awaiting its second
+    // half) the SAME cycle a fault fires, that straddling instruction's
+    // second half is genuinely unfetchable (its half lives on the very
+    // fetch that just faulted) -- architecturally it too must fault. This
+    // implementation does not attempt to preserve THAT instruction's own
+    // start PC for the trap (doing so would require carrying a PC field
+    // through the halfword pipe end to end, a much larger change than
+    // Task 6's own scope): the entry0_vld always block below
+    // UNCONDITIONALLY drops any pending carry the same cycle a fault
+    // fires, so the trap is instead reported at the FAULTING fetch's own
+    // PC. Still traps correctly (RTU still redirects away from the
+    // unexecutable page), just with a less precise epc/tval for this one
+    // narrow case -- flagged here for a later milestone to tighten if a
+    // test ever needs the exact straddling PC.
+    //-------------------------------------------------------------------------
+    wire ipack_fault_pgflt  = icache_inst_vld && icache_ipack_pgflt;
+    wire ipack_fault_accflt = icache_inst_vld && icache_ipack_acc_err && !icache_ipack_pgflt;
+    wire ipack_fault        = ipack_fault_pgflt || ipack_fault_accflt;
     // ibuf_ipack_stall is now a MODULE OUTPUT PORT (Task 7.1 amendment,
     // see the port-list note) driven in SECTION IBUF below -- no separate
     // internal fwd-declared wire needed, the port net serves both roles.
@@ -532,8 +579,11 @@ module IFU (
                           && !pred_ipack_delay_stall;                                // ipack.v:266-268
 
     wire [15:0] entry0_upd_inst = entry2_inst;                                       // ipack.v:276, the straddle carry
-    wire [15:0] entry1_upd_inst = icache_ipack_inst[15:0];                           // ipack.v:277
-    wire [15:0] entry2_upd_inst = icache_ipack_inst[31:16];                          // ipack.v:278
+    // M4 Task 6: the synthetic-NOP override (see the fault injection note
+    // above) -- 16'h0013 is the LOWER half (`ADDI x0,x0,0`'s [1:0]=11 own
+    // half), 16'h0000 the UPPER half.
+    wire [15:0] entry1_upd_inst = ipack_fault ? 16'h0013 : icache_ipack_inst[15:0];   // ipack.v:277
+    wire [15:0] entry2_upd_inst = ipack_fault ? 16'h0000 : icache_ipack_inst[31:16];  // ipack.v:278
 
     wire entry0_retire_en = !ipack_buf_stall && entry1_vld;                          // ipack.v:291
     wire entry1_retire_en = !ipack_buf_stall;                                        // ipack.v:292
@@ -542,6 +592,10 @@ module IFU (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)                     entry0_vld <= 1'b0;
         else if (ipack_buf_flush)       entry0_vld <= 1'b0;
+        // M4 Task 6: drop any pending straddle-carry the same cycle a fault
+        // fires (the STRADDLE EDGE CASE note above) -- placed ahead of
+        // entry0_create_en in this priority chain so a fault always wins.
+        else if (ipack_fault)           entry0_vld <= 1'b0;
         else if (entry0_create_en)      entry0_vld <= 1'b1;
         else if (entry0_retire_en)      entry0_vld <= 1'b0;
     end
@@ -557,6 +611,18 @@ module IFU (
     end
     always @(posedge clk) begin
         if (entry1_create_en) entry1_inst <= entry1_upd_inst;
+    end
+    // M4 Task 6: the fault tag rides alongside entry1_inst (entry1 always
+    // carries the synthetic NOP's defining lower half, [1:0]==11, whenever
+    // ipack_fault fired at creation) -- same no-reset style as entry1_inst
+    // itself (read only while entry1_vld is set, matching the array's own
+    // discipline).
+    reg entry1_fault_pgflt_r, entry1_fault_accflt_r;
+    always @(posedge clk) begin
+        if (entry1_create_en) begin
+            entry1_fault_pgflt_r  <= ipack_fault_pgflt;
+            entry1_fault_accflt_r <= ipack_fault_accflt;
+        end
     end
 
     always @(posedge clk or negedge rst_n) begin
@@ -672,6 +738,14 @@ module IFU (
     wire ipack_ibuf_inst_all    = ipack_all_vld;
     wire [47:0] ipack_ibuf_inst  = ipack_retire_inst;
 
+    // M4 Task 6: the fault tag, qualified to the EXACT retire shape a fault
+    // always takes (ipack_one_32bit_vld's first term, entry1+entry2 both
+    // freshly created together, no h0 carry -- guaranteed by the entry0_vld
+    // carry-drop above) AND to the push actually completing this cycle
+    // (ipack_ibuf_inst_vld, not merely being classified as ready to).
+    wire ipack_ibuf_fault_pgflt  = ipack_ibuf_inst_vld && ipack_one_32bit_vld && entry1_fault_pgflt_r;
+    wire ipack_ibuf_fault_accflt = ipack_ibuf_inst_vld && ipack_one_32bit_vld && entry1_fault_accflt_r;
+
     assign ipack_pcgen_reissue = ibuf_ipack_stall && icache_inst_vld;                // ipack.v:491
 
     assign ipack_pred_inst0_vld = ipack_first_vld;
@@ -716,6 +790,10 @@ module IFU (
     //=========================================================================
     reg  [15:0] ibuf_mem [0:5];
     reg  [1:0]  ibuf_tag [0:5];   // TASK 9: per-halfword bht_pred tag, see below
+    // M4 Task 6: per-halfword fault tag {pgflt,accflt}, mirroring ibuf_tag[]'s
+    // own push/pop indexing exactly (pushed at tail0 alongside the fault
+    // marker's low half, read out at ibuf_head alongside ifu_idu_id_bht_pred).
+    reg  [1:0]  ibuf_fault_tag [0:5];
     reg  [2:0]  ibuf_head;     // 0..5, head-of-queue (oldest halfword) pointer
     reg  [2:0]  ibuf_count;    // 0..6, occupancy
 
@@ -813,14 +891,24 @@ module IFU (
         if (ibuf_push_count >= 2'd1) begin
             ibuf_mem[ibuf_tail0] <= ipack_ibuf_inst[15:0];
             ibuf_tag[ibuf_tail0] <= pred_ibuf_br_taken0;      // tail0 is ALWAYS instr0's low half
+            // M4 Task 6: the fault tag rides on tail0 -- ipack_ibuf_fault_*
+            // is only ever asserted on the exact 2-push shape a fault takes
+            // (ipack_one_32bit_vld), whose tail0 is entry1's own low half,
+            // exactly where entry1_fault_pgflt_r/_accflt_r were latched.
+            ibuf_fault_tag[ibuf_tail0] <= {ipack_ibuf_fault_pgflt, ipack_ibuf_fault_accflt};
         end
         if (ibuf_push_count >= 2'd2) begin
             ibuf_mem[ibuf_tail1] <= ipack_ibuf_inst[31:16];
             ibuf_tag[ibuf_tail1] <= ibuf_tail1_is_instr0 ? pred_ibuf_br_taken0 : pred_ibuf_br_taken1;
+            // Never read (SECTION IBUF only ever reads ibuf_fault_tag[ibuf_head],
+            // h0's own slot) -- written 0 anyway, matching this array's own
+            // no-stale-garbage discipline (see ibuf_tag[]'s own precedent).
+            ibuf_fault_tag[ibuf_tail1] <= 2'b00;
         end
         if (ibuf_push_count >= 2'd3) begin
             ibuf_mem[ibuf_tail2] <= ipack_ibuf_inst[47:32];
             ibuf_tag[ibuf_tail2] <= pred_ibuf_br_taken1;      // only reachable via ipack_ibuf_inst_all: tail2 is instr1
+            ibuf_fault_tag[ibuf_tail2] <= 2'b00;              // never read, see tail1's own note
         end
     end
 
@@ -837,5 +925,10 @@ module IFU (
     // of whichever instruction is about to be delivered to IDU, exactly
     // where the real RTL anchors this field.
     assign ifu_idu_id_bht_pred = ibuf_tag[ibuf_head];
+    // M4 Task 6: read out exactly where ifu_idu_id_bht_pred is -- h0's own
+    // slot, the low half of whichever instruction (real or fault marker)
+    // is about to be delivered to IDU.
+    assign ifu_idu_id_fault_pgflt  = ibuf_fault_tag[ibuf_head][1];
+    assign ifu_idu_id_fault_accflt = ibuf_fault_tag[ibuf_head][0];
 
 endmodule

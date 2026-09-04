@@ -96,7 +96,14 @@
 //    RVTEST_PASS/FAIL protocol) and not silently worked around -- flagged
 //    here and in the Task 4 completion report for whichever milestone
 //    wants spec-exact mtval-on-illegal-instruction behavior (would need a
-//    new CSR.v output port).
+//    new CSR.v output port). M4 Task 6 NARROWS this gap without closing it:
+//    a CP0-dispatched FETCH FAULT (vec 12/1) needs no new CSR.v port at
+//    all, because tval == epc for a fetch fault (both are "the faulting
+//    fetch PC") and this module already has that PC live as
+//    `iu_rtu_ex1_cur_pc` the SAME EX1 cycle `ex2_cur_pc` (below) latches
+//    it for epc -- `ex1_tval`'s own mux picks it out by vec (12/1) rather
+//    than by a new port. The broader CP0-illegal-tval gap above is
+//    UNCHANGED and still flagged for later.
 //  * `iu_rtu_ex1_div_cmplt`/`_cmplt_dp` (and, for a narrow multiply with no
 //    split needed, `iu_rtu_ex1_mul_cmplt`/`_cmplt_dp`) are, per IU.v's own
 //    already-committed body AND the real donor (confirmed directly,
@@ -579,7 +586,16 @@ module RTU (
     wire [4:0] ex1_expt_vec = ex1_cp0_cmplt_dp ? cp0_rtu_ex1_expt_vec
                             : ex1_lsu_cmplt_dp ? lsu_rtu_expt_vec
                             :                     5'd0;
-    wire [63:0] ex1_tval = ex1_lsu_cmplt_dp ? lsu_rtu_tval : 64'd0;   // CP0 has no tval port, see header
+    // M4 Task 6: a CP0-dispatched fetch fault (vec 12 page-fault / vec 1
+    // access-fault, IDU's fault-marker EU_CP0 forcing) reports tval == epc
+    // == the faulting fetch PC -- iu_rtu_ex1_cur_pc, the SAME signal
+    // ex2_cur_pc (below) latches for epc this exact EX1 cycle. See header.
+    wire ex1_cp0_fetch_fault = ex1_cp0_cmplt_dp
+                            && (cp0_rtu_ex1_expt_vec == CAUSE_FETCH_PAGE_FAULT
+                             || cp0_rtu_ex1_expt_vec == CAUSE_FETCH_ACCESS);
+    wire [63:0] ex1_tval = ex1_lsu_cmplt_dp   ? lsu_rtu_tval
+                          : ex1_cp0_fetch_fault ? {{(64-PC_WIDTH){1'b0}}, iu_rtu_ex1_cur_pc}
+                          :                       64'd0;   // CP0 has no other tval port, see header
 
     reg        ex2_retire_vld;
     // Task 7.2: ex2_cur_pc is public-marked for the verisim harness

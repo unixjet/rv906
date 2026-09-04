@@ -391,6 +391,40 @@ static void test_mtval_allowlist(void) {
 }
 
 //-----------------------------------------------------------------------------
+// T8b (M4 Task 6): CP0 fetch-fault exception (vec 12 pgflt / vec 1 accflt) --
+// tval must equal epc (the faulting fetch PC), since CSR.v has no dedicated
+// tval port for CP0-sourced faults; RTU.v reuses iu_rtu_ex1_cur_pc directly.
+// A non-fetch-fault CP0 exception (e.g. ecall, vec 11, T7 above) must NOT
+// pick up cur_pc as tval -- it stays 0 (not allowlisted).
+//-----------------------------------------------------------------------------
+static void test_cp0_fetch_fault_tval(void) {
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->cp0_rtu_ex1_expt_vld = 1;
+    dut->cp0_rtu_ex1_expt_vec = 12;   // fetch page fault
+    dut->iu_rtu_ex1_cur_pc  = 0x80001004;
+    dut->iu_rtu_ex1_next_pc = 0x80001008;
+    tick();
+    check(dut->rtu_yy_xx_expt_vec == 12, "fetch pgflt: vec == 12 propagated");
+    check(dut->rtu_cp0_epc == 0x80001004, "fetch pgflt: epc == faulting fetch PC",
+          dut->rtu_cp0_epc, 0x80001004);
+    check(dut->rtu_cp0_tval == 0x80001004, "fetch pgflt: tval == epc (no dedicated CP0 tval port)",
+          dut->rtu_cp0_tval, 0x80001004);
+
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->cp0_rtu_ex1_expt_vld = 1;
+    dut->cp0_rtu_ex1_expt_vec = 1;    // fetch access fault
+    dut->iu_rtu_ex1_cur_pc  = 0x80002008;
+    dut->iu_rtu_ex1_next_pc = 0x8000200c;
+    tick();
+    check(dut->rtu_yy_xx_expt_vec == 1, "fetch accflt: vec == 1 propagated");
+    check(dut->rtu_cp0_tval == 0x80002008, "fetch accflt: tval == epc",
+          dut->rtu_cp0_tval, 0x80002008);
+    test_result("T8b CP0 fetch-fault (vec 12/1): tval == epc, reusing iu_rtu_ex1_cur_pc");
+}
+
+//-----------------------------------------------------------------------------
 // T9: LSU wb1 -- a PURE combinational passthrough (no register at all),
 // unlike every other write port. fwd2 uses the SEPARATE ex2_data_vld/
 // dest_reg/data bus.
@@ -703,6 +737,7 @@ int main(int argc, char **argv) {
     test_cp0_create_complete_commit();
     test_cp0_ecall_exception();
     test_mtval_allowlist();
+    test_cp0_fetch_fault_tval();
     test_lsu_wb1_and_fwd2();
     test_retire_blocking();
     test_flush_bju_depd_lsu();

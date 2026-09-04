@@ -33,6 +33,8 @@ static void tie_idle_inputs(void) {
     dut->ifu_idu_id_inst      = 0;
     dut->ifu_idu_id_inst_vld  = 0;
     dut->ifu_idu_id_bht_pred  = 0;
+    dut->ifu_idu_id_fault_pgflt  = 0;
+    dut->ifu_idu_id_fault_accflt = 0;
 
     dut->rtu_idu_fwd0_data = 0; dut->rtu_idu_fwd0_reg = 0; dut->rtu_idu_fwd0_vld = 0;
     dut->rtu_idu_fwd1_data = 0; dut->rtu_idu_fwd1_reg = 0; dut->rtu_idu_fwd1_vld = 0;
@@ -206,6 +208,20 @@ static void present(uint32_t inst, bool vld = true) {
     dut->ifu_idu_id_inst_vld = vld;
 }
 
+static void present_fetch_fault(bool pgflt, bool accflt) {
+    // Mirrors IFU.v's synthetic-NOP injection: the fault-carrying slot is
+    // always addi x0,x0,0 (32'h00000013), regardless of pgflt/accflt.
+    dut->ifu_idu_id_inst          = 0x00000013u;
+    dut->ifu_idu_id_inst_vld      = 1;
+    dut->ifu_idu_id_fault_pgflt   = pgflt  ? 1 : 0;
+    dut->ifu_idu_id_fault_accflt  = accflt ? 1 : 0;
+}
+
+static void clear_fetch_fault(void) {
+    dut->ifu_idu_id_fault_pgflt  = 0;
+    dut->ifu_idu_id_fault_accflt = 0;
+}
+
 //=============================================================================
 // Tests
 //=============================================================================
@@ -376,6 +392,30 @@ static void test_illegal_closed_list(void) {
     present(enc_i(0, 5, 0x0, 0, OP_SYSTEM)); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "ecall with rs1!=0: illegal (malformed)");
     test_result("T10 illegal decode closed list: FP/vector/custom/dret trap; sfence/sret/wfi legal (M4), AMO legal (M3)");
+}
+
+// ---- M4 Task 6: IFU->IDU fetch-fault channel forces EU_CP0 dispatch ----
+static void test_fetch_fault_forces_cp0(void) {
+    reset_dut();
+    present_fetch_fault(/*pgflt=*/true, /*accflt=*/false);
+    tick();
+    clear_fetch_fault();
+    present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "fetch pgflt: forced to EU_CP0 despite legal-looking ADDI bits");
+    check(dut->idu_cp0_ex1_fetch_pgflt == 1, "fetch pgflt: idu_cp0_ex1_fetch_pgflt latched into EX1");
+    check(dut->idu_cp0_ex1_fetch_accflt == 0, "fetch pgflt: accflt stays clear");
+    check(dut->idu_cp0_ex1_illegal == 0, "fetch pgflt: NOT reported as illegal (distinct signal)");
+    check(dut->idu_iu_ex1_alu_sel == 0, "fetch pgflt: does not also dispatch to ALU");
+
+    reset_dut();
+    present_fetch_fault(/*pgflt=*/false, /*accflt=*/true);
+    tick();
+    clear_fetch_fault();
+    present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1, "fetch accflt: forced to EU_CP0");
+    check(dut->idu_cp0_ex1_fetch_accflt == 1, "fetch accflt: idu_cp0_ex1_fetch_accflt latched into EX1");
+    check(dut->idu_cp0_ex1_fetch_pgflt == 0, "fetch accflt: pgflt stays clear");
+    test_result("T10b fetch-fault channel: ifu_idu_id_fault_{pgflt,accflt} force EU_CP0 dispatch and latch through EX1");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
@@ -692,6 +732,7 @@ int main(int argc, char **argv) {
     test_decode_32bit_csr();
     test_decode_32bit_fence_ecall();
     test_illegal_closed_list();
+    test_fetch_fault_forces_cp0();
     test_rvc_pairs();
     test_rvc_illegal();
 

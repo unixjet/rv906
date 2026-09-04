@@ -141,6 +141,11 @@ module IDU (
     input  wire [31:0]              ifu_idu_id_inst,
     input  wire                     ifu_idu_id_inst_vld,
     input  wire [1:0]               ifu_idu_id_bht_pred,
+    // M4 Task 6 (S13, D2): fetch-exception tags, IFU.v's own new ports --
+    // consumed at ID (dis_fetch_pgflt/_accflt below), forcing EU_CP0
+    // dispatch exactly like an illegal decode does.
+    input  wire                     ifu_idu_id_fault_pgflt,
+    input  wire                     ifu_idu_id_fault_accflt,
     output wire                     idu_ifu_id_stall,
 
     //=========================================================================
@@ -200,6 +205,11 @@ module IDU (
     output wire [FUNC_WIDTH-1:0]    idu_cp0_ex1_func,
     output wire [31:0]              idu_cp0_ex1_opcode,
     output wire                     idu_cp0_ex1_illegal,
+    // M4 Task 6 (S13, D2): fetch-fault siblings of idu_cp0_ex1_illegal --
+    // CSR.v traps vec 12/1 instead of vec 2 when either is set (donor
+    // aq_cp0_iui.v:645-666's own priority: pgflt > accflt > illegal).
+    output wire                     idu_cp0_ex1_fetch_pgflt,
+    output wire                     idu_cp0_ex1_fetch_accflt,
     output wire [63:0]              idu_cp0_ex1_src0_data,
     output wire [63:0]              idu_cp0_ex1_src1_data,
     output wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg,
@@ -1006,7 +1016,17 @@ module IDU (
     wire [63:0]           dis_src1_imm  = is32 ? d32_src1_imm     : d16_src1_imm;
     wire [63:0]           dis_src2_imm  = is32 ? d32_src2_imm     : d16_src2_imm;
 
-    wire [EU_WIDTH-1:0] dis_eu_final = dis_illegal ? EU_CP0 : dis_eu_raw;
+    // M4 Task 6: the fetch-fault tags, live at ID exactly like `inst` itself
+    // (IFU.v's own SECTION IBUF anchors both at ibuf_head/h0). Force EU_CP0
+    // dispatch the SAME way an illegal decode does -- the synthetic NOP's
+    // OWN decode (dis_illegal would read false for it; ADDI x0,x0,0 is a
+    // genuinely legal encoding) never gets a say once either fault flag is
+    // set.
+    wire dis_fetch_pgflt  = ifu_idu_id_fault_pgflt;
+    wire dis_fetch_accflt = ifu_idu_id_fault_accflt;
+
+    wire [EU_WIDTH-1:0] dis_eu_final = (dis_illegal || dis_fetch_pgflt || dis_fetch_accflt)
+                                      ? EU_CP0 : dis_eu_raw;
 
     // producer-type tag for THIS instruction, used both for WBT-create and
     // the WAW-except "new producer type" comparison (rvproc_pkg.sv's
@@ -1315,6 +1335,9 @@ module IDU (
     reg [1:0]               ex1_bht_pred_r;
     reg [31:0]              ex1_opcode_r;
     reg                     ex1_illegal_r;
+    // M4 Task 6: fetch-fault siblings of ex1_illegal_r, latched the same
+    // cycle/same way.
+    reg                     ex1_fetch_pgflt_r, ex1_fetch_accflt_r;
     // Task 7.3: latched length of the EX1 instruction (1=32b,0=16b). Source
     // is the combinational `is32` discriminator (line ~273), latched the
     // same cycle the EX1 data registers load. Feeds idu_iu_ex1_inst_len /
@@ -1395,6 +1418,8 @@ module IDU (
             ex1_bht_pred_r  <= 2'd0;
             ex1_opcode_r    <= 32'd0;
             ex1_illegal_r   <= 1'b0;
+            ex1_fetch_pgflt_r  <= 1'b0;
+            ex1_fetch_accflt_r <= 1'b0;
             ex1_inst_len_r  <= 1'b0;
         end else if (adv) begin
             ex1_func_r      <= dis_func;
@@ -1405,6 +1430,8 @@ module IDU (
             ex1_bht_pred_r  <= ifu_idu_id_bht_pred;
             ex1_opcode_r    <= inst;
             ex1_illegal_r   <= dis_illegal;
+            ex1_fetch_pgflt_r  <= dis_fetch_pgflt;
+            ex1_fetch_accflt_r <= dis_fetch_accflt;
             ex1_inst_len_r  <= is32;
         end else begin
             if (lf0_hit) begin ex1_src0_data_r <= lf0_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src0_rdy_r <= 1'b1; end
@@ -1458,6 +1485,8 @@ module IDU (
     assign idu_cp0_ex1_func      = ex1_func_r;
     assign idu_cp0_ex1_opcode    = ex1_opcode_r;
     assign idu_cp0_ex1_illegal   = ex1_illegal_r;
+    assign idu_cp0_ex1_fetch_pgflt  = ex1_fetch_pgflt_r;
+    assign idu_cp0_ex1_fetch_accflt = ex1_fetch_accflt_r;
     assign idu_cp0_ex1_src0_data = ex1_src0_data_r;
     assign idu_cp0_ex1_src1_data = ex1_src1_data_r;
     assign idu_cp0_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};

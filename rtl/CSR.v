@@ -83,6 +83,11 @@ module CSR #(
     input  wire [FUNC_WIDTH-1:0]    idu_cp0_ex1_func,
     input  wire [31:0]              idu_cp0_ex1_opcode,
     input  wire                     idu_cp0_ex1_illegal,   // IDU_ILLEGAL slice
+    // M4 Task 6 (S13, D2): fetch-fault siblings, IDU.v's own new ports --
+    // win priority over ex1_illegal below (donor aq_cp0_iui.v:645-666:
+    // pgflt(12) > accflt(1) > illegal(2)).
+    input  wire                     idu_cp0_ex1_fetch_pgflt,
+    input  wire                     idu_cp0_ex1_fetch_accflt,
     input  wire [63:0]              idu_cp0_ex1_src0_data, // rs1 (CSRRW/S/C only)
     input  wire [63:0]              idu_cp0_ex1_src1_data, // CSR address
     input  wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg,  // rd (old CSR value)
@@ -267,7 +272,17 @@ module CSR #(
     //=========================================================================
     wire ex1_flush  = rtu_yy_xx_flush_fe || rtu_yy_xx_flush;
     wire ex1_active = idu_cp0_ex1_sel && !ex1_flush;
-    wire ex1_ok      = ex1_active && !idu_cp0_ex1_illegal;   // legal, actionable this cycle
+    // M4 Task 6: a fetch-fault marker is excluded from ex1_ok exactly like
+    // an illegal decode is -- its (legal-looking) opcode bits must never be
+    // interpreted as a real ecall/ebreak/CSR access. Priority pgflt > accflt
+    // (donor aq_cp0_iui.v:645-666) -- moot in practice since MMU.v only
+    // ever raises one of mmu_lsu_page_fault/_access_fault per access
+    // (LSU.v's own SECTION-5 comment makes the same observation), stated
+    // rather than left to be discovered.
+    wire ex1_fetch_pgflt  = ex1_active && idu_cp0_ex1_fetch_pgflt;
+    wire ex1_fetch_accflt = ex1_active && idu_cp0_ex1_fetch_accflt && !idu_cp0_ex1_fetch_pgflt;
+    wire ex1_fetch_fault  = ex1_fetch_pgflt || ex1_fetch_accflt;
+    wire ex1_ok      = ex1_active && !idu_cp0_ex1_illegal && !ex1_fetch_fault;   // legal, actionable this cycle
     wire ex1_illegal = ex1_active &&  idu_cp0_ex1_illegal;
 
     wire is_ecall  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_ECALL);
@@ -1240,10 +1255,15 @@ module CSR #(
                          : (pm_r == PRIV_S) ? CAUSE_SUPERVISOR_ECALL
                                             : CAUSE_USER_ECALL;
 
-    assign cp0_rtu_ex1_expt_vld = ex1_illegal || is_ecall || is_ebreak
+    // M4 Task 6: ex1_fetch_fault (pgflt || accflt) OR'd in, and given
+    // priority OVER everything else in the vec mux below (donor
+    // aq_cp0_iui.v:645-666: pgflt(12) > accflt(1) > illegal(2) > ecall).
+    assign cp0_rtu_ex1_expt_vld = ex1_fetch_fault || ex1_illegal || is_ecall || is_ebreak
                                 || csr_access_illegal || xret_illegal;
     assign cp0_rtu_ex1_expt_int = 1'b0;
-    assign cp0_rtu_ex1_expt_vec = (ex1_illegal || csr_access_illegal || xret_illegal) ? CAUSE_ILLEGAL :
+    assign cp0_rtu_ex1_expt_vec = ex1_fetch_pgflt  ? CAUSE_FETCH_PAGE_FAULT :
+                                  ex1_fetch_accflt ? CAUSE_FETCH_ACCESS :
+                                  (ex1_illegal || csr_access_illegal || xret_illegal) ? CAUSE_ILLEGAL :
                                   is_ecall     ? ecall_vec :
                                   is_ebreak    ? CAUSE_BREAKPOINT : 5'd0;
 

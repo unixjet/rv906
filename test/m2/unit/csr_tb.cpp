@@ -87,6 +87,8 @@ static void tie_idle_inputs(void) {
     dut->idu_cp0_ex1_func       = 0;
     dut->idu_cp0_ex1_opcode     = 0;
     dut->idu_cp0_ex1_illegal    = 0;
+    dut->idu_cp0_ex1_fetch_pgflt  = 0;
+    dut->idu_cp0_ex1_fetch_accflt = 0;
     dut->idu_cp0_ex1_src0_data  = 0;
     dut->idu_cp0_ex1_src1_data  = 0;
     dut->idu_cp0_ex1_dst0_reg   = 0;
@@ -178,10 +180,13 @@ struct DispatchResult {
 static DispatchResult dispatch(uint32_t func, uint32_t csr_addr = 0,
                                 uint64_t rs1_or_uimm = 0, unsigned dst_reg = 0,
                                 bool illegal = false, bool imm_form = false,
-                                unsigned rs1_reg_field = 1) {
+                                unsigned rs1_reg_field = 1,
+                                bool fetch_pgflt = false, bool fetch_accflt = false) {
     dut->idu_cp0_ex1_sel       = 1;
     dut->idu_cp0_ex1_func      = func;
     dut->idu_cp0_ex1_illegal   = illegal ? 1 : 0;
+    dut->idu_cp0_ex1_fetch_pgflt  = fetch_pgflt  ? 1 : 0;
+    dut->idu_cp0_ex1_fetch_accflt = fetch_accflt ? 1 : 0;
     dut->idu_cp0_ex1_src1_data = csr_addr;
     dut->idu_cp0_ex1_dst0_reg  = dst_reg;
     if (imm_form) {
@@ -208,6 +213,8 @@ static DispatchResult dispatch(uint32_t func, uint32_t csr_addr = 0,
 
     dut->idu_cp0_ex1_sel = 0;
     dut->idu_cp0_ex1_illegal = 0;
+    dut->idu_cp0_ex1_fetch_pgflt  = 0;
+    dut->idu_cp0_ex1_fetch_accflt = 0;
     return r;
 }
 
@@ -473,6 +480,41 @@ static void test_ecall_ebreak_illegal(void) {
     test_result("T13 ecall/ebreak/illegal: expt_vld + correct vec, no side effects");
 }
 
+static void test_fetch_fault_priority(void) {
+    // pgflt alone -> vec 12, not an interrupt, no wb/chgflw.
+    DispatchResult r_pg = dispatch(/*func=*/0, 0, 0, 0, /*illegal=*/false,
+                                    /*imm_form=*/false, /*rs1_reg_field=*/1,
+                                    /*fetch_pgflt=*/true, /*fetch_accflt=*/false);
+    check(r_pg.expt_vld && r_pg.expt_vec == 12 && !r_pg.expt_int,
+          "fetch pgflt: expt_vld, vec=12 (fetch page fault)", r_pg.expt_vec, 12);
+    check(!r_pg.wb_vld && !r_pg.chgflw, "fetch pgflt: no wb, no chgflw");
+
+    // accflt alone -> vec 1.
+    DispatchResult r_acc = dispatch(/*func=*/0, 0, 0, 0, /*illegal=*/false,
+                                     /*imm_form=*/false, /*rs1_reg_field=*/1,
+                                     /*fetch_pgflt=*/false, /*fetch_accflt=*/true);
+    check(r_acc.expt_vld && r_acc.expt_vec == 1,
+          "fetch accflt: expt_vld, vec=1 (fetch access fault)", r_acc.expt_vec, 1);
+
+    // both asserted (shouldn't happen from IDU, but the priority mux must be
+    // deterministic) -- donor priority pgflt(12) > accflt(1).
+    DispatchResult r_both = dispatch(/*func=*/0, 0, 0, 0, /*illegal=*/false,
+                                      /*imm_form=*/false, /*rs1_reg_field=*/1,
+                                      /*fetch_pgflt=*/true, /*fetch_accflt=*/true);
+    check(r_both.expt_vec == 12, "fetch pgflt+accflt both set: pgflt wins (donor priority)",
+          r_both.expt_vec, 12);
+
+    // fetch pgflt + idu_cp0_ex1_illegal both set (the synthetic-NOP injection
+    // never sets illegal, but the priority mux must still resolve correctly
+    // if it ever did) -- donor priority pgflt(12) > illegal(2).
+    DispatchResult r_pg_ill = dispatch(CP0_FUNC_CSRRW, CSR_MSCRATCH, 0, 0,
+                                        /*illegal=*/true, /*imm_form=*/false,
+                                        /*rs1_reg_field=*/1, /*fetch_pgflt=*/true);
+    check(r_pg_ill.expt_vec == 12, "fetch pgflt + illegal both set: pgflt wins over illegal",
+          r_pg_ill.expt_vec, 12);
+    test_result("T13b fetch-fault priority: vec 12 > vec 1 > vec 2 (illegal), no side effects");
+}
+
 static void test_fence_no_op(void) {
     // Plain FENCE: with LSU quiescent (tie_idle_inputs drives
     // lsu_cp0_stb_empty=1) it completes immediately -- cmplt_dp asserted,
@@ -733,6 +775,7 @@ int main(int argc, char **argv) {
     test_trap_entry_mtval_non_allowlist();
     test_trap_entry_int_bit();
     test_ecall_ebreak_illegal();
+    test_fetch_fault_priority();
     test_fence_no_op();
     test_mie_mip_masking();
     test_mhcr_fanout();

@@ -281,6 +281,8 @@ module RVProc #(
     wire [31:0]              ifu_idu_id_inst;
     wire                     ifu_idu_id_inst_vld;
     wire [1:0]               ifu_idu_id_bht_pred;
+    wire                     ifu_idu_id_fault_pgflt;    // M4 Task 6
+    wire                     ifu_idu_id_fault_accflt;   // M4 Task 6
     wire                     idu_ifu_id_stall;
 
     //=========================================================================
@@ -372,6 +374,8 @@ module RVProc #(
     wire [FUNC_WIDTH-1:0]    idu_cp0_ex1_func;
     wire [31:0]              idu_cp0_ex1_opcode;
     wire                     idu_cp0_ex1_illegal;
+    wire                     idu_cp0_ex1_fetch_pgflt;    // M4 Task 6
+    wire                     idu_cp0_ex1_fetch_accflt;   // M4 Task 6
     wire [63:0]              idu_cp0_ex1_src0_data;
     wire [63:0]              idu_cp0_ex1_src1_data;
     wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
@@ -619,6 +623,8 @@ module RVProc #(
         .ifu_idu_id_inst         (ifu_idu_id_inst),
         .ifu_idu_id_inst_vld     (ifu_idu_id_inst_vld),
         .ifu_idu_id_bht_pred     (ifu_idu_id_bht_pred),
+        .ifu_idu_id_fault_pgflt  (ifu_idu_id_fault_pgflt),
+        .ifu_idu_id_fault_accflt (ifu_idu_id_fault_accflt),
         .idu_ifu_id_stall        (idu_ifu_id_stall),
 
         .pcgen_icache_va         (pcgen_icache_va),
@@ -790,6 +796,8 @@ module RVProc #(
         .ifu_idu_id_inst         (ifu_idu_id_inst),
         .ifu_idu_id_inst_vld     (ifu_idu_id_inst_vld),
         .ifu_idu_id_bht_pred     (ifu_idu_id_bht_pred),
+        .ifu_idu_id_fault_pgflt  (ifu_idu_id_fault_pgflt),
+        .ifu_idu_id_fault_accflt (ifu_idu_id_fault_accflt),
         .idu_ifu_id_stall        (idu_ifu_id_stall),
 
         .idu_iu_ex1_inst_vld     (idu_iu_ex1_inst_vld),
@@ -828,6 +836,8 @@ module RVProc #(
         .idu_cp0_ex1_func        (idu_cp0_ex1_func),
         .idu_cp0_ex1_opcode      (idu_cp0_ex1_opcode),
         .idu_cp0_ex1_illegal     (idu_cp0_ex1_illegal),
+        .idu_cp0_ex1_fetch_pgflt  (idu_cp0_ex1_fetch_pgflt),
+        .idu_cp0_ex1_fetch_accflt (idu_cp0_ex1_fetch_accflt),
         .idu_cp0_ex1_src0_data   (idu_cp0_ex1_src0_data),
         .idu_cp0_ex1_src1_data   (idu_cp0_ex1_src1_data),
         .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
@@ -1241,6 +1251,8 @@ module RVProc #(
         .idu_cp0_ex1_func        (idu_cp0_ex1_func),
         .idu_cp0_ex1_opcode      (idu_cp0_ex1_opcode),
         .idu_cp0_ex1_illegal     (idu_cp0_ex1_illegal),
+        .idu_cp0_ex1_fetch_pgflt  (idu_cp0_ex1_fetch_pgflt),
+        .idu_cp0_ex1_fetch_accflt (idu_cp0_ex1_fetch_accflt),
         .idu_cp0_ex1_src0_data   (idu_cp0_ex1_src0_data),
         .idu_cp0_ex1_src1_data   (idu_cp0_ex1_src1_data),
         .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
