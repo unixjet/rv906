@@ -95,6 +95,7 @@ static void tie_idle_inputs(void) {
     dut->lsu_rtu_wb_data          = 0;
     dut->lsu_rtu_wb_preg          = 0;
     dut->lsu_rtu_wb_vld           = 0;
+    dut->lsu_rtu_wb_dst_frf       = 0;
     dut->lsu_rtu_ex2_data         = 0;
     dut->lsu_rtu_ex2_data_vld     = 0;
     dut->lsu_rtu_ex2_dest_reg     = 0;
@@ -169,6 +170,7 @@ static void test_result(const char *name) {
 static void test_reset_state(void) {
     check(dut->rtu_idu_wb0_vld == 0, "reset: wb0 quiescent");
     check(dut->rtu_idu_wb1_vld == 0, "reset: wb1 quiescent");
+    check(dut->rtu_idu_wbf1_vld == 0, "reset: wbf1 quiescent");
     check(dut->rtu_idu_fwd0_vld == 0, "reset: fwd0 quiescent");
     check(dut->rtu_idu_fwd1_vld == 0, "reset: fwd1 quiescent");
     check(dut->rtu_idu_fwd2_vld == 0, "reset: fwd2 quiescent");
@@ -454,6 +456,38 @@ static void test_lsu_wb1_and_fwd2(void) {
     check(dut->rtu_idu_fwd2_vld && dut->rtu_idu_fwd2_data == 0x1111 && dut->rtu_idu_fwd2_reg == 8,
           "LSU fwd2: separate bus from wb1, also combinational");
     test_result("T9 LSU wb1 (pure combinational passthrough) + fwd2 (separate bus)");
+}
+
+//-----------------------------------------------------------------------------
+// T9b (M5 Task 4c, D8): lsu_rtu_wb_dst_frf steers the SAME lsu_rtu_wb_* payload
+// to wbf1 instead of wb1 -- an FLW/FLD completion must NOT also fire wb1 (its
+// dst0_reg index was never allocated in the GPR scoreboard), and a plain
+// GPR-destined completion (dst_frf=0, T9 above) must NOT also fire wbf1.
+//-----------------------------------------------------------------------------
+static void test_lsu_wbf1_dst_frf_routing(void) {
+    tie_idle_inputs();
+    dut->lsu_rtu_wb_vld     = 1;
+    dut->lsu_rtu_wb_data    = 0x3f800000;
+    dut->lsu_rtu_wb_preg    = 5;
+    dut->lsu_rtu_wb_dst_frf = 1;
+    dut->eval();
+    check(dut->rtu_idu_wbf1_vld && dut->rtu_idu_wbf1_data == 0x3f800000 && dut->rtu_idu_wbf1_reg == 5,
+          "LSU wbf1: combinational passthrough when dst_frf==1, SAME cycle");
+    check(!dut->rtu_idu_wb1_vld, "LSU wbf1: dst_frf==1 does NOT also fire wb1 (GPR)");
+
+    tie_idle_inputs();
+    dut->eval();
+    check(!dut->rtu_idu_wbf1_vld, "LSU wbf1: clears immediately (combinational), no lingering registered value");
+
+    dut->lsu_rtu_wb_vld     = 1;
+    dut->lsu_rtu_wb_data    = 0x9999;
+    dut->lsu_rtu_wb_preg    = 4;
+    dut->lsu_rtu_wb_dst_frf = 0;
+    dut->eval();
+    check(dut->rtu_idu_wb1_vld, "LSU wb1: dst_frf==0 fires wb1 (GPR) as before");
+    check(!dut->rtu_idu_wbf1_vld, "LSU wb1: dst_frf==0 does NOT also fire wbf1 (FRF)");
+
+    test_result("T9b LSU wbf1 dst_frf routing (M5 Task 4c, D8): wb1/wbf1 are mutually exclusive");
 }
 
 //-----------------------------------------------------------------------------
@@ -854,6 +888,7 @@ int main(int argc, char **argv) {
     test_mtval_allowlist();
     test_cp0_fetch_fault_tval();
     test_lsu_wb1_and_fwd2();
+    test_lsu_wbf1_dst_frf_routing();
     test_retire_blocking();
     test_flush_bju_depd_lsu();
     test_flush_mret();

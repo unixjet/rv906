@@ -361,6 +361,7 @@ module RVProc #(
     wire [63:0]              idu_lsu_ex1_src2_data;
     wire                     idu_lsu_ex1_src2_ready;
     wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg;
+    wire                     idu_lsu_ex1_dst0_frf;   // M5 Task 4c
     wire                     idu_lsu_ex1_inst_len;   // Task 7.3
     wire                     lsu_idu_full;
     wire                     lsu_cp0_stb_empty;   // Task 10.1 fence.i quiescence
@@ -476,6 +477,7 @@ module RVProc #(
     wire [63:0]              lsu_rtu_wb_data;
     wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg;
     wire                     lsu_rtu_wb_vld;
+    wire                     lsu_rtu_wb_dst_frf;   // M5 Task 4c
     wire [63:0]              lsu_rtu_ex2_data;
     wire                     lsu_rtu_ex2_data_vld;
     wire [GPR_IDX_WIDTH-1:0] lsu_rtu_ex2_dest_reg;
@@ -546,10 +548,13 @@ module RVProc #(
     wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg;
     wire                     rtu_idu_wb1_vld;
     // M5 Task 4b: FRF write port (wbf0), real RTU-driven signals now.
-    // wbf1 stays tied 0 at the instantiation below (future LSU-FRF path).
+    // M5 Task 4c: wbf1 (LSU-FRF path) also real RTU-driven signals now.
     wire [63:0]              rtu_idu_wbf0_data;
     wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf0_reg;
     wire                     rtu_idu_wbf0_vld;
+    wire [63:0]              rtu_idu_wbf1_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf1_reg;
+    wire                     rtu_idu_wbf1_vld;
 
     wire                     rtu_idu_flush_fe;
     wire                     rtu_idu_flush_stall;
@@ -873,6 +878,7 @@ module RVProc #(
         .idu_lsu_ex1_src2_data   (idu_lsu_ex1_src2_data),
         .idu_lsu_ex1_src2_ready  (idu_lsu_ex1_src2_ready),
         .idu_lsu_ex1_dst0_reg    (idu_lsu_ex1_dst0_reg),
+        .idu_lsu_ex1_dst0_frf    (idu_lsu_ex1_dst0_frf),
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
 
         .idu_cp0_ex1_sel         (idu_cp0_ex1_sel),
@@ -914,9 +920,9 @@ module RVProc #(
         .rtu_idu_wbf0_data       (rtu_idu_wbf0_data),
         .rtu_idu_wbf0_reg        (rtu_idu_wbf0_reg),
         .rtu_idu_wbf0_vld        (rtu_idu_wbf0_vld),
-        .rtu_idu_wbf1_data       (64'd0),
-        .rtu_idu_wbf1_reg        ({GPR_IDX_WIDTH{1'b0}}),
-        .rtu_idu_wbf1_vld        (1'b0),
+        .rtu_idu_wbf1_data       (rtu_idu_wbf1_data),
+        .rtu_idu_wbf1_reg        (rtu_idu_wbf1_reg),
+        .rtu_idu_wbf1_vld        (rtu_idu_wbf1_vld),
 
         .iu_idu_mult_issue_stall (iu_idu_mult_issue_stall),
         .iu_idu_mult_full        (iu_idu_mult_full),
@@ -1107,6 +1113,7 @@ module RVProc #(
         .idu_lsu_ex1_src2_data   (idu_lsu_ex1_src2_data),
         .idu_lsu_ex1_src2_ready  (idu_lsu_ex1_src2_ready),
         .idu_lsu_ex1_dst0_reg    (idu_lsu_ex1_dst0_reg),
+        .idu_lsu_ex1_dst0_frf    (idu_lsu_ex1_dst0_frf),
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
         .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
 
@@ -1122,6 +1129,7 @@ module RVProc #(
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
+        .lsu_rtu_wb_dst_frf      (lsu_rtu_wb_dst_frf),
         .lsu_rtu_ex2_data        (lsu_rtu_ex2_data),
         .lsu_rtu_ex2_data_vld    (lsu_rtu_ex2_data_vld),
         .lsu_rtu_ex2_dest_reg    (lsu_rtu_ex2_dest_reg),
@@ -1261,6 +1269,7 @@ module RVProc #(
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
+        .lsu_rtu_wb_dst_frf      (lsu_rtu_wb_dst_frf),
         .lsu_rtu_ex2_data        (lsu_rtu_ex2_data),
         .lsu_rtu_ex2_data_vld    (lsu_rtu_ex2_data_vld),
         .lsu_rtu_ex2_dest_reg    (lsu_rtu_ex2_dest_reg),
@@ -1323,6 +1332,9 @@ module RVProc #(
         .rtu_idu_wbf0_data       (rtu_idu_wbf0_data),
         .rtu_idu_wbf0_reg        (rtu_idu_wbf0_reg),
         .rtu_idu_wbf0_vld        (rtu_idu_wbf0_vld),
+        .rtu_idu_wbf1_data       (rtu_idu_wbf1_data),
+        .rtu_idu_wbf1_reg        (rtu_idu_wbf1_reg),
+        .rtu_idu_wbf1_vld        (rtu_idu_wbf1_vld),
         .rtu_idu_flush_fe        (rtu_idu_flush_fe),
         .rtu_idu_flush_stall     (rtu_idu_flush_stall),
         .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),

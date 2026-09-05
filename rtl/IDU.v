@@ -198,6 +198,8 @@ module IDU (
     output wire [63:0]              idu_lsu_ex1_src2_data,
     output wire                     idu_lsu_ex1_src2_ready,
     output wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg,
+    // M5 Task 4c: 1 for FLW/FLD (destination is FRF, not GPR) -- see D8.
+    output wire                     idu_lsu_ex1_dst0_frf,
     // Task 7.3: EX1 instruction length (1=32b,0=16b) for the LSU slice --
     // the completing-LSU-instruction length the RTU's pcgen inst_len mux
     // needs (aq_rtu_dp.v:367 `dp_ex1_inst_len = lsu_rtu_ex1_inst_len`).
@@ -418,6 +420,12 @@ module IDU (
     reg                  d32_src2_vld, d32_src2_imm_vld, d32_dst0_vld;
     reg [4:0]            d32_src0_reg, d32_src1_reg, d32_src2_reg, d32_dst0_reg;
     reg [63:0]           d32_src1_imm, d32_src2_imm;
+    // M5 Task 4c: LOAD-FP/STORE-FP destination/source-data tags -- FRF, not
+    // GPR, so they stay separate from dst0_vld/src2_vld (which would create
+    // a GPR wbt entry / route src2 through the GPR forward mux). No FRF
+    // scoreboard exists yet (Task 9), so these need no _vld-style readiness
+    // companion of their own.
+    reg                  d32_dst0_frf, d32_src2_frf;
 
     always @* begin
         // default init (decd.v:1519-1539's own top-of-block zero-init
@@ -431,6 +439,8 @@ module IDU (
         d32_src2_vld     = 1'b0;
         d32_src2_imm_vld = 1'b0;
         d32_dst0_vld     = 1'b0;
+        d32_dst0_frf     = 1'b0;
+        d32_src2_frf     = 1'b0;
         d32_src0_reg     = inst[19:15];   // rs1 field, unconditionally (decd.v:666)
         d32_src1_reg     = inst[24:20];   // rs2 field (R-type slot)
         d32_src2_reg     = inst[24:20];   // rs2 field (store-data slot)
@@ -540,6 +550,39 @@ module IDU (
                 d32_eu = EU_LSU; d32_func = LSU_FUNC_SD;
                 d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_s;
                 d32_src2_vld = 1'b1;
+            end
+            //-----------------------------------------------------------------
+            // M5 Task 4c: LOAD-FP/STORE-FP (opcode 0000111/0100111 ->
+            // inst[6:2]=00001/01001). D8: reuses the exact same EU_LSU
+            // AG/DC/STB/LFB machinery as the integer loads/stores above
+            // (donor FUNC low-nibble bit-exact, see rvproc_pkg.sv). The base
+            // address (src0/src1_imm) works exactly like lw/sw; only the
+            // destination (loads) / data operand (stores) differs: FRF, not
+            // GPR, so dst0_vld/src2_vld stay 0 here (no GPR wbt entry, no
+            // GPR forward-mux routing) and dst0_frf/src2_frf mark the FRF
+            // side instead (dst0_frf consumed by LSU.v's new dst0_frf tag;
+            // src2_frf overrides dis_src2_data to frf_src1_data below, SECTION
+            // FRF). Still gated illegal (misa.F/D=0 pre-swap, D11) exactly
+            // like the OP-FP arms above.
+            15'b???????01000001: begin  // flw
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_FLW;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i;
+                d32_dst0_frf = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b???????01100001: begin  // fld
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_FLD;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i;
+                d32_dst0_frf = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b???????01001001: begin  // fsw
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_FSW;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_s;
+                d32_src2_frf = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b???????01101001: begin  // fsd
+                d32_eu = EU_LSU; d32_func = LSU_FUNC_FSD;
+                d32_src0_vld = 1'b1; d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_s;
+                d32_src2_frf = 1'b1; d32_illegal = 1'b1;
             end
             //-----------------------------------------------------------------
             // M3 Task 7: RV64A atomics (opcode 0x2F -> inst[6:2]=01011).
@@ -1203,6 +1246,11 @@ module IDU (
     wire [4:0]            dis_dst0_reg5 = is32 ? d32_dst0_reg     : d16_dst0_reg;
     wire [63:0]           dis_src1_imm  = is32 ? d32_src1_imm     : d16_src1_imm;
     wire [63:0]           dis_src2_imm  = is32 ? d32_src2_imm     : d16_src2_imm;
+    // M5 Task 4c: FLW/FLD/FSW/FSD FRF tags -- no 16-bit (RVC) FP load/store
+    // decode exists yet (c.fld/c.fsd stay illegal, "no FP in M2" above), so
+    // the d16 side is always 0.
+    wire                  dis_dst0_frf  = is32 && d32_dst0_frf;
+    wire                  dis_src2_frf  = is32 && d32_src2_frf;
     // M5 Task 4b: OP-FP's funct3 field IS the rm field for FADD/FSUB/FCVT.f2f
     // (dynamic rounding mode) and a fixed sub-op selector (already captured
     // in FUNC bits above) for FMIN/FMAX/FSGNJ* -- passing it through
@@ -1543,7 +1591,8 @@ module IDU (
     wire [63:0] dis_src0_data = fwd_src0_vld ? fwd_data(dis_src0_reg5) : gpr_src0_data;
     wire [63:0] dis_src1_data = !dis_src1_vld ? dis_src1_imm
                               : fwd_src1_vld  ? fwd_data(dis_src1_reg5) : gpr_src1_data;
-    wire [63:0] dis_src2_data = !dis_src2_vld ? dis_src2_imm
+    wire [63:0] dis_src2_data = dis_src2_frf ? frf_src1_data
+                              : !dis_src2_vld ? dis_src2_imm
                               : fwd_src2_vld  ? fwd_data(dis_src2_reg5) : gpr_src2_data;
 
     // SRCn_RDY (dp.v:740-742,766-768,795-797 verbatim shape).
@@ -1609,6 +1658,9 @@ module IDU (
     reg                     ex1_src0_rdy_r, ex1_src1_rdy_r, ex1_src2_rdy_r;
     reg [4:0]               ex1_src0_reg_r, ex1_src1_reg_r, ex1_src2_reg_r;
     reg [4:0]               ex1_dst0_reg_r;
+    // M5 Task 4c: FRF-vs-GPR destination tag for LSU-class ops (FLW/FLD),
+    // latched alongside ex1_dst0_reg_r the same way.
+    reg                     ex1_dst0_frf_r;
     reg [1:0]               ex1_bht_pred_r;
     reg [31:0]              ex1_opcode_r;
     reg                     ex1_illegal_r;
@@ -1694,6 +1746,7 @@ module IDU (
             ex1_src0_rdy_r  <= 1'b0;  ex1_src1_rdy_r  <= 1'b0;  ex1_src2_rdy_r  <= 1'b0;
             ex1_src0_reg_r  <= 5'd0;  ex1_src1_reg_r  <= 5'd0;  ex1_src2_reg_r  <= 5'd0;
             ex1_dst0_reg_r  <= 5'd0;
+            ex1_dst0_frf_r  <= 1'b0;
             ex1_bht_pred_r  <= 2'd0;
             ex1_opcode_r    <= 32'd0;
             ex1_illegal_r   <= 1'b0;
@@ -1707,6 +1760,7 @@ module IDU (
             ex1_src1_data_r <= dis_src1_data; ex1_src1_rdy_r <= dis_src1_rdy; ex1_src1_reg_r <= dis_src1_reg5;
             ex1_src2_data_r <= dis_src2_data; ex1_src2_rdy_r <= dis_src2_rdy; ex1_src2_reg_r <= dis_src2_reg5;
             ex1_dst0_reg_r  <= dis_dst0_reg5;
+            ex1_dst0_frf_r  <= dis_dst0_frf;
             ex1_bht_pred_r  <= ifu_idu_id_bht_pred;
             ex1_opcode_r    <= inst;
             ex1_illegal_r   <= dis_illegal;
@@ -1796,6 +1850,10 @@ module IDU (
     assign idu_lsu_ex1_src2_data  = ex1_src2_data_r;
     assign idu_lsu_ex1_src2_ready = ex1_src2_rdy_r;
     assign idu_lsu_ex1_dst0_reg   = {1'b0, ex1_dst0_reg_r};
+    // M5 Task 4c: FLW/FLD write FRF instead of GPR (D8) -- LSU.v threads
+    // this alongside dst0_reg through AG/DC/LFB to pick the write-back
+    // register file at commit.
+    assign idu_lsu_ex1_dst0_frf   = ex1_dst0_frf_r;
     assign idu_lsu_ex1_inst_len   = ex1_inst_len_r;
 
     assign idu_cp0_ex1_func      = ex1_func_r;

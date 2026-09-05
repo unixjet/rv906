@@ -41,6 +41,14 @@ static const uint32_t F_SB  = 0x00301;
 static const uint32_t F_SH  = 0x00305;
 static const uint32_t F_SW  = 0x00309;
 static const uint32_t F_SD  = 0x0030d;
+// M5 Task 4c: LOAD-FP/STORE-FP (rvproc_pkg.sv LSU_FUNC_F*) -- reuses the
+// same EU_LSU AG/DC/LFB machinery; only the dst0_frf tag (threaded via
+// idu_lsu_ex1_dst0_frf/lsu_rtu_wb_dst_frf) and the FLW NaN-boxing formatter
+// differ from the plain LW/SW/LD/SD path this bench already exercises.
+static const uint32_t F_FLW = 0x00208;
+static const uint32_t F_FLD = 0x0020c;
+static const uint32_t F_FSW = 0x00209;
+static const uint32_t F_FSD = 0x0020d;
 
 //-----------------------------------------------------------------------------
 // DUT plumbing
@@ -238,6 +246,7 @@ static void idle_issue(void)
     dut->idu_lsu_ex1_src2_data  = 0;
     dut->idu_lsu_ex1_src2_ready = 1;
     dut->idu_lsu_ex1_dst0_reg   = 0;
+    dut->idu_lsu_ex1_dst0_frf   = 0;
 }
 
 static void tick(void)
@@ -337,6 +346,7 @@ struct LsuResult {
     uint64_t tval = 0;
     int      cycles = 0;
     bool     timed_out = false;
+    bool     wb_dst_frf = false;   // M5 Task 4c: lsu_rtu_wb_dst_frf
 };
 
 // Issues one EX1 dispatch (a one-cycle pulse, matching how a real IDU
@@ -344,7 +354,8 @@ struct LsuResult {
 // bus at that exact cycle. `sel`/`dp_sel` are exposed separately so the
 // STB-create-vs-flush interlock test can drive the ungated `dp_sel` alone.
 static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src2,
-                       unsigned dst0, bool sel = true, bool dp_sel = true, int guard = 500)
+                       unsigned dst0, bool sel = true, bool dp_sel = true, int guard = 500,
+                       bool dst0_frf = false)
 {
     int waited = 0;
     while (dut->lsu_idu_full && waited < guard) { idle_issue(); tick(); waited++; }
@@ -365,20 +376,22 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
     dut->idu_lsu_ex1_src2_data  = src2;
     dut->idu_lsu_ex1_src2_ready = 1;
     dut->idu_lsu_ex1_dst0_reg   = dst0;
+    dut->idu_lsu_ex1_dst0_frf   = dst0_frf ? 1 : 0;
     tick();
     idle_issue();
 
     LsuResult r;
     for (int i = 0; i < guard; i++) {
         if (dut->lsu_rtu_ex1_cmplt_dp) {
-            r.cmplt    = true;
-            r.wb_vld   = dut->lsu_rtu_wb_vld != 0;
-            r.wb_data  = dut->lsu_rtu_wb_data;
-            r.wb_preg  = dut->lsu_rtu_wb_preg;
-            r.expt_vld = dut->lsu_rtu_expt_vld != 0;
-            r.expt_vec = dut->lsu_rtu_expt_vec;
-            r.tval     = dut->lsu_rtu_tval;
-            r.cycles   = i + 1;
+            r.cmplt      = true;
+            r.wb_vld     = dut->lsu_rtu_wb_vld != 0;
+            r.wb_data    = dut->lsu_rtu_wb_data;
+            r.wb_preg    = dut->lsu_rtu_wb_preg;
+            r.expt_vld   = dut->lsu_rtu_expt_vld != 0;
+            r.expt_vec   = dut->lsu_rtu_expt_vec;
+            r.tval       = dut->lsu_rtu_tval;
+            r.cycles     = i + 1;
+            r.wb_dst_frf = dut->lsu_rtu_wb_dst_frf != 0;
             tick();
             return r;
         }
@@ -488,7 +501,7 @@ static PtwResult ptw_probe(uint64_t addr, int guard = 200)
 // completion (non-blocking). Used by the hit-under-miss tests to put a
 // missing load in flight and then observe other ops proceeding.
 static void issue_only(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src2,
-                       unsigned dst0)
+                       unsigned dst0, bool dst0_frf = false)
 {
     int waited = 0;
     while (dut->lsu_idu_full && waited < 500) { idle_issue(); tick(); waited++; }
@@ -503,6 +516,7 @@ static void issue_only(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
     dut->idu_lsu_ex1_src2_data  = src2;
     dut->idu_lsu_ex1_src2_ready = 1;
     dut->idu_lsu_ex1_dst0_reg   = dst0;
+    dut->idu_lsu_ex1_dst0_frf   = dst0_frf ? 1 : 0;
     tick();
     idle_issue();
 }
@@ -523,6 +537,7 @@ static LsuResult wait_completion(int preg, int guard = 600)
             r.expt_vec = dut->lsu_rtu_expt_vec;
             r.tval     = dut->lsu_rtu_tval;
             r.cycles   = i + 1;
+            r.wb_dst_frf = dut->lsu_rtu_wb_dst_frf != 0;
             tick();
             return r;
         }
@@ -1427,6 +1442,84 @@ static void test_ag_wait_flush(void)
     test_result("T17 AG wait-state: RTU flush drops a parked DTLB-miss op");
 }
 
+// T18 (M5 Task 4c): FLW/FLD dst0_frf tag threading + FLW NaN-boxing, through
+// BOTH completion paths -- the fast-reply hit path (da_final, LSU.v:2453)
+// and the deferred-LFB-miss path (lfb_wb_data, LSU.v:2497) -- plus a plain
+// LW contrast on the identical bit pattern proving the NaN-boxing formatter
+// is gated strictly on dst0_frf (D5), not merely on word size.
+static void test_fp_load_dst_frf_and_nanbox(void)
+{
+    const uint64_t LINE_HIT = 0x00000000800a0000ULL;   // warmed -> fast-reply hits
+    const uint64_t W_OFF    = 0x00, D_OFF = 0x08;
+    const uint32_t W_PAT    = 0x3f800000UL;             // 1.0f; bit31=0 so the
+                                                          // LW-vs-FLW top-32 contrast
+                                                          // is unambiguous
+    const uint64_t D_PAT    = 0x400921FB54442D18ULL;    // pi as a double bit pattern
+
+    for (int i = 0; i < 4; i++) mem_wr(LINE_HIT + W_OFF + i, (uint8_t)(W_PAT >> (i * 8)));
+    for (int i = 0; i < 8; i++) mem_wr(LINE_HIT + D_OFF + i, (uint8_t)(D_PAT >> (i * 8)));
+
+    // Warm the line (plain LD) so the FLW/FLD/LW reads below are cache hits,
+    // exercising the fast-reply da_final path.
+    do_op(F_LD, LINE_HIT, 0, 0, 6);
+    settle(3);
+
+    LsuResult flw = do_op(F_FLW, LINE_HIT, W_OFF, 0, 5, true, true, 500, /*dst0_frf=*/true);
+    check(flw.cmplt && !flw.expt_vld, "flw (hit): completes cleanly",
+          flw.cmplt && !flw.expt_vld, 1);
+    check(flw.wb_dst_frf, "flw (hit): lsu_rtu_wb_dst_frf==1 (D8 tag threads to the wb bus)",
+          flw.wb_dst_frf, 1);
+    check(flw.wb_data == (0xffffffff00000000ULL | W_PAT),
+          "flw (hit): NaN-boxed (D5) -- upper 32 bits forced to 0xffffffff",
+          flw.wb_data, 0xffffffff00000000ULL | W_PAT);
+
+    LsuResult lw = do_op(F_LW, LINE_HIT, W_OFF, 0, 5, true, true, 500, /*dst0_frf=*/false);
+    check(!lw.wb_dst_frf, "lw (hit) contrast: lsu_rtu_wb_dst_frf==0", lw.wb_dst_frf, 0);
+    check(lw.wb_data == (uint64_t)W_PAT,
+          "lw (hit) contrast: sign-extended (bit31=0), NOT NaN-boxed -- same bit "
+          "pattern as flw above, proving the formatter gates on dst0_frf (D5), not size",
+          lw.wb_data, (uint64_t)W_PAT);
+
+    LsuResult fld = do_op(F_FLD, LINE_HIT, D_OFF, 0, 7, true, true, 500, /*dst0_frf=*/true);
+    check(fld.cmplt && !fld.expt_vld, "fld (hit): completes cleanly",
+          fld.cmplt && !fld.expt_vld, 1);
+    check(fld.wb_dst_frf, "fld (hit): lsu_rtu_wb_dst_frf==1", fld.wb_dst_frf, 1);
+    check(fld.wb_data == D_PAT,
+          "fld (hit): full 64-bit passthrough, no NaN-boxing at double width",
+          fld.wb_data, D_PAT);
+
+    // Deferred-LFB-miss path: a cold line forces the non-blocking LSU to
+    // defer the FLW into the LFB (M3b Task A rework); the dst0_frf tag must
+    // survive that detour (lfb_dst_frf[]) and the NaN-boxing formatter must
+    // re-fire from lfb_wb_data (LSU.v:2497), not just from da_final.
+    const uint64_t LINE_MISS = 0x0000000080100000ULL;   // cold -> genuine miss (untouched
+                                                          // by any earlier test in this file --
+                                                          // 0x800a1000 collided with T11's
+                                                          // still-resident BASE2 cache line, and
+                                                          // 0x800b0000 collided with T16's
+                                                          // still-resident PTE-servant line
+                                                          // (test_ptw_servant's wa=1 store-alloc
+                                                          // at 0x800b0010); every address up to
+                                                          // 0x800f2000 is touched somewhere in
+                                                          // this file, so this constant must stay
+                                                          // above that high-water mark)
+    for (int i = 0; i < 4; i++) mem_wr(LINE_MISS + i, (uint8_t)(W_PAT >> (i * 8)));
+
+    issue_only(F_FLW, LINE_MISS, 0, 0, 5, /*dst0_frf=*/true);
+    LsuResult flw_miss = wait_completion(5, 300);
+    check(flw_miss.cmplt && !flw_miss.expt_vld, "flw (LFB-deferred miss): completes cleanly",
+          flw_miss.cmplt && !flw_miss.expt_vld, 1);
+    check(flw_miss.wb_dst_frf,
+          "flw (LFB-deferred miss): dst0_frf tag survives the LFB detour (lfb_dst_frf[])",
+          flw_miss.wb_dst_frf, 1);
+    check(flw_miss.wb_data == (0xffffffff00000000ULL | W_PAT),
+          "flw (LFB-deferred miss): NaN-boxed from lfb_wb_data, same as the hit path",
+          flw_miss.wb_data, 0xffffffff00000000ULL | W_PAT);
+
+    settle(10);
+    test_result("T18 FLW/FLD dst0_frf tag + NaN-boxing (M5 Task 4c, D5/D8): fast-reply and LFB-deferred paths both correct");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -1454,6 +1547,7 @@ int main(int argc, char **argv)
     test_mmu_fault_trap_at_issue();        // M4 Task 5, S12: DTLB fault traps at issue
     test_ptw_servant();                    // M4 Task 5, D3: PTW servant, array-probe-first
     test_ag_wait_flush();                  // M4 Task 5, D1: RTU flush drops a parked op
+    test_fp_load_dst_frf_and_nanbox();     // M5 Task 4c, D5/D8: dst0_frf tag + FLW NaN-boxing
 
     printf("[lsu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

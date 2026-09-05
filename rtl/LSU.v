@@ -96,6 +96,10 @@ module LSU #(
     input  wire [63:0]              idu_lsu_ex1_src2_data, // store data
     input  wire                     idu_lsu_ex1_src2_ready,
     input  wire [GPR_IDX_WIDTH-1:0] idu_lsu_ex1_dst0_reg,  // load dest
+    // M5 Task 4c: 1 for FLW/FLD -- destination is FRF, not GPR (D8). Threaded
+    // alongside dst0_reg through AG-wait/DC/LFB to pick the write-back
+    // register file at the lsu_rtu_wb_* output ports below.
+    input  wire                     idu_lsu_ex1_dst0_frf,
     // Task 7.3: the EX1 instruction's length (1=32b,0=16b RVC) for the LSU
     // slice -- latched with the in-flight instruction, reported back to the
     // RTU's pcgen inst_len mux (aq_rtu_dp.v:367 lsu arm).
@@ -150,6 +154,10 @@ module LSU #(
     output wire [63:0]              lsu_rtu_wb_data,
     output wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     output wire                     lsu_rtu_wb_vld,
+    // M5 Task 4c (D8): destination-register-file selector riding alongside
+    // the writeback payload above -- 1 = FRF (FLW/FLD), 0 = GPR (everyone
+    // else, unchanged). RTU routes this payload to wbf1 instead of wb1 when set.
+    output wire                     lsu_rtu_wb_dst_frf,
     output wire [63:0]              lsu_rtu_ex2_data,
     output wire                     lsu_rtu_ex2_data_vld,
     output wire [GPR_IDX_WIDTH-1:0] lsu_rtu_ex2_dest_reg,   // Task 6 amendment, see header
@@ -402,6 +410,8 @@ module LSU #(
     wire [63:0] ag_addr      = ag_wait_r ? ag_wait_addr_r : ag_addr_live;
     wire [63:0] ag_src2_data_eff = ag_wait_r ? ag_wait_src2_data_r : idu_lsu_ex1_src2_data;
     wire [GPR_IDX_WIDTH-1:0] ag_dst0_reg_eff = ag_wait_r ? ag_wait_dst0_reg_r : idu_lsu_ex1_dst0_reg;
+    // M5 Task 4c: dst0_frf tag, mirrors ag_dst0_reg_eff's buffer/live mux.
+    wire ag_dst0_frf_eff = ag_wait_r ? ag_wait_dst0_frf_r : idu_lsu_ex1_dst0_frf;
     wire        ag_inst_len_eff = ag_wait_r ? ag_wait_inst_len_r : idu_lsu_ex1_inst_len;
 
     wire ag_misalign = (ag_size == 2'b01 && ag_addr[0])
@@ -533,6 +543,7 @@ module LSU #(
     reg [FUNC_WIDTH-1:0]    ag_wait_func_r;
     reg [63:0]              ag_wait_src2_data_r;
     reg [GPR_IDX_WIDTH-1:0] ag_wait_dst0_reg_r;
+    reg                     ag_wait_dst0_frf_r;  // M5 Task 4c: mirrors dst0_reg_r
     reg                     ag_wait_inst_len_r;
     always @(posedge clk) begin
         if (ag_mmu_wait_start && !ag_wait_r) begin
@@ -540,6 +551,7 @@ module LSU #(
             ag_wait_func_r      <= idu_lsu_ex1_func;
             ag_wait_src2_data_r <= idu_lsu_ex1_src2_data;
             ag_wait_dst0_reg_r  <= idu_lsu_ex1_dst0_reg;
+            ag_wait_dst0_frf_r  <= idu_lsu_ex1_dst0_frf;
             ag_wait_inst_len_r  <= idu_lsu_ex1_inst_len;
         end
     end
@@ -589,27 +601,28 @@ module LSU #(
     localparam [1:0] ST_FRZ   = 2'b10;
     localparam [1:0] ST_REPLY = 2'b11;
 
-    reg [1:0] state /* verilator public */;
+    reg [1:0] state;
 
     // AG-latch: captured every time IDLE accepts something (a real
     // instruction or an STB drain), read uniformly by DCS/FRZ/REPLY.
-    reg        dc_is_store_r /* verilator public */, dc_sign_ext_r;
+    reg        dc_is_store_r, dc_sign_ext_r;
     reg        dc_plain_ld_r;   // M3b: this op is a plain load (LFB-deferrable)
     reg [1:0]  dc_size_r;
-    reg [63:0] dc_addr_r /* verilator public */;
+    reg [63:0] dc_addr_r;
     reg [2:0]  dc_dw_off_r, dc_byte_off_r;
     reg [7:0]  dc_byte_mask_r;
     reg [63:0] dc_store_data_r;
-    reg [DCACHE_INDEX_W-1:0]   dc_index_r /* verilator public */;
-    reg [DCACHE_TAG_WIDTH-1:0] dc_tag_r /* verilator public */;
+    reg [DCACHE_INDEX_W-1:0]   dc_index_r;
+    reg [DCACHE_TAG_WIDTH-1:0] dc_tag_r;
     reg        dc_ca_r;             // "this transaction touches the array"
     reg        dc_misalign_r;
     reg [GPR_IDX_WIDTH-1:0] dc_dst0_reg_r;
+    reg                     dc_dst0_frf_r;  // M5 Task 4c: mirrors dc_dst0_reg_r
     // Task 7.3: length of the in-flight LSU instruction, latched on issue
     // (1=32b,0=16b RVC); reported as lsu_rtu_ex1_inst_len at completion.
     reg                     dc_inst_len_r;
     reg  [15:0]             dc_pc_r;        // M3b Task D: PFB trainer PC tag
-    reg        dc_is_drain_r /* verilator public */;
+    reg        dc_is_drain_r;
     reg [1:0]  dc_drain_idx_r;
     reg        dc_wa_r;
     reg        dc_touched_array_r;   // did the IDLE cycle that latched this
@@ -620,10 +633,10 @@ module LSU #(
 
     // DCS-latch: captured at the DCS->{FRZ|REPLY} transition.
     reg [WAYS-1:0] dc_hit_way_r;
-    reg            dc_hit_r /* verilator public */;
+    reg            dc_hit_r;
     reg [WAYS-1:0] dc_way_vld_r, dc_way_dirty_r;
     reg [511:0]    dc_rdata_r;
-    reg            frz_is_direct_r /* verilator public */;
+    reg            frz_is_direct_r;
     // M3b: set when a SECOND op misses ST_DCS while the LFB already holds a
     // deferred load (single-entry LFB -- the slot is occupied). DCache.v's
     // dc_resp_vld is a single unscoped pulse, not tagged per-requester
@@ -683,21 +696,21 @@ module LSU #(
     // never needs a cross-entry age-ordered merge: at most one entry ever
     // exists per doubleword.
     //-------------------------------------------------------------------------
-    reg        stb_vld      [0:3] /* verilator public */;
-    reg [63:0] stb_addr     [0:3] /* verilator public */;
+    reg        stb_vld      [0:3];
+    reg [63:0] stb_addr     [0:3];
     reg [DCACHE_INDEX_W-1:0]   stb_index [0:3];
     reg [DCACHE_TAG_WIDTH-1:0] stb_tag   [0:3];
     reg [2:0]  stb_dw_off   [0:3];
-    reg [7:0]  stb_byte_vld [0:3] /* verilator public */;
-    reg [63:0] stb_data     [0:3] /* verilator public */;
+    reg [7:0]  stb_byte_vld [0:3];
+    reg [63:0] stb_data     [0:3];
     reg [WAYS-1:0] stb_way  [0:3];
-    reg        stb_was_hit  [0:3] /* verilator public */;
+    reg        stb_was_hit  [0:3];
     // Store size (0=B,1=H,2=W,3=D) per STB entry. Needed so a drained entry
     // advertises the correct AXI awsize for its direct write-back. The donor
     // C906 STB (aq_lsu_stb.v:895-901) carries stb_entryN_size per entry and
     // drives stb_awsize from it; our `issue_drain` path does not relatch
     // dc_size_r, so the store's own size would be STALE by drain time.
-    reg [2:0]  stb_size     [0:3] /* verilator public */;
+    reg [2:0]  stb_size     [0:3];
 
     wire [60:0] ag_dword       = ag_addr[63:3];
     wire        stb_m0_ag = stb_vld[0] && (stb_addr[0][63:3] == ag_dword);
@@ -1067,6 +1080,7 @@ module LSU #(
             dc_ca_r         <= 1'b0;
             dc_misalign_r   <= 1'b0;
             dc_dst0_reg_r   <= {GPR_IDX_WIDTH{1'b0}};
+            dc_dst0_frf_r   <= 1'b0;
             dc_inst_len_r   <= 1'b0;
             dc_pc_r         <= 16'd0;
             dc_is_drain_r   <= 1'b0;
@@ -1101,6 +1115,7 @@ module LSU #(
                         dc_ca_r         <= mmu_lsu_ca;
                         dc_misalign_r   <= ag_misalign;
                         dc_dst0_reg_r   <= ag_dst0_reg_eff;
+                        dc_dst0_frf_r   <= ag_dst0_frf_eff;
                         dc_inst_len_r   <= ag_inst_len_eff;
                         dc_pc_r         <= iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
                         dc_is_drain_r   <= 1'b0;
@@ -1549,6 +1564,7 @@ module LSU #(
     reg [1:0]  lfb_state    [0:LFB_DEPTH-1];
     reg [63:0] lfb_addr     [0:LFB_DEPTH-1];   // deferred load byte address
     reg [GPR_IDX_WIDTH-1:0] lfb_dst [0:LFB_DEPTH-1];
+    reg        lfb_dst_frf  [0:LFB_DEPTH-1];   // M5 Task 4c: mirrors lfb_dst
     reg [1:0]  lfb_size     [0:LFB_DEPTH-1];
     reg        lfb_sign_ext [0:LFB_DEPTH-1];
     reg [2:0]  lfb_byte_off [0:LFB_DEPTH-1];
@@ -1809,6 +1825,7 @@ module LSU #(
                 lfb_state[lfb_i]    <= E_IDLE;
                 lfb_addr[lfb_i]     <= 64'd0;
                 lfb_dst[lfb_i]      <= {GPR_IDX_WIDTH{1'b0}};
+                lfb_dst_frf[lfb_i]  <= 1'b0;
                 lfb_size[lfb_i]     <= 2'd0;
                 lfb_sign_ext[lfb_i] <= 1'b0;
                 lfb_byte_off[lfb_i] <= 3'd0;
@@ -1825,6 +1842,7 @@ module LSU #(
             if (lfb_defer_fire) begin
                 lfb_addr[lfb_tail_idx]     <= dc_addr_r;
                 lfb_dst[lfb_tail_idx]      <= dc_dst0_reg_r;
+                lfb_dst_frf[lfb_tail_idx]  <= dc_dst0_frf_r;
                 lfb_size[lfb_tail_idx]     <= dc_size_r;
                 lfb_sign_ext[lfb_tail_idx] <= dc_sign_ext_r;
                 lfb_byte_off[lfb_tail_idx] <= dc_byte_off_r;
@@ -1841,6 +1859,7 @@ module LSU #(
                 // (dst/size/offsets unused -- a prefetch drains silently).
                 lfb_addr[lfb_tail_idx]     <= {24'b0, pfb_req_pa};
                 lfb_dst[lfb_tail_idx]      <= {GPR_IDX_WIDTH{1'b0}};
+                lfb_dst_frf[lfb_tail_idx]  <= 1'b0;
                 lfb_size[lfb_tail_idx]     <= 2'd3;
                 lfb_sign_ext[lfb_tail_idx] <= 1'b0;
                 lfb_byte_off[lfb_tail_idx] <= 3'd0;
@@ -2428,6 +2447,10 @@ module LSU #(
             3'b1_10: da_final = {{32{rotated[31]}}, rotated[31:0]};
             default: da_final = rotated;
         endcase
+        // M5 Task 4c (D5): FLW NaN-boxing -- a single-precision FRF load must
+        // read back with bits[63:32] all-1s, not zero-extended (sign_ext is
+        // always 0 for FP loads, so this only ever overrides the 3'b0_10 arm).
+        if (dc_dst0_frf_r && dc_size_r == 2'b10) da_final = {32'hffff_ffff, rotated[31:0]};
     end
 
     //-------------------------------------------------------------------------
@@ -2468,6 +2491,10 @@ module LSU #(
             3'b1_10: lfb_wb_data = {{32{lfb_rotated[31]}}, lfb_rotated[31:0]};
             default: lfb_wb_data = lfb_rotated;
         endcase
+        // M5 Task 4c (D5): FLW NaN-boxing for the deferred-LFB completion
+        // path -- see da_final's matching override above.
+        if (lfb_dst_frf[lfb_head_idx] && lfb_size[lfb_head_idx] == 2'b10)
+            lfb_wb_data = {32'hffff_ffff, lfb_rotated[31:0]};
     end
     //-------------------------------------------------------------------------
     // SECTION AMO ALU (M3 Task 4) -- combinational read-modify-write compute,
@@ -2806,6 +2833,9 @@ module LSU #(
                                                       : {{32{da_final[31]}}, da_final[31:0]})
                                        : da_final));
     assign lsu_rtu_wb_preg = lfb_cmplt_fire ? lfb_dst[lfb_head_idx] : dc_dst0_reg_r;
+    // M5 Task 4c (D8): destination-register-file selector, same mux shape as
+    // lsu_rtu_wb_preg immediately above.
+    assign lsu_rtu_wb_dst_frf = lfb_cmplt_fire ? lfb_dst_frf[lfb_head_idx] : dc_dst0_frf_r;
 
     // DC-stage forward for a cache hit: the line is available combinationally
     // at ST_DCS, so forward it there (one cycle before the ST_REPLY wb).

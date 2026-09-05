@@ -748,6 +748,20 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_SH  = 20'h00305;  // cfig.h:514
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SW  = 20'h00309;  // cfig.h:515
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SD  = 20'h0030d;  // cfig.h:516
 
+// M5 Task 4 (LOAD-FP/STORE-FP): FLW/FLD/FSW/FSD FUNC values. Donor
+// aq_idu_cfig.h:511-519 -- FUNC_FLW=12'b0111_0000_1000, FUNC_FLD=
+// ..._1100, FUNC_FSW=..._1001, FUNC_FSD=..._1101 -- the functionally
+// active low-4 bits (bit0=store, bit1=sign-ext, bits[3:2]=size) already
+// match this clone's own LSU_FUNC convention bit-for-bit (W=2'b10,
+// D=2'b11, sign-ext always 0 for FP), so FLW/FLD/FSW/FSD reuse the
+// existing AG/DC/STB/LFB size/store decode unchanged. New class tag
+// 0x002xx (distinct from 0x003xx regular ld/st, 0x00bxx LR/SC, and the
+// bits[19:12]==8'h01 AMO range).
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_FLW  = 20'h00208;
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_FLD  = 20'h0020c;
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_FSW  = 20'h00209;
+parameter [FUNC_WIDTH-1:0] LSU_FUNC_FSD  = 20'h0020d;
+
 // M5 Task 2: FP instruction-encoding constants (standard RISC-V ISA-spec
 // facts, not donor implementation details -- same carve-out already used
 // for the M2/M4 CSR addresses above). fmt (inst[26:25]) selects the OP-FP

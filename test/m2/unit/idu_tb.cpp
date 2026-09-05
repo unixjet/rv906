@@ -147,10 +147,17 @@ static const uint32_t OP_LUI = 0x37, OP_AUIPC = 0x17, OP_JAL = 0x6F, OP_JALR = 0
 static const uint32_t OP_BRANCH = 0x63, OP_SYSTEM = 0x73, OP_OPIMM32 = 0x1B, OP_OP32 = 0x3B;
 static const uint32_t OP_MISCMEM = 0x0F;
 static const uint32_t OP_FP = 0x53, OP_AMO = 0x2F, OP_VEC = 0x57, OP_CUSTOM0 = 0x0B;
+static const uint32_t OP_LOAD_FP = 0x07, OP_STORE_FP = 0x27;
 // CP0 FUNC encodings (rvproc_pkg.sv CP0_FUNC_*) needed by the M4 decode checks.
 static const uint32_t CP0_FUNC_SRET   = 0x00082;
 static const uint32_t CP0_FUNC_WFI    = 0x00102;
 static const uint32_t CP0_FUNC_SFENCE = 0x00044;
+// LSU FUNC encodings (rvproc_pkg.sv LSU_FUNC_*) needed by the M5 Task 4c
+// LOAD-FP/STORE-FP decode checks.
+static const uint32_t LSU_FUNC_FLW = 0x00208;
+static const uint32_t LSU_FUNC_FLD = 0x0020c;
+static const uint32_t LSU_FUNC_FSW = 0x00209;
+static const uint32_t LSU_FUNC_FSD = 0x0020d;
 // FP FUNC bit positions (rvproc_pkg.sv FUNC_* -- bit indices, not packed
 // hex literals; consumed via idu_fpu_ex1_func[FUNC_X]-style tests in FPU.v).
 static const uint32_t FUNC_DOUBLE_BIT   = 16;
@@ -226,6 +233,11 @@ static uint32_t fsgnjn_d(void) { return enc_r(0x11, 2, 1, 0x1, 5, OP_FP); }
 static uint32_t fsgnjx_d(void) { return enc_r(0x11, 2, 1, 0x2, 5, OP_FP); }
 static uint32_t fcvt_s_d(uint32_t rm) { return enc_r(0x20, 1, 1, rm, 5, OP_FP); }
 static uint32_t fcvt_d_s(uint32_t rm) { return enc_r(0x21, 0, 1, rm, 5, OP_FP); }
+// M5 Task 4c: LOAD-FP/STORE-FP (I-type for loads, S-type for stores).
+static uint32_t flw_(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x2, rd, OP_LOAD_FP); }
+static uint32_t fld_(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x3, rd, OP_LOAD_FP); }
+static uint32_t fsw_(uint32_t rs2, uint32_t rs1, int32_t imm) { return enc_s(imm, rs2, rs1, 0x2, OP_STORE_FP); }
+static uint32_t fsd_(uint32_t rs2, uint32_t rs1, int32_t imm) { return enc_s(imm, rs2, rs1, 0x3, OP_STORE_FP); }
 static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
 static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
 
@@ -670,6 +682,65 @@ static void test_fp_arith_sgnj_cvt_decode(void) {
     test_result("T10d OP-FP add/sub/minmax/sgnj/f2f-convert decode (M5 Task 4b): func bits + rm + FRF dst0_reg correct, dead-wired pre-Task-9");
 }
 
+// ---- M5 Task 4c: LOAD-FP/STORE-FP decode (D8: reuses EU_LSU, dst0_frf/
+// src2_frf mark the FRF side instead of the GPR dst0_vld/src2_vld path).
+// Still illegal-gated pre-swap like the other OP-FP arms. ----
+static void test_fp_ldst_decode(void) {
+    reset_dut();
+    write_gpr(1, 0x2000);
+    present(flw_(5, 1, 8)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_sel == 0, "flw: lsu_sel does NOT fire yet -- illegal-gated (dis_eu_final forces EU_CP0 on d32_illegal=1), matches the OP-FP dead-wired-pre-Task-9 pattern");
+    check(dut->idu_lsu_ex1_func == LSU_FUNC_FLW, "flw: func == LSU_FUNC_FLW");
+    check(dut->idu_lsu_ex1_src0_data == 0x2000, "flw: src0=x1(base)");
+    check(dut->idu_lsu_ex1_src1_data == 8, "flw: src1=imm(offset)=8");
+    check(dut->idu_lsu_ex1_dst0_reg == 5, "flw: dst0_reg==rd (FRF index, shares the bus)");
+    check(dut->idu_lsu_ex1_dst0_frf == 1, "flw: dst0_frf==1 (D8 selector, not a GPR dest)");
+    check(dut->idu_cp0_ex1_illegal == 1, "flw: illegal pre-swap (misa.F/D=0, D11)");
+
+    reset_dut();
+    write_gpr(1, 0x3000);
+    present(fld_(6, 1, 16)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_func == LSU_FUNC_FLD, "fld: func == LSU_FUNC_FLD");
+    check(dut->idu_lsu_ex1_dst0_reg == 6, "fld: dst0_reg==rd");
+    check(dut->idu_lsu_ex1_dst0_frf == 1, "fld: dst0_frf==1");
+    check(dut->idu_cp0_ex1_illegal == 1, "fld: illegal pre-swap");
+
+    reset_dut();
+    write_gpr(1, 0x4000);
+    write_frf(2, 0x40091EB851EB851FULL); // 3.14 as a double bit pattern, held in f2
+    present(fsw_(2, 1, 4)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_func == LSU_FUNC_FSW, "fsw: func == LSU_FUNC_FSW");
+    check(dut->idu_lsu_ex1_src0_data == 0x4000, "fsw: src0=x1(base)");
+    check(dut->idu_lsu_ex1_src1_data == 4, "fsw: src1=imm(offset)=4");
+    check(dut->idu_lsu_ex1_src2_data == 0x40091EB851EB851FULL,
+          "fsw: src2=f2 (FRF store-data, NOT a GPR read despite sharing rs2 field encoding)",
+          dut->idu_lsu_ex1_src2_data, 0x40091EB851EB851FULL);
+    check(dut->idu_cp0_ex1_illegal == 1, "fsw: illegal pre-swap");
+
+    reset_dut();
+    write_gpr(1, 0x5000);
+    write_frf(3, 0xCAFEBABEDEADBEEFULL);
+    present(fsd_(3, 1, 24)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_func == LSU_FUNC_FSD, "fsd: func == LSU_FUNC_FSD");
+    check(dut->idu_lsu_ex1_src2_data == 0xCAFEBABEDEADBEEFULL,
+          "fsd: src2=f3 (FRF store-data)", dut->idu_lsu_ex1_src2_data, 0xCAFEBABEDEADBEEFULL);
+    check(dut->idu_cp0_ex1_illegal == 1, "fsd: illegal pre-swap");
+
+    // A GPR write to the SAME numeric index as the FRF source register must
+    // NOT leak into the FSW/FSD store-data slot -- confirms src2_frf really
+    // overrides the GPR read path rather than merely coexisting with it.
+    reset_dut();
+    write_gpr(1, 0x6000);
+    write_gpr(4, 0xBADBADBADULL);   // x4, same numeric index as f4 below
+    write_frf(4, 0x1122334455667788ULL);
+    present(fsd_(4, 1, 0)); tick(); present(0, false);
+    check(dut->idu_lsu_ex1_src2_data == 0x1122334455667788ULL,
+          "fsd: src2 reads f4, not the numerically-aliased x4 GPR value",
+          dut->idu_lsu_ex1_src2_data, 0x1122334455667788ULL);
+
+    test_result("T10e LOAD-FP/STORE-FP decode (M5 Task 4c): D8 EU_LSU reuse, dst0_frf/src2_frf route correctly, dead-wired pre-Task-9");
+}
+
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
 static void test_rvc_pairs(void) {
     reset_dut();
@@ -1049,6 +1120,7 @@ int main(int argc, char **argv) {
     test_fetch_fault_forces_cp0();
     test_fp_cmp_class_decode();
     test_fp_arith_sgnj_cvt_decode();
+    test_fp_ldst_decode();
     test_rvc_pairs();
     test_rvc_illegal();
 

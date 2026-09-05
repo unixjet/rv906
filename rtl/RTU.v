@@ -249,6 +249,10 @@ module RTU (
     input  wire [63:0]              lsu_rtu_wb_data,
     input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     input  wire                     lsu_rtu_wb_vld,
+    // M5 Task 4c (D8): FRF/GPR destination selector riding alongside the
+    // lsu_rtu_wb_* payload above -- 1 = FLW/FLD completion (route to wbf1
+    // below, NOT wb1/GPR).
+    input  wire                     lsu_rtu_wb_dst_frf,
     input  wire [63:0]              lsu_rtu_ex2_data,
     input  wire                     lsu_rtu_ex2_data_vld,
     input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_ex2_dest_reg,
@@ -343,11 +347,18 @@ module RTU (
     output wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg,
     output wire                     rtu_idu_wb1_vld,
     // M5 Task 4b: FRF writeback, registered one cycle behind EX1 like wb0
-    // (design doc S7.3). wbf1 stays reserved/tied-off (future LSU-FRF path,
-    // "Task 4c") -- FALU is the only wbf0 producer today.
+    // (design doc S7.3). FALU is the only wbf0 producer today.
     output wire [63:0]              rtu_idu_wbf0_data,
     output wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf0_reg,
     output wire                     rtu_idu_wbf0_vld,
+    // M5 Task 4c (D8): FRF's LSU-writeback port -- a PURE combinational
+    // passthrough of lsu_rtu_wb_* (gated to FRF-destined completions), same
+    // shape/timing as wb1's own GPR passthrough immediately above (LSU's own
+    // internal pipeline latency already produces the value at the correct
+    // write-back cycle -- no extra register stage needed here).
+    output wire [63:0]              rtu_idu_wbf1_data,
+    output wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf1_reg,
+    output wire                     rtu_idu_wbf1_vld,
     output wire                     rtu_idu_flush_fe,
     output wire                     rtu_idu_flush_stall,
     output wire                     rtu_idu_flush_wbt,
@@ -933,9 +944,17 @@ module RTU (
     assign rtu_idu_wb0_reg  = wb0_preg_r;
     assign rtu_idu_wb0_data = wb0_data_r;
 
-    assign rtu_idu_wb1_vld  = lsu_rtu_wb_vld;
+    // M5 Task 4c (D8): gated !lsu_rtu_wb_dst_frf -- an FLW/FLD completion
+    // must NOT write the GPR file (its dst0_reg index was never allocated in
+    // the GPR scoreboard -- IDU.v leaves dis_dst0_vld=0 for these, see
+    // rv906's own FRF-destination note there). Route it to wbf1 instead.
+    assign rtu_idu_wb1_vld  = lsu_rtu_wb_vld && !lsu_rtu_wb_dst_frf;
     assign rtu_idu_wb1_reg  = lsu_rtu_wb_preg;
     assign rtu_idu_wb1_data = lsu_rtu_wb_data;
+
+    assign rtu_idu_wbf1_vld  = lsu_rtu_wb_vld && lsu_rtu_wb_dst_frf;
+    assign rtu_idu_wbf1_reg  = lsu_rtu_wb_preg;
+    assign rtu_idu_wbf1_data = lsu_rtu_wb_data;
 
     // ---- wbf0 (M5 Task 4b): FRF write port, registered ONE cycle behind
     // the EX1-cycle FALU producer -- same single register stage as wb0
