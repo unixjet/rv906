@@ -408,9 +408,28 @@ module RTU (
     // the completing EU (donor aq_rtu_dp.v:350-379). ALU/BJU/LSU/CP0 carry
     // real RVC-aware lengths; MULT/DIV/VEC are 32-bit-only in M2 (no 16-bit
     // form in the RVC decoder) so they fall to the 1'b1 default.
+    //
+    // The select vector MUST be the same early/late flavor as the pcgen
+    // TRIGGER (dp_ex1_cmplt_for_pcgen) above, not the retire-late
+    // dp_cmplt_source: an LSU op's for-pcgen arm fires while its `_dp` is
+    // still several cycles away (line 391-392), and a PARKED bju fires
+    // for-pcgen at entry-creation but `_dp`/bju_resolves_now only at pop
+    // (IU.v iu_rtu_ex1_bju_cmplt_for_pcgen note). On those cycles every
+    // `_dp` bit is 0, so selecting on dp_cmplt_source fell to the
+    // `default` 32-bit assumption even for a 16-bit RVC completer,
+    // advancing bju_pcgen_pc by 4 instead of 2 -- a permanent pcgen/retire
+    // desync (the same self-drift class as IU.v's Task 7.3 note) that
+    // eventually redirects a later branch to a wrong, sometimes
+    // self-referential target (found chasing the rv64ui-v-simple hang:
+    // HBDBG showed the LSU fully idle while IFU relooped forever on one
+    // PC, hit=1/pf=0 every fetch -- i.e. the front end, not the LSU, had
+    // desynced).
+    wire [6:0] pcgen_len_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_for_pcgen,
+                                    ex1_div_cmplt_dp, ex1_lsu_cmplt_for_pcgen, ex1_cp0_cmplt_dp,
+                                    ex1_vec_cmplt_dp};
     reg rtu_iu_ex1_inst_len_r;
     always @* begin
-        case (dp_cmplt_source)
+        case (pcgen_len_source)
             CBUS_ALU_SEL: rtu_iu_ex1_inst_len_r = iu_rtu_ex1_alu_inst_len;
             CBUS_BJU_SEL: rtu_iu_ex1_inst_len_r = iu_rtu_ex1_bju_inst_len;
             CBUS_LSU_SEL: rtu_iu_ex1_inst_len_r = lsu_rtu_ex1_inst_len;
@@ -593,8 +612,11 @@ module RTU (
     wire ex1_cp0_fetch_fault = ex1_cp0_cmplt_dp
                             && (cp0_rtu_ex1_expt_vec == CAUSE_FETCH_PAGE_FAULT
                              || cp0_rtu_ex1_expt_vec == CAUSE_FETCH_ACCESS);
+    // Sign-extend (not zero-extend): a kernel-space fetch fault's tval must
+    // equal the faulting PC's canonical VA, same defect class as IU.v's
+    // iu_ifu_tar_pc/ag_rs1_live/bju_wb_data.
     wire [63:0] ex1_tval = ex1_lsu_cmplt_dp   ? lsu_rtu_tval
-                          : ex1_cp0_fetch_fault ? {{(64-PC_WIDTH){1'b0}}, iu_rtu_ex1_cur_pc}
+                          : ex1_cp0_fetch_fault ? {{(64-PC_WIDTH){iu_rtu_ex1_cur_pc[PC_WIDTH-1]}}, iu_rtu_ex1_cur_pc}
                           :                       64'd0;   // CP0 has no other tval port, see header
 
     reg        ex2_retire_vld;
