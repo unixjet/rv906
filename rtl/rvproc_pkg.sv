@@ -321,6 +321,13 @@ parameter [11:0] CSR_TDATA2     = 12'h7A2;
 parameter [11:0] CSR_TDATA3     = 12'h7A3;
 parameter [11:0] CSR_TCONTROL   = 12'h7A5;
 
+// M5 Task 1: user-level floating-point CSRs (standard RISC-V unprivileged
+// ISA addresses; donor confirms the same numbers, aq_cp0_regs.v FFLAGS/FRM/
+// FCSR case arms).
+parameter [11:0] CSR_FFLAGS     = 12'h001;
+parameter [11:0] CSR_FRM        = 12'h002;
+parameter [11:0] CSR_FCSR       = 12'h003;
+
 // mstatus / sstatus bit positions (privileged ISA standard layout; donor
 // aq_cp0_trap_csr.v:486-494). RV64: SD=63, MBE/SBE=37/36 (tied 0), SXL/UXL
 // =35:34/33:32 (RO 2'b10), TSR=22, TW=21, TVM=20, MXR=19, SUM=18, MPRV=17,

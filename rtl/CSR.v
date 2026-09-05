@@ -632,14 +632,23 @@ module CSR #(
         end
     end
 
-    // FS: M4 keeps it storage-only (no FPU until M5); writes accepted so
-    // software (rv64si-p-csr sets FS via mstatus) behaves, reads back.
+    // FS: M4 kept it storage-only; M5 Task 1 adds the real Clean/Initial->
+    // Dirty auto-transition (donor aq_cp0_trap_csr.v:571-583) on top of the
+    // pre-existing software-write path. An explicit mstatus/sstatus write
+    // takes priority over the dirty update (same order as the donor's own
+    // if-elsif chain at :575-580). `fs_dirty_upd` (SECTION FP CSR STATE
+    // below) is a forward reference -- this file already forward-
+    // references wires declared later (e.g. csr_wdata itself, defined at
+    // the RMW mux far below but consumed here), so this is not a new
+    // pattern.
     reg [1:0] fs_field;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             fs_field <= 2'b00;
         else if (mstatus_wr)
             fs_field <= csr_wdata[MSTATUS_FS_HI:MSTATUS_FS_LO];
+        else if (fs_dirty_upd)
+            fs_field <= 2'b11;
     end
     wire sd_bit = (fs_field == 2'b11);
 
@@ -1190,6 +1199,57 @@ module CSR #(
                                mhint_amr, mhint_dcache_pref_en, 2'b0};
 
     //=========================================================================
+    // SECTION FP CSR STATE (M5 Task 1). fflags(0x001)/frm(0x002)/fcsr(0x003)
+    // storage, donor aq_cp0_float_csr.v:220-268: an fcsr write updates BOTH
+    // frm[7:5] and fflags[4:0] at once (its own `fcsr_local_en` arm in each
+    // register's always block); a direct fflags/frm write touches only its
+    // own field. rv906 drops the donor's T-Head vxrm/vxsat/fxcr vector-
+    // extension bits (no vector extension) -- fcsr's bits [10:8] stay 0
+    // unlike the donor's non-zero vxrm/vxsat, otherwise the standard
+    // (non-T-Head) fcsr encoding {frm[7:5], fflags[4:0]}. FS-off illegal
+    // gating (SECTION EX1 COMPLETION's csr_access_illegal, donor
+    // aq_cp0_regs.v:1101-1104) and the dirty-on-FP-CSR-write transition
+    // (`fs_dirty_upd` below, consumed by SECTION MSTATUS's fs_field always
+    // block; donor aq_cp0_trap_csr.v:562-569) are both wired here. The
+    // FP-instruction-retire OR-term (donor's `rtu_cp0_fs_dirty_updt`) is
+    // added at Task 4/8 once FP opcodes exist; today only an explicit CSR
+    // write can dirty FS.
+    //=========================================================================
+    reg [4:0] fflags_reg;
+    reg [2:0] frm_reg;
+    wire fflags_local_en = csr_wen && (csr_addr == CSR_FFLAGS);
+    wire frm_local_en    = csr_wen && (csr_addr == CSR_FRM);
+    wire fcsr_local_en   = csr_wen && (csr_addr == CSR_FCSR);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            fflags_reg <= 5'b0;
+        else if (fcsr_local_en)
+            fflags_reg <= csr_wdata[4:0];
+        else if (fflags_local_en)
+            fflags_reg <= csr_wdata[4:0];
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            frm_reg <= 3'b0;
+        else if (fcsr_local_en)
+            frm_reg <= csr_wdata[7:5];
+        else if (frm_local_en)
+            frm_reg <= csr_wdata[2:0];
+    end
+
+    wire [63:0] fflags_value = {59'b0, fflags_reg};
+    wire [63:0] frm_value    = {61'b0, frm_reg};
+    wire [63:0] fcsr_value   = {56'b0, frm_reg, fflags_reg};
+
+    // Clean/Initial -> Dirty on any FP-CSR write (donor fs_dirty_upd,
+    // aq_cp0_trap_csr.v:562-569); Off(00) and already-Dirty(11) are excluded
+    // exactly as the donor excludes them.
+    wire fs_dirty_upd = (fflags_local_en || frm_local_en || fcsr_local_en)
+                     && (fs_field == 2'b01 || fs_field == 2'b10);
+
+    //=========================================================================
     // SECTION READ MUX -- the generic address-decoded read bus every RMW
     // (and every plain CSR read) goes through (CP0 note B1's "hybrid" bus).
     // Unimplemented addresses read 0 -- IDU (Task 5) is the one that must
@@ -1239,6 +1299,9 @@ module CSR #(
             CSR_MXSTATUS:   csr_read_mux = mxstatus_value;
             CSR_MHCR:       csr_read_mux = mhcr_value;
             CSR_MHINT:      csr_read_mux = mhint_value;
+            CSR_FFLAGS:     csr_read_mux = fflags_value;
+            CSR_FRM:        csr_read_mux = frm_value;
+            CSR_FCSR:       csr_read_mux = fcsr_value;
             default:        csr_read_mux = 64'd0;
         endcase
     endfunction
@@ -1329,7 +1392,14 @@ module CSR #(
     wire csr_ro_write = is_csr_op && (csr_addr[11:10] == 2'b11) && csr_wen_raw;
     wire satp_tvm_illegal = is_csr_op && (csr_addr == CSR_SATP)
                           && (pm_r == PRIV_S) && tvm_f;
-    wire csr_access_illegal = csr_priv_bad || csr_ro_write || satp_tvm_illegal;
+    // M5 Task 1: fflags/frm/fcsr access with mstatus.FS==Off is illegal
+    // (donor aq_cp0_regs.v:1101-1104, `regs_imm_inv = regs_fs_off` grouped
+    // identically for all three addresses).
+    wire csr_fp_addr = (csr_addr == CSR_FFLAGS) || (csr_addr == CSR_FRM)
+                     || (csr_addr == CSR_FCSR);
+    wire csr_fp_illegal = is_csr_op && csr_fp_addr && (fs_field == 2'b00);
+    wire csr_access_illegal = csr_priv_bad || csr_ro_write || satp_tvm_illegal
+                            || csr_fp_illegal;
 
     // Per-privilege ecall cause (U=8, S=9, M=11).
     wire [4:0] ecall_vec = (pm_r == PRIV_M) ? CAUSE_MACHINE_ECALL
