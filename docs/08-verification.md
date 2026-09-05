@@ -1,4 +1,4 @@
-// 8 Verification gates (M3b complete)
+// 8 Verification gates (M4 complete)
 
 ## §8.14 M3b full LSU acceptance (§7.4 "Complete LSU")
 
@@ -60,3 +60,90 @@ bash /tmp/run_atomic.sh                           # PASS=19 FAIL=0
 ---
 
 **Verification log (this session):** `git status` shows clean working tree after committing all Task F changes. All gates verified green in the preceding commands. M3b fully implemented and tested.
+
+## §8.15 M4 privilege + MMU + PMP acceptance (§7.4 "privilege complete + MMU + PMP + counter CSRs")
+
+After implementing the privilege machine (M/S/U + delegation + counters),
+the 128-entry Sv39 MMU + hardware PTW, and the 8-entry PMP (Tasks 0–9),
+verify against the following two-sided gate chain: the pre-M4 battery
+must stay bit-identical MMU-off (the OFF path, G1), and the new
+privilege/VM suites must pass MMU-on (the ON path).
+
+### Gate chain (must pass all):
+
+```bash
+# 1. Clean Verilog build
+make verisim 2>&1 | grep -icE "%error|error:"        # should be 0
+
+# 2. Unit suite (csr_tb/mmu_tb/lsu_tb privilege + TLB + PTW + servant rows)
+make -C test/m2/unit run                              # UNIT-SUITE-PASS
+
+# --- OFF path (G1): identical to the pre-M4 baseline, satp=0 reset ---
+# 3. Full regression sweep
+bash test/m2/run_all.sh                               # 86/87 (only documented rv64ui-p-ma_data)
+# 4. Atomic operation tests
+bash /tmp/run_atomic.sh                               # PASS=19 FAIL=0
+# 5. Full v-suite (identity-mapped, MMU-off)
+bash /tmp/run_vsuite_full.sh                          # 85/86 (only documented rv64ui-v-ma_data)
+
+# --- ON path: real Sv39 translation, satp=Sv39 ---
+# 6. Directed si/mi/mmu suite
+bash test/m4/run_directed.sh                          # SI+MI+MMU: PASS=30 FAIL=0
+# 7. Full v-suite under real translation
+#   (iterate build/rv64ui-v-*.elf build/rv64um-v-*.elf build/rv64ua-v-*.elf
+#    through bin/verisim/testbench --print-result, same runner shape as
+#    run_directed.sh)
+```
+
+### Expected results (green = pass, red = known failure):
+
+| Test suite                          | Pass | Fail | Notes                                    |
+|--------------------------------------|------|------|-------------------------------------------|
+| `make verisim`                       | 0 errors | — | No new Verilator warnings                |
+| Unit suite                           | PASS | —    | csr_tb/mmu_tb/lsu_tb privilege+TLB+PTW rows |
+| Sweep (OFF path)                     | 86   | 1    | `rv64ui-p-ma_data` documented              |
+| RV64U atomic (OFF path)              | 19   | 0    | Bit-identical to pre-M4 baseline           |
+| v-suite (OFF path, MMU-off)          | 85   | 1    | `rv64ui-v-ma_data` documented              |
+| rv64si-p (ON path)                   | 7    | 0    | csr/dirty/icache-alias/ma_fetch/scall/sbreak/wfi |
+| rv64mi-p (ON path)                   | 17   | 0    | incl. pmpaddr, instret_overflow, breakpoint (no-triggers escape) |
+| Directed mmu set (ON path)           | 6    | 0    | ptwalk/pmp/pmpstore/misalign/ldst_samepage/amo |
+| v-suite (ON path, real Sv39)         | 85   | 1    | Same `rv64ui-v-ma_data` deviation under translation |
+
+### Directed-test coverage (M4-specific):
+
+| Test / row                        | Scenario                                                        |
+|------------------------------------|-------------------------------------------------------------------|
+| mmu_ptwalk                         | 3-level walk incl. superpage leaves, PTE-in-D$ coherence          |
+| mmu_pmp / mmu_pmpstore              | PMP deny on fetch/load/store; STB/LFB drain race (found here)     |
+| mmu_misalign                       | Misaligned access under active translation                        |
+| mmu_ldst_samepage                  | Load+store to the same translated page, no false miss             |
+| mmu_amo                            | AMO under Sv39 (found the double-dispatch race, see LSU §M4)      |
+| rv64si-p-dirty                     | Software A/D (no HW update); D-M4-1 store/AMO/SC-fault-on-D=0     |
+| rv64si-p-wfi / rv64mi-p-illegal    | TW/TVM/TSR trap arms; WFI flushing no-op (D-M4-7)                  |
+| rv64mi-p-pmpaddr                   | PMP WARL/NAPOT-readback conformance (no deviation needed, N §…)   |
+| rv64mi-p-breakpoint                | No-triggers escape (real tselect/tdata1/tdata2/tcontrol, D-M4-5)  |
+| rv64mi-p-instret_overflow          | Write-suppresses-increment minstret semantics                     |
+
+### Known deviations (documented, full ledger in the M4 design doc §2.3):
+
+- D-M4-1: D-bit check enabled for stores/AMO/SC (donor has it commented out).
+- D-M4-2: MAEE dropped — PMA always from rv906's own sysmap-style table.
+- D-M4-4/D11: single 128-entry fully-associative flop TLB (no uTLB/jTLB split).
+- D-M4-5/D12: T-Head SMIR/SMEL/SMEH/SMCIR + tlbp/tlbr/tlbwi/tlbwr dropped.
+- D-M4-6: sfence.vma over-invalidates (whole TLB for every flavor).
+- D-M4-7: WFI is a flushing no-op until M6's interrupt path exists.
+- D-M4-8: NA4 stays dead (donor ties it 0 too).
+- D-M4-9: `time` CSR (0xC01) deferred to M6/CLINT.
+- D-M4-11: "THE SWAP" (Task 8) closed by construction — CSR.v's privilege
+  decode was live from Task 1 onward, so G1 was satisfied continuously by
+  every task's gate run rather than by one flip commit.
+
+---
+
+**Verification log (this session):** working tree clean after the Task
+0–9 commits; the full gate chain above (unit suite, 86/87 sweep, 19/19
+atomics, 85/86 OFF-path v-suite, 30/30 directed si+mi+mmu, 85/86 ON-path
+v-suite under real Sv39 translation) was re-run and confirmed green from
+a clean rebuild, bit-identical to the pre-M4 baseline on the OFF path.
+M4 fully implemented and tested; §7.4's M4 acceptance criteria
+("rv64si/mi + vm tests pass") are met.

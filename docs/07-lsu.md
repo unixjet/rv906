@@ -130,6 +130,54 @@ No explicit ownership-tag register is needed; mutual exclusion relies on the thr
 - `cp0_lsu_dcache_pref_en` / `pref_dist`: PFB controls (CSR 0x7C5 bits 2, [14:13]).
 - `cp0_lsu_amr`: AMR threshold control (CSR 0x7C5 bits [4:3]).
 
+## MMU / PTW integration (M4)
+
+M4 adds Sv39 translation ahead of the D-cache path without disturbing any
+of the non-blocking structures above. Three additions:
+
+### AG wait-state (`ag_wait_r`)
+
+The AG stage still consumes the MMU's translation combinationally on the
+dispatch cycle when it hits (`mmu_lsu_pa_vld=1` same-cycle) — bit-identical
+to the pre-M4 OFF path. On a DTLB miss (`pa_vld=0`), a single flop
+`ag_wait_r` sets, `lsu_idu_full` holds the op in IDU's EX1, and issue
+resumes the instant the walk lands (`ag_wait_r && mmu_lsu_pa_vld`).
+
+Detecting a *fresh* miss entry needs an ungated "an LSU op is live in EX1
+right now" signal (`ag_raw_ready`, fed by IDU's `idu_lsu_ex1_raw_vld`) —
+using the existing, `!lsu_idu_full`-gated `idu_lsu_ex1_sel` here would
+close a combinational loop (full → wait detection → sel → full).
+`lsu_mmu_va_vld` uses `ag_raw_ready || ag_wait_r` (not `ag_valid ||
+ag_wait_r`) to keep the MMU request level-valid through the walk, mirroring
+ICache's existing request-hold pattern.
+
+### PTW memory servant
+
+The hardware page-table walker (`rtl/MMU.v`) has no private memory port —
+it walks through the LSU exactly like a demand load: `mmu_lsu_data_req`
+arbitrates into the D-cache pipe at lowest priority, probing the D-cache
+array first (page tables are written by cacheable stores, so a PTE line
+can be dirty in the cache at walk time — a bus-only walker would read
+stale PTEs) and falling through to the bus otherwise. A walk only starts
+once the STB has fully drained (`!any_stb_vld`), which is also why
+sfence.vma waits for STB quiescence before invalidating: a drained STB
+makes the array-only probe coherent without needing STB forwarding. Single
+outstanding walk, no interaction with the LFB/VB/PFB machinery above.
+
+### MPRV-resolved data-channel privilege
+
+PMP's M-mode bypass must use the MPRV-resolved privilege for explicit data
+accesses (donor `aq_pmp_acc.v:118-119`), never for fetches. `MMU.v` derives
+`mmu_pmp_data_priv_mode` (from `ptw_priv_mode` during a PTW-issued check,
+else `lsu_mmu_priv_mode`) and feeds it to `PMP.v`'s new `data_priv_mode`
+input, kept separate from `priv_mode` (fetch-only).
+
+### AMO/SC store-classification (D-M4-1)
+
+`lsu_mmu_st_inst` also covers AMO/SC (`ag_is_store || ag_is_amo_c ||
+ag_is_sc_c`): an AMO/SC to a D=0 PTE must fault the D-bit walker check
+exactly like a plain store, since it writes the line too.
+
 ## Test coverage (lsu_tb.cpp T1–T13)
 
 | Test | Scenario                                          | Validation                         |
@@ -150,4 +198,5 @@ Full acceptance gates passed: `make verisim` clean, unit suite UNIT-SUITE-PASS, 
 
 **References:** 
 - Plan: `docs/plans/2026-08-31-m3b-full-lsu.md` (task breakdown, donor file mappings)
-- Verification: `docs/08-verification.md` (§8.14 M3b acceptance criteria)
+- Verification: `docs/08-verification.md` (§8.14 M3b acceptance criteria, §8.15 M4 acceptance criteria)
+- M4 design: `docs/superpowers/specs/2026-08-31-m4-priv-mmu-pmp-design.md` (D1/D3 — AG wait-state, PTW servant)

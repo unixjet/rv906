@@ -1,8 +1,10 @@
 # M4: Privilege (M/S/U) + Sv39 MMU + PMP — Design
 
 Date: 2026-08-31
-Status: Approved (plan: `~/.claude/plans/composed-waddling-unicorn.md`;
-this doc graduates it into the project spec set)
+Status: **COMPLETE** (Tasks 0–10 all committed and gated green; see §8
+close-out below). Originally approved (plan:
+`~/.claude/plans/composed-waddling-unicorn.md`; this doc graduated it
+into the project spec set).
 Parent: `2026-08-20-rv906-c906-clone-design.md` §7.4 row M4: *"privilege
 complete + MMU (jTLB, PTW, sv39) + PMP + counter CSRs"*, acceptance
 *"rv64si/mi + vm tests pass"*.
@@ -280,3 +282,40 @@ twin of rv12's MED-5).
 - **Cycle-count identity at G1**: none of tasks 1–8 is expected to move
   the OFF-path instruction counts; measure at the swap commit and compare
   against the parent.
+
+## 8. Close-out (Task 10)
+
+All ten tasks landed (commits `1e47c25`..`3633e17`, plus four follow-on
+directed-debug fixes found while bringing the ON path up: the
+`rv64si-p-dirty` AG-wait snapshot-latch hang, the JALR-target-LSB clear,
+the sfence.vma same-cycle done-pulse race, and — found only once Task 5's
+directed set exercised real concurrent traffic — the LSU entry-cycle race
++ AMO/SC store-classification + STB/LFB drain race + MPRV data-priv fix
+bundle, plus the parked-entry BHT mispredict self-correction (`aq_iu_
+bju.v:687-707`, previously deferred as "out of scope") and a family of
+sign-extension fixes for every kernel-space PC value crossing a
+`PC_WIDTH`→64b boundary — CSR read values, BJU redirect/link targets, and
+fetch-fault `tval`, all the same defect class first found on
+`iu_ifu_tar_pc`).
+
+**Two-sided acceptance, both sides green:**
+- **OFF path (G1):** unit suite PASS; sweep 86/87 (`rv64ui-p-ma_data`
+  documented); atomics 19/19; full v-suite 85/86 (`rv64ui-v-ma_data`
+  documented) — all bit-identical to the pre-M4 (M3b) baseline, confirmed
+  by a clean rebuild + full re-run after every commit in this milestone.
+- **ON path:** rv64si-p 7/7; rv64mi-p 17/17; directed mmu set (ptwalk/pmp/
+  pmpstore/misalign/ldst_samepage/amo) 6/6; full v-suite under real Sv39
+  translation 85/86 (same documented `rv64ui-v-ma_data` deviation, i.e.
+  the MMU introduces no new failures under translation).
+
+Full gate detail and commands: `docs/08-verification.md` §8.15.
+
+§7.4's M4 pass criterion — *"rv64si/mi + vm tests pass"* — is met. No
+open items remain from §7 "Risks / open points": the trap-PC mux timing,
+the MPP WARL probe, the v-env tohost uncached-megapage treatment, and
+minstret write-precedence all passed on first bring-up of their
+respective directed/upstream tests; no OFF-path cycle-count drift was
+observed at any task boundary.
+
+Next milestone: **M5** (scalar FPU, F/D + half-precision transfers),
+per §7.4 of the parent design doc.
