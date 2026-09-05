@@ -151,6 +151,14 @@ static const uint32_t OP_FP = 0x53, OP_AMO = 0x2F, OP_VEC = 0x57, OP_CUSTOM0 = 0
 static const uint32_t CP0_FUNC_SRET   = 0x00082;
 static const uint32_t CP0_FUNC_WFI    = 0x00102;
 static const uint32_t CP0_FUNC_SFENCE = 0x00044;
+// FP FUNC bit positions (rvproc_pkg.sv FUNC_* -- bit indices, not packed
+// hex literals; consumed via idu_fpu_ex1_func[FUNC_X]-style tests in FPU.v).
+static const uint32_t FUNC_DOUBLE_BIT   = 16;
+static const uint32_t FUNC_CLASS_BIT    = 18;
+static const uint32_t FUNC_CMP_BIT      = 10;
+static const uint32_t FUNC_CMP_LE_BIT   = 2;
+static const uint32_t FUNC_CMP_LT_BIT   = 1;
+static const uint32_t FUNC_CMP_FEQ_BIT  = 0;
 
 static uint32_t addi(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x0, rd, OP_OPIMM); }
 static uint32_t add_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x00, rs2, rs1, 0x0, rd, OP_OP); }
@@ -177,6 +185,16 @@ static uint32_t sfence_vma_(void) { return enc_r(0x09, 0, 0, 0x0, 0, OP_SYSTEM);
 static uint32_t famo_add_w(void) { return enc_r(0x00, 6, 1, 0x2, 5, OP_AMO); } // amoadd.w x5,x6,(x1)
 static uint32_t famo_reserved_w(void) { return enc_r(0x14, 6, 1, 0x2, 5, OP_AMO); } // funct5=00101 (reserved)
 static uint32_t fp_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_FP); }
+// M5 Task 4a: OP-FP compare/classify (feq/flt/fle.s/d, fclass.s/d) --
+// rd=5, rs1=1, rs2=2 (rs2=0 for fclass, RISC-V spec: unused operand field).
+static uint32_t feq_s(void) { return enc_r(0x50, 2, 1, 0x2, 5, OP_FP); }
+static uint32_t flt_s(void) { return enc_r(0x50, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fle_s(void) { return enc_r(0x50, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t feq_d(void) { return enc_r(0x51, 2, 1, 0x2, 5, OP_FP); }
+static uint32_t flt_d(void) { return enc_r(0x51, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fle_d(void) { return enc_r(0x51, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t fclass_s(void) { return enc_r(0x70, 0, 1, 0x1, 5, OP_FP); }
+static uint32_t fclass_d(void) { return enc_r(0x71, 0, 1, 0x1, 5, OP_FP); }
 static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
 static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
 
@@ -436,6 +454,76 @@ static void test_fetch_fault_forces_cp0(void) {
     check(dut->idu_cp0_ex1_fetch_accflt == 1, "fetch accflt: idu_cp0_ex1_fetch_accflt latched into EX1");
     check(dut->idu_cp0_ex1_fetch_pgflt == 0, "fetch accflt: pgflt stays clear");
     test_result("T10b fetch-fault channel: ifu_idu_id_fault_{pgflt,accflt} force EU_CP0 dispatch and latch through EX1");
+}
+
+// ---- M5 Task 4a: OP-FP compare/classify decode arms. Hardwired illegal
+// (misa.F/D=0 pre-swap) means dis_eu_final forces EU_CP0 dispatch for all
+// of these -- fadd_sel/fspu_sel/fcnvt_sel (gated on ex1_eu_r[EU_FP_SEL])
+// must stay 0 even though the func bits decode correctly (ex1_func_r is
+// NOT illegal-gated, unlike ex1_eu_r -- see IDU.v dis_eu_final). ----
+static void test_fp_cmp_class_decode(void) {
+    reset_dut();
+    present(feq_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1,
+          "feq.s: illegal pre-swap, dispatches to CP0");
+    check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_FEQ_BIT) & 1) == 1,
+          "feq.s: FUNC_CMP+FUNC_CMP_FEQ bits set despite illegal gating");
+    check(dut->idu_fpu_ex1_fadd_sel == 0 && dut->idu_fpu_ex1_fspu_sel == 0,
+          "feq.s: fadd_sel/fspu_sel stay 0 (ex1_eu_r forced to EU_CP0, not EU_FP)");
+    check(dut->idu_cp0_ex1_dst0_reg == 5, "feq.s: dst0_reg == rd (GPR dest, xvld-class default path)");
+
+    reset_dut();
+    present(flt_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "flt.s: illegal pre-swap");
+    check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LT_BIT) & 1) == 1,
+          "flt.s: FUNC_CMP+FUNC_CMP_LT bits set");
+
+    reset_dut();
+    present(fle_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "fle.s: illegal pre-swap");
+    check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LE_BIT) & 1) == 1,
+          "fle.s: FUNC_CMP+FUNC_CMP_LE bits set");
+
+    reset_dut();
+    present(feq_d()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "feq.d: illegal pre-swap");
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_FEQ_BIT) & 1) == 1,
+          "feq.d: FUNC_DOUBLE+FUNC_CMP+FUNC_CMP_FEQ bits set");
+
+    reset_dut();
+    present(flt_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LT_BIT) & 1) == 1,
+          "flt.d: FUNC_DOUBLE+FUNC_CMP+FUNC_CMP_LT bits set");
+
+    reset_dut();
+    present(fle_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LE_BIT) & 1) == 1,
+          "fle.d: FUNC_DOUBLE+FUNC_CMP+FUNC_CMP_LE bits set");
+
+    reset_dut();
+    present(fclass_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 1, "fclass.s: illegal pre-swap");
+    check(((dut->idu_fpu_ex1_func >> FUNC_CLASS_BIT) & 1) == 1,
+          "fclass.s: FUNC_CLASS bit set");
+    check(dut->idu_fpu_ex1_fspu_sel == 0,
+          "fclass.s: fspu_sel stays 0 despite FUNC_CLASS set (ex1_eu_r forced to EU_CP0)");
+    check(dut->idu_cp0_ex1_dst0_reg == 5, "fclass.s: dst0_reg == rd (GPR dest, xvld-class default path)");
+
+    reset_dut();
+    present(fclass_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CLASS_BIT) & 1) == 1,
+          "fclass.d: FUNC_DOUBLE+FUNC_CLASS bits set");
+    test_result("T10c OP-FP compare/classify decode (M5 Task 4a): func bits correct, dead-wired pre-Task-9");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
@@ -815,6 +903,7 @@ int main(int argc, char **argv) {
     test_decode_32bit_fence_ecall();
     test_illegal_closed_list();
     test_fetch_fault_forces_cp0();
+    test_fp_cmp_class_decode();
     test_rvc_pairs();
     test_rvc_illegal();
 

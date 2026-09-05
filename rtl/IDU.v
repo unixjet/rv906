@@ -238,6 +238,27 @@ module IDU (
     output wire [63:0]              idu_fpu_ex1_fsrc1_data,
     output wire [63:0]              idu_fpu_ex1_fsrc2_data,
 
+    // M5 Task 4: FALU sub-block dispatch selects + shared func/rm bus.
+    // Mirrors idu_iu_ex1_alu_sel's shape exactly (ex1_eu_r[EU_FP_SEL] &&
+    // !stall && commit), split three ways by which func bits are set
+    // (fadd: add/sub/cmp/minmax; fspu: sign-inject/classify; fcnvt: f2f
+    // convert). Task 4a's FEQ/FLT/FLE arms set FUNC_CMP (fadd_sel) and its
+    // FCLASS arms set FUNC_CLASS (fspu_sel) -- fcnvt_sel alone stays
+    // permanently 0 until Task 4b/7 add the arms that set FUNC_CVT_*.
+    // func reuses ex1_func_r (already EU-agnostic, same as idu_iu_ex1_func/
+    // idu_lsu_ex1_func/idu_cp0_ex1_func); rm is unused by compare/classify
+    // (Task 4a) and tied 0 until Task 4b's arithmetic arms decode it.
+    // NB: all of this is structurally wired but dead pre-Task-9 regardless
+    // -- dis_eu_final (below) forces EU_CP0 whenever d32_illegal=1, and
+    // every Task 4a decode arm hardwires illegal=1, so ex1_eu_r[EU_FP_SEL]
+    // never actually sets until Task 9 replaces that hardwire with a real
+    // misa.F/D-gated expression.
+    output wire                     idu_fpu_ex1_fadd_sel,
+    output wire                     idu_fpu_ex1_fspu_sel,
+    output wire                     idu_fpu_ex1_fcnvt_sel,
+    output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
+    output wire [2:0]               idu_fpu_ex1_rm,
+
     //=========================================================================
     // RTU -> IDU : the exclusive bypass network (IDU note S6) + the 2
     // architectural commit ports.
@@ -795,6 +816,56 @@ module IDU (
             15'b???????11111100: begin  // csrrci
                 d32_eu = EU_CP0; d32_func = CP0_FUNC_CSRRCI;
                 d32_src1_imm_vld = 1'b1; d32_src1_imm = imm_i; d32_dst0_vld = 1'b1;
+            end
+            // M5 Task 4 (part a): OP-FP compare/classify -- xvld-class, GPR
+            // destination (rd, via the EXISTING d32_dst0_vld/_reg path,
+            // default-set to inst[11:7] above -- unchanged GPR WBT/wb0/wb1
+            // machinery). Sources are FRF-read (idu_fpu_ex1_fsrc0/1_data,
+            // SECTION FRF -- unconditional reads off inst[19:15]/[24:20],
+            // no GPR src_vld gating needed since GPR is never read here).
+            // d32_illegal is hardwired 1 (misa.F/D=0 pre-swap, Task 9 wires
+            // a real gated expression). d32_eu=EU_FP does NOT reach the FPU
+            // pre-Task-9 despite that: dis_eu_final (SECTION EU DISPATCH,
+            // below) forces EU_CP0 whenever dis_illegal is set, overriding
+            // dis_eu_raw back to EU_CP0 for every arm here. The wiring is
+            // still correct/needed -- Task 9 only has to stop hardwiring
+            // d32_illegal, nothing else changes. rs2=00000 for fclass is
+            // NOT separately checked (harmless: everything here is illegal
+            // anyway).
+            15'b1010000_010_10100: begin  // feq.s
+                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_FEQ] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1010000_001_10100: begin  // flt.s
+                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LT] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1010000_000_10100: begin  // fle.s
+                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LE] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1010001_010_10100: begin  // feq.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_FEQ] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1010001_001_10100: begin  // flt.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LT] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1010001_000_10100: begin  // fle.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LE] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1110000_001_10100: begin  // fclass.s
+                d32_eu = EU_FP; d32_func[FUNC_CLASS] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1110001_001_10100: begin  // fclass.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_CLASS] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
             end
             default: d32_illegal = 1'b1;   // FP/vector/AMO-LR-SC/custom-0/
                                             // dret/any unallocated encoding
@@ -1599,6 +1670,16 @@ module IDU (
     assign idu_cp0_ex1_sel       = ex1_eu_r[EU_CP0_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit;
     assign idu_lsu_ex1_sel       = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit && !lsu_idu_full;
     assign idu_lsu_ex1_dp_sel    = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && !lsu_idu_full;
+    // M5 Task 4: FP dispatch selects (see the port declaration comment).
+    assign idu_fpu_ex1_fadd_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
+                                  && (ex1_func_r[FUNC_ADD] || ex1_func_r[FUNC_SUB]
+                                      || ex1_func_r[FUNC_CMP] || ex1_func_r[FUNC_MAX] || ex1_func_r[FUNC_MIN]);
+    assign idu_fpu_ex1_fspu_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
+                                  && (ex1_func_r[FUNC_SPU_SGN] || ex1_func_r[FUNC_CLASS]);
+    assign idu_fpu_ex1_fcnvt_sel = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
+                                  && (ex1_func_r[FUNC_CVT_WIDDEN] || ex1_func_r[FUNC_CVT_NARROW]);
+    assign idu_fpu_ex1_func      = ex1_func_r;
+    assign idu_fpu_ex1_rm        = 3'b000;  // Task 4b wires real rm decode
     // M4 Task 5 fix: same term set as idu_lsu_ex1_sel, minus !lsu_idu_full --
     // see the port declaration comment (~line 186).
     assign idu_lsu_ex1_raw_vld   = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit;

@@ -387,6 +387,16 @@ module RVProc #(
     wire [63:0]              idu_fpu_ex1_fsrc0_data;
     wire [63:0]              idu_fpu_ex1_fsrc1_data;
     wire [63:0]              idu_fpu_ex1_fsrc2_data;
+    // M5 Task 4a: real dispatch-select/func/rm outputs. Structurally wired
+    // now but dead pre-Task-9 -- dis_eu_final (IDU.v) forces EU_CP0 whenever
+    // d32_illegal=1, and every Task 4a FP decode arm hardwires illegal=1, so
+    // ex1_eu_r[EU_FP_SEL] never sets until Task 9 replaces that hardwire
+    // with a real misa.F/D-gated expression.
+    wire                     idu_fpu_ex1_fadd_sel;
+    wire                     idu_fpu_ex1_fspu_sel;
+    wire                     idu_fpu_ex1_fcnvt_sel;
+    wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
+    wire [2:0]               idu_fpu_ex1_rm;
 
     // M5 Task 3: FPU.v FALU outputs. IDU decode does not yet route to
     // FPU (Task 4), so these are landing pads with no consumer yet.
@@ -870,6 +880,11 @@ module RVProc #(
         .idu_fpu_ex1_fsrc0_data  (idu_fpu_ex1_fsrc0_data),
         .idu_fpu_ex1_fsrc1_data  (idu_fpu_ex1_fsrc1_data),
         .idu_fpu_ex1_fsrc2_data  (idu_fpu_ex1_fsrc2_data),
+        .idu_fpu_ex1_fadd_sel    (idu_fpu_ex1_fadd_sel),
+        .idu_fpu_ex1_fspu_sel    (idu_fpu_ex1_fspu_sel),
+        .idu_fpu_ex1_fcnvt_sel   (idu_fpu_ex1_fcnvt_sel),
+        .idu_fpu_ex1_func        (idu_fpu_ex1_func),
+        .idu_fpu_ex1_rm          (idu_fpu_ex1_rm),
 
         .rtu_idu_fwd0_data       (rtu_idu_fwd0_data),
         .rtu_idu_fwd0_reg        (rtu_idu_fwd0_reg),
@@ -1020,22 +1035,24 @@ module RVProc #(
     );
 
     //=========================================================================
-    // FPU instance: FALU sub-block only (Task 3). IDU decode does not yet
-    // drive the `_fadd_sel`/`_fspu_sel`/`_fcnvt_sel`/`_func`/`_rm` inputs
-    // (Task 4 wires those up), so they're tied to inert constants here --
-    // same pattern as the RTU->IDU tie-offs above. `idu_fpu_ex1_fsrc0/1_data`
+    // FPU instance: FALU sub-block only (Task 3). IDU decode now drives the
+    // real `_fadd_sel`/`_fspu_sel`/`_fcnvt_sel`/`_func`/`_rm` outputs (Task
+    // 4a: FEQ/FLT/FLE/FCLASS decode arms), but they are structurally dead
+    // until Task 9 -- IDU.v's `dis_eu_final` forces EU_CP0 whenever
+    // d32_illegal=1, and every Task 4a arm hardwires illegal=1, so
+    // ex1_eu_r[EU_FP_SEL] never sets pre-swap. `idu_fpu_ex1_fsrc0/1_data`
     // are the real M5 Task 2 FRF read-port outputs. `fpu_rtu_ex1_falu_*`
-    // outputs have no consumer yet (RTU wiring lands with Task 4).
+    // outputs have no consumer yet (RTU wiring lands with Task 4b).
     //=========================================================================
     FPU u_fpu (
         .clk                       (clk),
         .rst_n                     (rst_n),
 
-        .idu_fpu_ex1_fadd_sel      (1'b0),
-        .idu_fpu_ex1_fspu_sel      (1'b0),
-        .idu_fpu_ex1_fcnvt_sel     (1'b0),
-        .idu_fpu_ex1_func          ({FUNC_WIDTH{1'b0}}),
-        .idu_fpu_ex1_rm            (3'b000),
+        .idu_fpu_ex1_fadd_sel      (idu_fpu_ex1_fadd_sel),
+        .idu_fpu_ex1_fspu_sel      (idu_fpu_ex1_fspu_sel),
+        .idu_fpu_ex1_fcnvt_sel     (idu_fpu_ex1_fcnvt_sel),
+        .idu_fpu_ex1_func          (idu_fpu_ex1_func),
+        .idu_fpu_ex1_rm            (idu_fpu_ex1_rm),
         .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
         .idu_fpu_ex1_fsrc1_data    (idu_fpu_ex1_fsrc1_data),
 

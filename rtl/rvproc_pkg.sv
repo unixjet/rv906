@@ -411,6 +411,14 @@ parameter [EU_WIDTH-1:0] EU_MULT = 10'b0000000100;   // cfig.h:107
 parameter [EU_WIDTH-1:0] EU_DIV  = 10'b0000001000;   // cfig.h:108
 parameter [EU_WIDTH-1:0] EU_CP0  = 10'b0000010000;   // cfig.h:109
 parameter [EU_WIDTH-1:0] EU_LSU  = 10'b0000100000;   // cfig.h:110
+// M5 Task 4: EU_FP one-hot value at the already-reserved EU_FP_SEL=8
+// position (cfig.h:122, see the EU_FP_SEL declaration below). NOT a donor
+// bit-pattern citation -- the donor's own FP/VEC group tags are denser
+// multi-bit fields this package has no consumer for (see the comment at
+// EU_VGROUP_SEL/EU_FP_SEL/EU_VEC_SEL below); rv906 just needs a plain
+// one-hot slot for its own single-issue EU dispatch mux, same shape as
+// EU_ALU..EU_LSU above.
+parameter [EU_WIDTH-1:0] EU_FP   = 10'b0100000000;
 
 parameter EU_ALU_SEL  = 0;    // cfig.h:112
 parameter EU_BJU_SEL  = 1;    // cfig.h:113
