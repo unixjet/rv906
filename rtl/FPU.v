@@ -75,10 +75,16 @@ module FPU (
     input  wire                        idu_fpu_ex1_fadd_sel,
     input  wire                        idu_fpu_ex1_fspu_sel,
     input  wire                        idu_fpu_ex1_fcnvt_sel,
+    // M5 Task 5: FMAU dispatch select + the third FRF source (the addend
+    // for fmadd/fmsub/fnmadd/fnmsub; don't-care, per rv12 D6's class-terms
+    // gating, for a plain fmul). IDU.v already exports this data port
+    // (M5 Task 2); the _sel wire is new this task.
+    input  wire                        idu_fpu_ex1_fmau_sel,
     input  wire [FUNC_WIDTH-1:0]       idu_fpu_ex1_func,
     input  wire [2:0]                  idu_fpu_ex1_rm,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc0_data,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc1_data,
+    input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc2_data,
     // M5 Task 4b: destination register tag, pure pass-through (IU.v's
     // `iu_rtu_ex1_alu_preg = idu_iu_ex1_dst0_reg` / CSR.v's
     // `cp0_rtu_ex1_wb_preg = idu_cp0_ex1_dst0_reg` precedent) -- RTU uses
@@ -733,13 +739,202 @@ module FPU (
                                                                      : f2f_pack[4:0];
 
     //=========================================================================
-    // SECTION 12: THE EU RESULT MUX (D1: one-hot OR-mux, IU.v ALU-section
-    // style -- no EX3 register, the three selects are mutually exclusive by
+    // SECTION 12: FMAU -- FUSED MULTIPLY-ADD (fmul.{s,d}, and the fmadd/
+    // fmsub/fnmadd/fnmsub.{s,d} family). Algorithmic porting source:
+    // ../rv12/rtl/FPUMul.v SECTIONS 3-9 (that file's own C910-derived FMA
+    // datapath), FLATTENED per D1 exactly as SECTIONS 4-8 above flatten
+    // FPUAlu.v -- every `fm_e2_*` wire below is a same-cycle EX1 alias, not
+    // a registered EX2 value; a distinct `fm_e2_` prefix (rather than
+    // colliding with FADD's own `e2_*` names above) is used only so a
+    // reader can still align this section against ../rv12/rtl/FPUMul.v's
+    // SECTION 7 register cut-line. rv12's own SECTION 10 result-tap
+    // registers (EX3/EX4/EX5) are DROPPED ENTIRELY: there is only one
+    // cycle here, so `fmau_ex1_result`/`fmau_ex1_flags` feed the result mux
+    // in SECTION 13 directly, same shape as FALU/FCNVT above.
+    //
+    // {NEG,SUB,FUSED} is rv12 FPUMul.v's own SECTION 3 field name for the
+    // three-bit fused-op sub-select (../rv12/rtl/FPUMul.v:59); rv906 does
+    // not preserve the LOW-THREE-BITS placement (rvproc_pkg.sv's
+    // FUNC_MAU_FUSED/_SUB/_NEG comment explains why: those bit positions
+    // are already occupied by FADD/FSPU sub-group bits under this file's
+    // established bit-reuse convention) but keeps the donor's three
+    // independent flags and their meaning verbatim:
+    //     fmadd = {NEG,SUB,FUSED} = 001   fmsub  = 011
+    //     fnmsub                 = 111   fnmadd = 101
+    //     plain fmul: FUSED = 0 (NEG/SUB don't-care)
+    //=========================================================================
+    wire op_fused   = idu_fpu_ex1_func[FUNC_MAU_FUSED];
+    wire op_mau_sub = idu_fpu_ex1_func[FUNC_MAU_SUB];
+    wire op_mau_neg = idu_fpu_ex1_func[FUNC_MAU_NEG];
+
+    // -- source 2 / addend classify, gated on op_fused (rv12 D6: a plain
+    // fmul forces the addend out at the CLASS TERMS, not the operand mux)
+    wire        c_cnan  = op_fused && box_check_en && !(&idu_fpu_ex1_fsrc2_data[63:32]);
+    wire        c_s_raw = f_double ? idu_fpu_ex1_fsrc2_data[63] : idu_fpu_ex1_fsrc2_data[31];
+    wire [10:0] c_ef    = f_double ? idu_fpu_ex1_fsrc2_data[62:52] : {3'b0, idu_fpu_ex1_fsrc2_data[30:23]};
+    wire [51:0] c_frac  = f_double ? idu_fpu_ex1_fsrc2_data[51:0] : {idu_fpu_ex1_fsrc2_data[22:0], 29'b0};
+    wire        c_e_max = f_double ? (&idu_fpu_ex1_fsrc2_data[62:52]) : (&idu_fpu_ex1_fsrc2_data[30:23]);
+    wire        c_e_z   = ~|c_ef;
+    wire        c_f_z   = ~|c_frac;
+    wire        c_f_msb = f_double ? idu_fpu_ex1_fsrc2_data[51] : idu_fpu_ex1_fsrc2_data[22];
+    wire        c_is_snan = op_fused && c_e_max && !c_f_msb && !c_f_z && !c_cnan;
+    wire        c_is_qnan = op_fused && ((c_e_max && c_f_msb) || c_cnan);
+    wire        c_is_inf  = op_fused && c_e_max && c_f_z && !c_cnan;
+    wire        c_is_zero = !op_fused || (c_e_z && c_f_z && !c_cnan);
+    wire [52:0] c_sig53   = (!op_fused || c_cnan) ? 53'b0 : {~c_e_z, c_frac};
+    wire [11:0] c_eeff    = c_e_z ? 12'd1 : {1'b0, c_ef};
+
+    // Only FMAU needs "is this operand a finite normal/subnormal" (SECTION
+    // 6's prod_is_inf term below); FALU has no equivalent use, so these
+    // extend SECTION 3's classify set rather than living there.
+    wire a_is_norm = !a_is_zero && !a_e_max && !a_cnan;
+    wire b_is_norm = !b_is_zero && !b_e_max && !b_cnan;
+
+    // -- SECTION 4 (FPUMul.v): effective signs/exponents ---------------------
+    wire         prod_sign = a_s ^ b_s ^ op_mau_neg;
+    wire         add_sign  = op_fused ? (c_s_raw ^ op_mau_sub ^ op_mau_neg) : prod_sign;
+    wire         sub_vld   = op_fused && (prod_sign ^ add_sign);
+    wire [10:0]  mau_bias  = f_double ? BIAS_D : BIAS_S;
+    wire signed [13:0] e_a = $signed({2'b0, a_eeff}) - $signed({3'b0, mau_bias});
+    wire signed [13:0] e_b = $signed({2'b0, b_eeff}) - $signed({3'b0, mau_bias});
+    wire signed [13:0] e_c = $signed({2'b0, c_eeff}) - $signed({3'b0, mau_bias});
+    wire signed [13:0] top_p = e_a + e_b + 14'sd1;
+    wire signed [13:0] top_c = e_c;
+
+    // -- SECTION 5 (FPUMul.v): exact product + alignment geometry -----------
+    // D2: ONE Verilog `*` for the exact 106-bit product -- no Booth/Wallace
+    // array (rv12's own decision; behavioral is correct here).
+    wire [105:0] prod106  = a_sig53 * b_sig53;
+    wire         top_p_vld = !(a_is_zero || b_is_zero);
+    wire         top_c_vld = !c_is_zero;
+    wire signed [13:0] mau_top = (top_p_vld && top_c_vld) ? ((top_p > top_c) ? top_p : top_c)
+                                : top_p_vld ? top_p : top_c_vld ? top_c : top_p;
+    wire signed [13:0] d_p_raw = top_p_vld ? (mau_top - top_p) : 14'sd0;
+    wire signed [13:0] d_c_raw = top_c_vld ? (mau_top - top_c) : 14'sd0;
+    wire [7:0] d_p = (d_p_raw >= 14'sd164) ? 8'd164 : d_p_raw[7:0];
+    wire [7:0] d_c = (d_c_raw >= 14'sd164) ? 8'd164 : d_c_raw[7:0];
+
+    // -- SECTION 6 (FPUMul.v): special results/NV ----------------------------
+    wire prod_is_inf = (a_is_inf && b_is_norm) || (b_is_inf && a_is_norm) || (a_is_inf && b_is_inf);
+    wire mau_nv = a_is_snan || b_is_snan || c_is_snan
+               || (a_is_zero && b_is_inf) || (b_is_zero && a_is_inf)
+               || (prod_is_inf && c_is_inf && sub_vld);
+    wire mau_res_qnan = a_is_qnan || b_is_qnan || c_is_qnan || mau_nv;
+    wire mau_res_inf  = !mau_res_qnan && (a_is_inf || b_is_inf || c_is_inf);
+    wire mau_inf_sign = c_is_inf ? add_sign : prod_sign;
+    wire mau_res_special = mau_res_qnan || mau_res_inf;
+    wire [63:0] mau_special_data = mau_res_qnan
+        ? (f_double ? {1'b0, 11'h7ff, 1'b1, 51'b0} : {32'hffffffff, 1'b0, 8'hff, 1'b1, 22'b0})
+        : (f_double ? {mau_inf_sign, 11'h7ff, 52'b0} : {32'hffffffff, mau_inf_sign, 8'hff, 23'b0});
+    wire [4:0]  mau_special_flags = {mau_nv, 4'b0};
+    wire        mau_zero_sign = (prod_sign == add_sign) ? prod_sign : (idu_fpu_ex1_rm == 3'b010);
+
+    //-- FLATTENED EX1->EX2 (D1): fm_e2_* wire ALIASES, see the section
+    // banner above -- not registered.
+    wire         fm_e2_double        = f_double;
+    wire [105:0] fm_e2_prod106       = prod106;
+    wire [52:0]  fm_e2_c_sig53       = c_sig53;
+    wire [7:0]   fm_e2_d_p           = d_p;
+    wire [7:0]   fm_e2_d_c           = d_c;
+    wire         fm_e2_prod_sign     = prod_sign;
+    wire         fm_e2_add_sign      = add_sign;
+    wire signed [13:0] fm_e2_top     = mau_top;
+    wire [10:0]  fm_e2_bias          = mau_bias;
+    wire [2:0]   fm_e2_rm            = idu_fpu_ex1_rm;
+    wire         fm_e2_special       = mau_res_special;
+    wire [63:0]  fm_e2_special_data  = mau_special_data;
+    wire [4:0]   fm_e2_special_flags = mau_special_flags;
+    wire         fm_e2_zero_sign     = mau_zero_sign;
+
+    // Leading-zero count over the 164-bit alignment field (rv12 FPUMul.v's
+    // own `lzc164`; D4: a plain count taken AFTER the add, not a parallel
+    // anticipator). Returns 164 for zero.
+    localparam integer WF = 164;
+
+    function [7:0] lzc164;
+        input [WF-1:0] v;
+        integer i;
+        reg    found;
+        begin
+            lzc164 = 8'd164;
+            found = 1'b0;
+            for (i = WF-1; i >= 0; i = i - 1)
+                if (v[i] && !found) begin
+                    found = 1'b1;
+                    lzc164 = 8'd163 - i[7:0];
+                end
+        end
+    endfunction
+
+    // -- SECTION 8 (FPUMul.v): 164-bit alignment + exact sum -----------------
+    wire [WF-1:0] pf_base = {1'b0, fm_e2_prod106, 57'b0};
+    wire [WF-1:0] cf_base = {1'b0, fm_e2_c_sig53, 110'b0};
+    wire [WF-1:0] pf = pf_base >> fm_e2_d_p;
+    wire [WF-1:0] cf = cf_base >> fm_e2_d_c;
+    wire drop_p = |(pf_base & ~({WF{1'b1}} << fm_e2_d_p));
+    wire drop_c = |(cf_base & ~({WF{1'b1}} << fm_e2_d_c));
+    wire mau_same_sign = (fm_e2_prod_sign == fm_e2_add_sign);
+    wire p_bigger = (pf > cf) || ((pf == cf) && drop_p);
+
+    reg [WF-1:0] fsum;
+    reg          fst;
+    reg          fsign;
+    always @* begin
+        if (mau_same_sign) begin
+            fsum  = pf + cf;
+            fst   = drop_p || drop_c;
+            fsign = fm_e2_prod_sign;
+        end else if (p_bigger) begin
+            fsum  = pf - cf - {{(WF-1){1'b0}}, drop_c};
+            fst   = drop_p || drop_c;
+            fsign = fm_e2_prod_sign;
+        end else begin
+            fsum  = cf - pf - {{(WF-1){1'b0}}, drop_p};
+            fst   = drop_p || drop_c;
+            fsign = fm_e2_add_sign;
+        end
+    end
+
+    // -- SECTION 9 (FPUMul.v): normalize/single-pack/special-merge ----------
+    wire [7:0] fsum_lz      = lzc164(fsum);
+    wire [7:0] fsum_top_idx = 8'd163 - fsum_lz;
+    wire       need_rsh     = (fsum_top_idx >= 8'd55);
+    wire [7:0] map_rsh      = fsum_top_idx - 8'd55;
+    wire [7:0] map_lsh      = 8'd55 - fsum_top_idx;
+    wire [WF-1:0] fsum_rsh  = fsum >> map_rsh;
+    wire [WF-1:0] fsum_lsh  = fsum << map_lsh;
+    wire       map_st       = need_rsh ? |(fsum & ~({WF{1'b1}} << map_rsh)) : 1'b0;
+    wire       fsum_zero    = (fsum == {WF{1'b0}});
+    wire [PW-1:0] pack_p    = fsum_zero ? (fst ? {{(PW-1){1'b0}}, 1'b1} : {PW{1'b0}})
+                            : need_rsh  ? fsum_rsh[PW-1:0]
+                                        : fsum_lsh[PW-1:0];
+    wire signed [13:0] pack_e14 = fsum_zero
+        ? (fm_e2_top - 14'sd107 + $signed({3'b0, fm_e2_bias}))
+        : (fm_e2_top + 14'sd1 - $signed({6'b0, fsum_lz}) + $signed({3'b0, fm_e2_bias}));
+    wire signed [12:0] pack_e = pack_e14[12:0];
+
+    wire [PACK_W-1:0] mau_packed = fp_pack(fsign, pack_e, pack_p, fst | map_st,
+                                           fm_e2_rm, fm_e2_double);
+    wire        mau_zero_taken = fsum_zero && !fst;
+    wire [63:0] mau_zero_data  = fm_e2_double ? {fm_e2_zero_sign, 63'b0}
+                                              : {32'hffffffff, fm_e2_zero_sign, 31'b0};
+
+    wire [63:0] fmau_ex1_result = fm_e2_special  ? fm_e2_special_data
+                                : mau_zero_taken  ? mau_zero_data
+                                                  : mau_packed[PACK_W-1:5];
+    wire [4:0]  fmau_ex1_flags  = fm_e2_special  ? fm_e2_special_flags
+                                : mau_zero_taken  ? 5'b0
+                                                  : mau_packed[4:0];
+
+    //=========================================================================
+    // SECTION 13: THE EU RESULT MUX (D1: one-hot OR-mux, IU.v ALU-section
+    // style -- no EX3 register, the four selects are mutually exclusive by
     // construction since IDU issues at most one EU per cycle)
     //=========================================================================
     assign fpu_rtu_ex1_falu_fdata  = idu_fpu_ex1_fadd_sel  ? fadd_ex2_result
                                     : idu_fpu_ex1_fspu_sel  ? fspu_ex1_result
                                     : idu_fpu_ex1_fcnvt_sel ? fcnvt_ex1_result
+                                    : idu_fpu_ex1_fmau_sel  ? fmau_ex1_result
                                                              : 64'b0;
 
     assign fpu_rtu_ex1_falu_xdata  = idu_fpu_ex1_fadd_sel  ? fadd_mfvr_data
@@ -748,13 +943,17 @@ module FPU (
 
     assign fpu_rtu_ex1_falu_fflags = idu_fpu_ex1_fadd_sel  ? fadd_ex2_flags
                                     : idu_fpu_ex1_fcnvt_sel ? fcnvt_ex1_flags
+                                    : idu_fpu_ex1_fmau_sel  ? fmau_ex1_flags
                                                              : 5'b0;
 
-    // fvld: an FP-register-destination result -- add/sub/min/max/sgnj*/f2f,
-    // but NOT a compare (that's xvld) and NOT fclass (also xvld).
+    // fvld: an FP-register-destination result -- add/sub/min/max/sgnj*/f2f/
+    // fma, but NOT a compare (that's xvld) and NOT fclass (also xvld).
+    // FMAU never targets an integer destination (RISC-V spec), so it only
+    // ever contributes to fvld/fdata, never xvld/xdata.
     assign fpu_rtu_ex1_falu_fvld   = (idu_fpu_ex1_fadd_sel  && !op_cmp)
                                     || (idu_fpu_ex1_fspu_sel  && !spu_op_class)
-                                    || idu_fpu_ex1_fcnvt_sel;
+                                    || idu_fpu_ex1_fcnvt_sel
+                                    || idu_fpu_ex1_fmau_sel;
 
     // xvld: an integer-register-destination result -- compare or fclass.
     assign fpu_rtu_ex1_falu_xvld   = (idu_fpu_ex1_fadd_sel && op_cmp)

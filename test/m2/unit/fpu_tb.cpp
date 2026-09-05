@@ -1,27 +1,32 @@
 //=============================================================================
-// fpu_tb.cpp -- standalone unit bench for rtl/FPU.v (M5 Task 3)
+// fpu_tb.cpp -- standalone unit bench for rtl/FPU.v (M5 Tasks 3 + 5)
 //=============================================================================
 // Verilates FPU.v + rvproc_pkg.sv alone (no IDU/RTU) and drives the frozen
-// idu_fpu_ex1_*/rm/fsrc0/fsrc1 ports directly, same tick()-based clocking and
-// check()/test_result() bookkeeping pattern as test/m2/unit/iu_tb.cpp.
+// idu_fpu_ex1_*/rm/fsrc0/fsrc1/fsrc2 ports directly, same tick()-based
+// clocking and check()/test_result() bookkeeping pattern as
+// test/m2/unit/iu_tb.cpp.
 //
-// Scope: Task 3's restricted FALU sub-block only -- FADD (add/sub/compare/
+// Scope: Task 3's restricted FALU sub-block -- FADD (add/sub/compare/
 // min-max), FSPU (sign-inject + fclass only, no fmv.*), FCNVT (float-to-
-// float only, no int<->float). This is a white-box bench of FPU.v's own
-// documented contract (see FPU.v's header D1/D-TASK3-1/2/3), not a RISC-V
-// compliance suite -- rv64uf/ud coverage lands once IDU decode routes to
-// this module (Task 4) and the ISA swap flips misa.F/D (Task 9).
+// float only, no int<->float) -- plus Task 5's FMAU (fmul/fmadd/fmsub/
+// fnmadd/fnmsub, single-cycle EX1 handshake per M5 design doc D1). This is
+// a white-box bench of FPU.v's own documented contract (see FPU.v's header
+// D1/D-TASK3-1/2/3), not a RISC-V compliance suite -- rv64uf/ud coverage
+// lands once IDU decode routes to this module (Task 4/5) and the ISA swap
+// flips misa.F/D (Task 9).
 //
 // ORACLE: the host x86-64 FPU's native `double`/`float` arithmetic IS an
 // IEEE-754 binary64/binary32 implementation defaulting to round-to-nearest-
 // even -- bit-identical to RISC-V's RNE (rm=000), the only mode exercised
 // here except one directed RTZ check via fesetround(). Result VALUES are
-// checked against plain native arithmetic. The NX (inexact) flag is checked
-// via a widening trick: redo the same operation in a wider type (`long
-// double` for double operands, `double` for float operands -- comfortably
-// exact for the small, hand-picked operand pairs used below) and see
-// whether narrowing that exact-for-these-operands result changes it. No
-// SoftFloat oracle is vendored for this directed first pass.
+// checked against plain native arithmetic (FADD/FCNVT/plain FMUL) or a
+// single-rounding a*b+/-c oracle shaped like std::fma() (fma_exact_d/s(),
+// FMAU's fused forms). The NX (inexact) flag is checked via a widening
+// trick: redo the same operation in a wider type (`long double` for double
+// operands, `double` for float operands -- comfortably exact for the
+// small, hand-picked operand pairs used below) and see whether narrowing
+// that exact-for-these-operands result changes it. No SoftFloat oracle is
+// vendored for this directed first pass.
 //
 // Build/run: make -C test/m2/unit fpu && bin/unit/fpu_tb
 // Prints one line per test and ends with UNIT-PASS or UNIT-FAIL.
@@ -57,6 +62,9 @@ static const unsigned FUNC_SPU_SGN_N  = 1;
 static const unsigned FUNC_SPU_SGN_J  = 0;
 static const unsigned FUNC_CVT_WIDDEN = 14;
 static const unsigned FUNC_CVT_NARROW = 13;
+static const unsigned FUNC_MAU_FUSED  = 5;
+static const unsigned FUNC_MAU_SUB    = 7;
+static const unsigned FUNC_MAU_NEG    = 17;
 
 static inline uint32_t bitv(unsigned n) { return 1u << n; }
 
@@ -99,10 +107,12 @@ static void tie_idle_inputs(void) {
     dut->idu_fpu_ex1_fadd_sel   = 0;
     dut->idu_fpu_ex1_fspu_sel   = 0;
     dut->idu_fpu_ex1_fcnvt_sel  = 0;
+    dut->idu_fpu_ex1_fmau_sel   = 0;
     dut->idu_fpu_ex1_func       = 0;
     dut->idu_fpu_ex1_rm         = 0;
     dut->idu_fpu_ex1_fsrc0_data = 0;
     dut->idu_fpu_ex1_fsrc1_data = 0;
+    dut->idu_fpu_ex1_fsrc2_data = 0;
     dut->idu_fpu_ex1_dst0_reg   = 0;
 }
 
@@ -153,6 +163,20 @@ static bool add_exact_d(double a, double b, bool sub) {
 }
 static bool add_exact_s(float a, float b, bool sub) {
     double e = sub ? ((double)a - (double)b) : ((double)a + (double)b);
+    return (double)(float)e == e;
+}
+
+// Same idea for FMAU (a*b +/- c, single rounding): exact iff the a*b
+// product AND the final sum both land exactly, for the specific
+// hand-picked small operands used below (products stay well within
+// long double's 64-bit mantissa for the double rows, and double's 53-bit
+// mantissa comfortably covers the float rows' <=48-bit products).
+static bool fma_exact_d(double a, double b, double c) {
+    long double e = (long double)a * (long double)b + (long double)c;
+    return (long double)(double)e == e;
+}
+static bool fma_exact_s(float a, float b, float c) {
+    double e = (double)a * (double)b + (double)c;
     return (double)(float)e == e;
 }
 
@@ -207,6 +231,20 @@ static FpuResult fcnvt_op(uint32_t func, unsigned rm, uint64_t fsrc0) {
     dut->idu_fpu_ex1_func       = func;
     dut->idu_fpu_ex1_rm         = rm;
     dut->idu_fpu_ex1_fsrc0_data = fsrc0;
+    dut->eval();
+    FpuResult r = read_result();
+    tick();
+    return r;
+}
+
+static FpuResult fmau_op(uint32_t func, unsigned rm, uint64_t fsrc0, uint64_t fsrc1, uint64_t fsrc2) {
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fmau_sel   = 1;
+    dut->idu_fpu_ex1_func       = func;
+    dut->idu_fpu_ex1_rm         = rm;
+    dut->idu_fpu_ex1_fsrc0_data = fsrc0;
+    dut->idu_fpu_ex1_fsrc1_data = fsrc1;
+    dut->idu_fpu_ex1_fsrc2_data = fsrc2;
     dut->eval();
     FpuResult r = read_result();
     tick();
@@ -538,6 +576,113 @@ static void test_dst0_reg_preg_passthrough(void) {
     test_result("T8 idu_fpu_ex1_dst0_reg -> fpu_rtu_ex1_falu_preg pass-through (M5 Task 4b)");
 }
 
+//-----------------------------------------------------------------------------
+// T9: FMAU.D fmadd/fmsub/fnmadd/fnmsub -- value + NX flag, via the host's
+// std::fma()-shaped fma_exact_d() oracle (single-rounding a*b+/-c).
+//-----------------------------------------------------------------------------
+static void test_fmau_d_basic(void) {
+    uint32_t f_fmadd  = bitv(FUNC_MAU_FUSED) | bitv(FUNC_DOUBLE);
+    uint32_t f_fmsub  = bitv(FUNC_MAU_FUSED) | bitv(FUNC_MAU_SUB) | bitv(FUNC_DOUBLE);
+    uint32_t f_fnmsub = bitv(FUNC_MAU_FUSED) | bitv(FUNC_MAU_SUB) | bitv(FUNC_MAU_NEG) | bitv(FUNC_DOUBLE);
+    uint32_t f_fnmadd = bitv(FUNC_MAU_FUSED) | bitv(FUNC_MAU_NEG) | bitv(FUNC_DOUBLE);
+
+    double a = 1.5, b = 2.0, c = 1.0;
+    FpuResult r = fmau_op(f_fmadd, RM_RNE, d2b(a), d2b(b), d2b(c));
+    check(r.fdata == d2b(a * b + c) && r.fvld && !r.xvld,
+          "FMADD.D 1.5*2.0+1.0 == 4.0, fvld routing", r.fdata, d2b(a * b + c));
+    check(r.fflags == 0, "FMADD.D 1.5*2.0+1.0 exact, flags clean", r.fflags, 0);
+
+    r = fmau_op(f_fmsub, RM_RNE, d2b(a), d2b(b), d2b(c));
+    check(r.fdata == d2b(a * b - c), "FMSUB.D 1.5*2.0-1.0 == 2.0", r.fdata, d2b(a * b - c));
+
+    r = fmau_op(f_fnmsub, RM_RNE, d2b(a), d2b(b), d2b(c));
+    check(r.fdata == d2b(-(a * b) + c), "FNMSUB.D -(1.5*2.0)+1.0 == -2.0", r.fdata, d2b(-(a * b) + c));
+
+    r = fmau_op(f_fnmadd, RM_RNE, d2b(a), d2b(b), d2b(c));
+    check(r.fdata == d2b(-(a * b) - c), "FNMADD.D -(1.5*2.0)-1.0 == -4.0", r.fdata, d2b(-(a * b) - c));
+
+    // Inexact addend well below the product's ulp -> NX set, value rounds
+    // to the product (mirrors FADD.D's bypass-path test).
+    a = 1.0; b = 1.0; c = ldexp(1.0, -60);
+    r = fmau_op(f_fmadd, RM_RNE, d2b(a), d2b(b), d2b(c));
+    check((r.fflags & 0x1) == (fma_exact_d(a, b, c) ? 0u : 1u),
+          "FMADD.D 1.0*1.0+2^-60 sets NX", r.fflags, 1);
+
+    // qNaN in -> canonical qNaN out, NV=0; sNaN in -> NV=1.
+    r = fmau_op(f_fmadd, RM_RNE, QNAN_D, d2b(1.0), d2b(1.0));
+    check(r.fdata == QNAN_D && r.fflags == 0, "FMADD.D qNaN*1.0+1.0 -> canonical qNaN, no NV");
+    r = fmau_op(f_fmadd, RM_RNE, SNAN_D, d2b(1.0), d2b(1.0));
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FMADD.D sNaN*1.0+1.0 -> qNaN, NV set");
+
+    // 0*inf -> invalid (independent of the addend).
+    r = fmau_op(f_fmadd, RM_RNE, PINF_D, PZERO_D, d2b(1.0));
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FMADD.D inf*0+1.0 -> qNaN, NV set");
+
+    // inf - inf via fmsub (product +inf, subtrahend +inf) -> invalid.
+    r = fmau_op(f_fmsub, RM_RNE, PINF_D, d2b(1.0), PINF_D);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FMSUB.D inf*1.0-inf -> qNaN, NV set");
+
+    // finite*inf -> inf, no flags.
+    r = fmau_op(f_fmadd, RM_RNE, d2b(2.0), PINF_D, PZERO_D);
+    check(r.fdata == PINF_D && r.fflags == 0, "FMADD.D 2.0*inf+0 -> inf, no flags");
+
+    test_result("T9 FMAU.D fmadd/fmsub/fnmadd/fnmsub: value + NX flag, specials");
+}
+
+//-----------------------------------------------------------------------------
+// T10: FMAU.S fmadd/fmsub -- boxed values + NaN-box check.
+//-----------------------------------------------------------------------------
+static void test_fmau_s_basic(void) {
+    uint32_t f_fmadd = bitv(FUNC_MAU_FUSED) | bitv(FUNC_B_SINGLE);
+    uint32_t f_fmsub = bitv(FUNC_MAU_FUSED) | bitv(FUNC_MAU_SUB) | bitv(FUNC_B_SINGLE);
+
+    float a = 1.5f, b = 2.0f, c = 1.0f;
+    FpuResult r = fmau_op(f_fmadd, RM_RNE, box(f2b(a)), box(f2b(b)), box(f2b(c)));
+    check(r.fdata == box(f2b(a * b + c)), "FMADD.S 1.5*2.0+1.0 == 4.0 (boxed)",
+          r.fdata, box(f2b(a * b + c)));
+    check(r.fflags == 0, "FMADD.S 1.5*2.0+1.0 exact, flags clean", r.fflags, 0);
+
+    r = fmau_op(f_fmsub, RM_RNE, box(f2b(a)), box(f2b(b)), box(f2b(c)));
+    check(r.fdata == box(f2b(a * b - c)), "FMSUB.S 1.5*2.0-1.0 == 2.0 (boxed)",
+          r.fdata, box(f2b(a * b - c)));
+
+    a = 1.0f; b = 1.0f; c = ldexpf(1.0f, -30);
+    r = fmau_op(f_fmadd, RM_RNE, box(f2b(a)), box(f2b(b)), box(f2b(c)));
+    check((r.fflags & 0x1) == (fma_exact_s(a, b, c) ? 0u : 1u), "FMADD.S 1.0*1.0+2^-30 sets NX");
+
+    // un-boxed garbage upper bits on any source -> treated as canonical qNaN.
+    uint64_t garbage = 0x1234567800000000ULL | (uint64_t)f2b(3.0f);
+    r = fmau_op(f_fmadd, RM_RNE, garbage, box(f2b(1.0f)), box(f2b(1.0f)));
+    check(r.fdata == box(QNAN_S), "FMADD.S unboxed src0 -> canonical qNaN in", r.fdata, box(QNAN_S));
+
+    test_result("T10 FMAU.S fmadd/fmsub: value + NX flag + NaN-box check");
+}
+
+//-----------------------------------------------------------------------------
+// T11: FMAU plain fmul.s/d -- FUNC_MAU_FUSED=0, addend forced don't-care
+// (rv12 D6: c_is_zero = !op_fused || ...).
+//-----------------------------------------------------------------------------
+static void test_fmau_mul(void) {
+    uint32_t f_mul_d = bitv(FUNC_DOUBLE);
+    uint32_t f_mul_s = bitv(FUNC_B_SINGLE);
+
+    double a = 1.5, b = 2.0;
+    FpuResult r = fmau_op(f_mul_d, RM_RNE, d2b(a), d2b(b), 0xDEADBEEFDEADBEEFULL);
+    check(r.fdata == d2b(a * b) && r.fflags == 0,
+          "FMUL.D 1.5*2.0 == 3.0 exact, addend don't-care", r.fdata, d2b(a * b));
+
+    a = 1.1; b = 1.1;
+    r = fmau_op(f_mul_d, RM_RNE, d2b(a), d2b(b), 0);
+    check(r.fdata == d2b(a * b), "FMUL.D 1.1*1.1 value", r.fdata, d2b(a * b));
+    check((r.fflags & 0x1) == (fma_exact_d(a, b, 0.0) ? 0u : 1u), "FMUL.D 1.1*1.1 sets NX");
+
+    float fa = 1.1f, fb = 1.1f;
+    r = fmau_op(f_mul_s, RM_RNE, box(f2b(fa)), box(f2b(fb)), 0);
+    check(r.fdata == box(f2b(fa * fb)), "FMUL.S 1.1*1.1 value (boxed)", r.fdata, box(f2b(fa * fb)));
+
+    test_result("T11 FMAU plain fmul.s/d: value + NX flag, addend don't-care");
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     dut = new VFPU;
@@ -550,6 +695,9 @@ int main(int argc, char **argv) {
     test_fspu_sgnj();
     test_fspu_fclass();
     test_fcnvt_f2f();
+    test_fmau_d_basic();
+    test_fmau_s_basic();
+    test_fmau_mul();
     test_dst0_reg_preg_passthrough();
 
     printf("[fpu_tb] %llu cycles, %d failure(s)\n",

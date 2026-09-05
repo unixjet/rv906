@@ -383,8 +383,8 @@ module RVProc #(
     wire [63:0]              idu_cp0_ex1_src1_data;
     wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
     wire                     idu_cp0_ex1_inst_len;   // Task 7.3
-    // M5 Task 2: FRF read-port outputs. Consumed by FPU.v below (Task 3);
-    // idu_fpu_ex1_fsrc2_data still has no consumer (fmadd family: Task 5).
+    // M5 Task 2: FRF read-port outputs. Consumed by FPU.v below (Task 3
+    // for fsrc0/1; Task 5 wires fsrc2 into the FPU instance for fmadd).
     wire [63:0]              idu_fpu_ex1_fsrc0_data;
     wire [63:0]              idu_fpu_ex1_fsrc1_data;
     wire [63:0]              idu_fpu_ex1_fsrc2_data;
@@ -396,6 +396,7 @@ module RVProc #(
     wire                     idu_fpu_ex1_fadd_sel;
     wire                     idu_fpu_ex1_fspu_sel;
     wire                     idu_fpu_ex1_fcnvt_sel;
+    wire                     idu_fpu_ex1_fmau_sel;  // M5 Task 5
     wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
     wire [2:0]               idu_fpu_ex1_rm;
     // M5 Task 4b: FPU destination-register pass-through (IDU decode ->
@@ -898,6 +899,7 @@ module RVProc #(
         .idu_fpu_ex1_fadd_sel    (idu_fpu_ex1_fadd_sel),
         .idu_fpu_ex1_fspu_sel    (idu_fpu_ex1_fspu_sel),
         .idu_fpu_ex1_fcnvt_sel   (idu_fpu_ex1_fcnvt_sel),
+        .idu_fpu_ex1_fmau_sel    (idu_fpu_ex1_fmau_sel),
         .idu_fpu_ex1_func        (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm          (idu_fpu_ex1_rm),
         .idu_fpu_ex1_dst0_reg    (idu_fpu_ex1_dst0_reg),
@@ -1067,10 +1069,12 @@ module RVProc #(
         .idu_fpu_ex1_fadd_sel      (idu_fpu_ex1_fadd_sel),
         .idu_fpu_ex1_fspu_sel      (idu_fpu_ex1_fspu_sel),
         .idu_fpu_ex1_fcnvt_sel     (idu_fpu_ex1_fcnvt_sel),
+        .idu_fpu_ex1_fmau_sel      (idu_fpu_ex1_fmau_sel),
         .idu_fpu_ex1_func          (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm            (idu_fpu_ex1_rm),
         .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
         .idu_fpu_ex1_fsrc1_data    (idu_fpu_ex1_fsrc1_data),
+        .idu_fpu_ex1_fsrc2_data    (idu_fpu_ex1_fsrc2_data),
         .idu_fpu_ex1_dst0_reg      (idu_fpu_ex1_dst0_reg),
 
         .fpu_rtu_ex1_falu_fdata    (fpu_rtu_ex1_falu_fdata),

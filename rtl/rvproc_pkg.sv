@@ -807,7 +807,7 @@ parameter [2:0] FP_RM_DYN  = 3'b111;  // dynamic -- use frm CSR
 // (not deferred): rv906 has no vector/SIMD FP context at all (D1), so its
 // box_check_en collapses to `f_single` directly instead of rv12's
 // `f_scalar && f_single`.
-parameter FUNC_DOUBLE      = 16;  // format nibble (shared FADD/FSPU/FCNVT)
+parameter FUNC_DOUBLE      = 16;  // format nibble (shared FADD/FSPU/FCNVT/FMAU)
 parameter FUNC_B_SINGLE    = 15;
 parameter FUNC_CLASS       = 18;
 
@@ -829,5 +829,33 @@ parameter FUNC_SPU_SGN_J   = 0;
 
 parameter FUNC_CVT_WIDDEN  = 14;  // FCNVT format group (f2i/i2f: Task 7)
 parameter FUNC_CVT_NARROW  = 13;
+
+// M5 Task 5: FPU.v FMAU micro-op FUNC_* bit positions. Reuses FUNC_DOUBLE/
+// FUNC_B_SINGLE above for the format nibble (safe: FMAU's dispatch is
+// mutually exclusive with FADD/FSPU/FCNVT's one-hot _sel lines -- same
+// established convention as FUNC_CMP_LT/FUNC_SPU_SGN_N sharing bit 1
+// above). {NEG,SUB,FUSED} is rv12's own FPUMul.v SECTION 3 field name for
+// the three-bit fused-op sub-select (../rv12/rtl/FPUMul.v:59:
+// "the func word's low three bits are {NEG, SUB, FUSED}"); rv906 does not
+// preserve the LOW-THREE-BITS placement (those positions are already
+// occupied by FADD/FSPU sub-group bits per the bit-reuse convention), only
+// the three independent flags and their donor-cited meaning:
+//     fmadd = {NEG,SUB,FUSED} = 001   fmsub  = 011
+//     fnmsub                 = 111   fnmadd = 101
+//     plain fmul: FUSED = 0 (NEG/SUB don't-care)
+parameter FUNC_MAU_FUSED   = 5;
+parameter FUNC_MAU_SUB     = 7;
+parameter FUNC_MAU_NEG     = 17;
+
+// IDU-only classification bit (never read by FPU.v -- its FMAU algorithm
+// section only consumes FUSED/SUB/NEG + the shared format nibble, already
+// sufficient there since op_fused's polarity disambiguates plain-fmul from
+// the fused family internally). IDU's one-hot idu_fpu_ex1_fmau_sel line
+// needs its OWN unconditional per-member identifying bit, mirroring how
+// FADD/FSPU/FCNVT each OR their own group's bits: FUSED/SUB/NEG can't serve
+// that role for FMAU because plain fmul sets FUSED=0 with SUB/NEG
+// don't-care, so no OR of those three bits is ever true for it. Bit 19 is
+// the last free FUNC_WIDTH=20 slot (0-18 all allocated above/elsewhere).
+parameter FUNC_MAU_MUL     = 19;  // set for ALL FIVE FMAU-class instructions
 
 endpackage

@@ -258,6 +258,12 @@ module IDU (
     output wire                     idu_fpu_ex1_fadd_sel,
     output wire                     idu_fpu_ex1_fspu_sel,
     output wire                     idu_fpu_ex1_fcnvt_sel,
+    // M5 Task 5: FMAU dispatch select. Identified by FUNC_MAU_MUL alone
+    // (rvproc_pkg.sv) -- unlike the three siblings above, FUSED/SUB/NEG
+    // can't serve as FMAU's own identifying OR-group (plain fmul sets
+    // FUSED=0 with SUB/NEG don't-care), so IDU sets one dedicated bit
+    // uniformly across all five FMAU-class instructions instead.
+    output wire                     idu_fpu_ex1_fmau_sel,
     output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
     output wire [2:0]               idu_fpu_ex1_rm,
     // M5 Task 4b: destination register tag (rd), same pass-through shape as
@@ -988,6 +994,76 @@ module IDU (
             end
             15'b0100001_???_10100: begin  // fcvt.d.s
                 d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1; d32_func[FUNC_CVT_WIDDEN] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            // M5 Task 5: plain fmul (OP-FP, opcode[6:2]=10100, funct5=00010)
+            // -- FRF-destined like fadd/fsub above (d32_dst0_vld left 0, same
+            // reasoning). FUNC_MAU_FUSED=0 (SUB/NEG don't-care) dispatches
+            // FPU.v's non-fused multiply path; FUNC_MAU_MUL identifies this
+            // as an FMAU-class op for idu_fpu_ex1_fmau_sel (SECTION EU
+            // DISPATCH below).
+            15'b0001000_???_10100: begin  // fmul.s
+                d32_eu = EU_FP; d32_func[FUNC_MAU_MUL] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0001001_???_10100: begin  // fmul.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MAU_MUL] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            // M5 Task 5: R4-type FMA family (MADD/MSUB/NMSUB/NMADD major
+            // opcodes 10000/10001/10010/10011, per LOAD-FP=00001/STORE-FP=
+            // 01001's sibling precedent above). rs3=inst[31:27] occupies
+            // what would be funct7[6:2] for R-type, and fmt=inst[26:25]
+            // occupies funct7[1:0] -- so the 15-bit casez key's top 5 bits
+            // (rs3) are wildcarded here, unlike every R-type arm above where
+            // that field is a fixed funct7. fmt selects S/D (00/01); rm
+            // (inst[14:12]) stays wildcarded exactly like fadd/fsub's `???`
+            // above (FPU.v's rounding-mode consumer doesn't gate decode).
+            // {NEG,SUB,FUSED} per rvproc_pkg.sv's donor-cited encoding:
+            // fmadd=001, fmsub=011, fnmsub=111, fnmadd=101.
+            15'b?????00???10000: begin  // fmadd.s
+                d32_eu = EU_FP;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????01???10000: begin  // fmadd.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????00???10001: begin  // fmsub.s
+                d32_eu = EU_FP;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_SUB] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????01???10001: begin  // fmsub.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_SUB] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????00???10010: begin  // fnmsub.s
+                d32_eu = EU_FP;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_SUB] = 1'b1; d32_func[FUNC_MAU_NEG] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????01???10010: begin  // fnmsub.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_SUB] = 1'b1; d32_func[FUNC_MAU_NEG] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????00???10011: begin  // fnmadd.s
+                d32_eu = EU_FP;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_NEG] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b?????01???10011: begin  // fnmadd.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
+                d32_func[FUNC_MAU_NEG] = 1'b1;
                 d32_illegal = 1'b1;
             end
             default: d32_illegal = 1'b1;   // FP/vector/AMO-LR-SC/custom-0/
@@ -1822,6 +1898,11 @@ module IDU (
                                   && (ex1_func_r[FUNC_SPU_SGN] || ex1_func_r[FUNC_CLASS]);
     assign idu_fpu_ex1_fcnvt_sel = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && (ex1_func_r[FUNC_CVT_WIDDEN] || ex1_func_r[FUNC_CVT_NARROW]);
+    // M5 Task 5: FUNC_MAU_MUL alone identifies FMAU-class ops (see the
+    // port declaration comment -- FUSED/SUB/NEG can't serve this role
+    // since plain fmul sets FUSED=0 with SUB/NEG don't-care).
+    assign idu_fpu_ex1_fmau_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
+                                  && ex1_func_r[FUNC_MAU_MUL];
     assign idu_fpu_ex1_func      = ex1_func_r;
     assign idu_fpu_ex1_rm        = ex1_rm_r;
     assign idu_fpu_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};
