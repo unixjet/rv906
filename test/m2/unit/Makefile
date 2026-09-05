@@ -33,7 +33,7 @@ VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
 BIN_DIR = $(ROOT)/bin/unit
 
 .PHONY: all run clean
-all: csr iu rtu idu dcache mmu lsu lr_sc
+all: csr iu rtu idu dcache mmu lsu lr_sc fpu
 
 #-----------------------------------------------------------------------------
 # CSR (plan task 2.2)
@@ -166,6 +166,23 @@ $(LR_SC_BIN): $(LR_SC_RTL) $(CURDIR)/lr_sc_tb.cpp
 		-o $@ $(LR_SC_RTL) $(CURDIR)/lr_sc_tb.cpp
 	$(MAKE) -C $(LR_SC_OBJ) -f VLSU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
 
+#-----------------------------------------------------------------------------
+# FPU (M5 task 3) -- FALU sub-block only (add/sub/cmp/min-max, sign-inject
+# + fclass, float-to-float convert); not yet reachable from IDU decode.
+#-----------------------------------------------------------------------------
+FPU_OBJ = $(ROOT)/obj/unit/fpu
+FPU_BIN = $(BIN_DIR)/fpu_tb
+FPU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/FPU.v
+
+.PHONY: fpu
+fpu: $(FPU_BIN)
+
+$(FPU_BIN): $(FPU_RTL) $(CURDIR)/fpu_tb.cpp
+	@mkdir -p $(FPU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module FPU --Mdir $(FPU_OBJ) \
+		-o $@ $(FPU_RTL) $(CURDIR)/fpu_tb.cpp
+	$(MAKE) -C $(FPU_OBJ) -f VFPU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
 # Run EVERY bench even when one fails, then report -- a recipe line that
 # exits non-zero would otherwise abort the target and hide the benches
 # behind it, exactly backwards for a regression run (test/m1/unit/Makefile
@@ -180,10 +197,11 @@ run: all
 	$(MMU_BIN) || rc=1; \
 	$(LSU_BIN) || rc=1; \
 	$(LR_SC_BIN) || rc=1; \
+	$(FPU_BIN) || rc=1; \
 	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
 	exit $$rc
 
 clean:
 	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN) $(ROOT)/obj/unit/idu $(IDU_BIN) \
 	       $(ROOT)/obj/unit/dcache $(DCACHE_BIN) $(ROOT)/obj/unit/mmu $(MMU_BIN) $(ROOT)/obj/unit/lsu $(LSU_BIN) \
-	       $(ROOT)/obj/unit/lr_sc $(LR_SC_BIN)
+	       $(ROOT)/obj/unit/lr_sc $(LR_SC_BIN) $(ROOT)/obj/unit/fpu $(FPU_BIN)

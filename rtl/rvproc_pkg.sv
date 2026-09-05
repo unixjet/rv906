@@ -760,4 +760,52 @@ parameter [2:0] FP_RM_RUP  = 3'b011;  // round up (towards +inf)
 parameter [2:0] FP_RM_RMM  = 3'b100;  // round to nearest, ties to max magnitude
 parameter [2:0] FP_RM_DYN  = 3'b111;  // dynamic -- use frm CSR
 
+// M5 Task 3: FPU.v FALU micro-op FUNC_* bit positions. UNLIKE the
+// ALU_FUNC_*/LSU_FUNC_*/CP0_FUNC_* families above, these are NOT a literal
+// donor bit-layout citation, but C906 DOES have a real scalar-FALU control
+// word to cite: `vpu_group_1_xx_ex1_func` (20 bits, decoded in
+// refs/openc906/C906_RTL_FACTORY/gen_rtl/vfalu/rtl/aq_fadd_scalar_dp.v:542-566
+// [add/sub/cmp/max/min group], aq_fspu_top.v:195-227 [sgnj/class/mv group],
+// aq_fcnvt_scalar_dp.v:449-513 [widen/narrow group]). The functional op
+// groupings below are traceable to that word one-for-one, and some
+// individual sub-fields even land on the identical bit (donor's sign-inject
+// group gates on func[6] with j/n/x sub-select at func[0]/[1]/[2] --
+// exactly FUNC_SPU_SGN=6/_SGN_J=0/_SGN_N=1/_SGN_X=2 below). But the FULL
+// bit assignment is not a match (e.g. donor's fclass is func[7], not bit 18
+// here) because C906 packs this word wider (20b, shared with its
+// vector/DSP cluster) than rv906's narrower scalar-only word. The concrete
+// bit positions instead mirror rv12's own FPUAlu.v encoding (itself
+// independently derived from C910's decode, per rv12's own citations)
+// purely to ease porting FPUAlu.v's algorithms into FPU.v; reusing
+// FUNC_WIDTH is a naming convenience, not a claim of shared origin with the
+// value-compare families. Only the bits Task 3's restricted scope (FADD
+// full; FSPU sign-inject+fclass only; FCNVT float-to-float only) actually
+// needs are listed -- the fmv.*/f2i/i2f bits rv12 also defines are deferred
+// to Task 7 and added there. rv12's FUNC_SCALAR bit is dropped outright
+// (not deferred): rv906 has no vector/SIMD FP context at all (D1), so its
+// box_check_en collapses to `f_single` directly instead of rv12's
+// `f_scalar && f_single`.
+parameter FUNC_DOUBLE      = 16;  // format nibble (shared FADD/FSPU/FCNVT)
+parameter FUNC_B_SINGLE    = 15;
+parameter FUNC_CLASS       = 18;
+
+parameter FUNC_ADD         = 12;  // FADD op/compare group
+parameter FUNC_SUB         = 11;
+parameter FUNC_CMP         = 10;
+parameter FUNC_MAX         = 9;
+parameter FUNC_MIN         = 8;
+parameter FUNC_CMP_FNE     = 4;
+parameter FUNC_CMP_FORD    = 3;
+parameter FUNC_CMP_LE      = 2;
+parameter FUNC_CMP_LT      = 1;
+parameter FUNC_CMP_FEQ     = 0;
+
+parameter FUNC_SPU_SGN     = 6;   // FSPU sign-inject group (mv ops: Task 7)
+parameter FUNC_SPU_SGN_X   = 2;
+parameter FUNC_SPU_SGN_N   = 1;
+parameter FUNC_SPU_SGN_J   = 0;
+
+parameter FUNC_CVT_WIDDEN  = 14;  // FCNVT format group (f2i/i2f: Task 7)
+parameter FUNC_CVT_NARROW  = 13;
+
 endpackage

@@ -382,11 +382,19 @@ module RVProc #(
     wire [63:0]              idu_cp0_ex1_src1_data;
     wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
     wire                     idu_cp0_ex1_inst_len;   // Task 7.3
-    // M5 Task 2: FRF read-port outputs. No consumer exists until Task 3
-    // (FPU.v) -- dangling here, same as any pre-consumer landing pad.
+    // M5 Task 2: FRF read-port outputs. Consumed by FPU.v below (Task 3);
+    // idu_fpu_ex1_fsrc2_data still has no consumer (fmadd family: Task 5).
     wire [63:0]              idu_fpu_ex1_fsrc0_data;
     wire [63:0]              idu_fpu_ex1_fsrc1_data;
     wire [63:0]              idu_fpu_ex1_fsrc2_data;
+
+    // M5 Task 3: FPU.v FALU outputs. IDU decode does not yet route to
+    // FPU (Task 4), so these are landing pads with no consumer yet.
+    wire [63:0]              fpu_rtu_ex1_falu_fdata;
+    wire [63:0]              fpu_rtu_ex1_falu_xdata;
+    wire [4:0]               fpu_rtu_ex1_falu_fflags;
+    wire                     fpu_rtu_ex1_falu_fvld;
+    wire                     fpu_rtu_ex1_falu_xvld;
     wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
     wire [15:0]              iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
 
@@ -1009,6 +1017,33 @@ module RVProc #(
         .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr)
+    );
+
+    //=========================================================================
+    // FPU instance: FALU sub-block only (Task 3). IDU decode does not yet
+    // drive the `_fadd_sel`/`_fspu_sel`/`_fcnvt_sel`/`_func`/`_rm` inputs
+    // (Task 4 wires those up), so they're tied to inert constants here --
+    // same pattern as the RTU->IDU tie-offs above. `idu_fpu_ex1_fsrc0/1_data`
+    // are the real M5 Task 2 FRF read-port outputs. `fpu_rtu_ex1_falu_*`
+    // outputs have no consumer yet (RTU wiring lands with Task 4).
+    //=========================================================================
+    FPU u_fpu (
+        .clk                       (clk),
+        .rst_n                     (rst_n),
+
+        .idu_fpu_ex1_fadd_sel      (1'b0),
+        .idu_fpu_ex1_fspu_sel      (1'b0),
+        .idu_fpu_ex1_fcnvt_sel     (1'b0),
+        .idu_fpu_ex1_func          ({FUNC_WIDTH{1'b0}}),
+        .idu_fpu_ex1_rm            (3'b000),
+        .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
+        .idu_fpu_ex1_fsrc1_data    (idu_fpu_ex1_fsrc1_data),
+
+        .fpu_rtu_ex1_falu_fdata    (fpu_rtu_ex1_falu_fdata),
+        .fpu_rtu_ex1_falu_xdata    (fpu_rtu_ex1_falu_xdata),
+        .fpu_rtu_ex1_falu_fflags   (fpu_rtu_ex1_falu_fflags),
+        .fpu_rtu_ex1_falu_fvld     (fpu_rtu_ex1_falu_fvld),
+        .fpu_rtu_ex1_falu_xvld     (fpu_rtu_ex1_falu_xvld)
     );
 
     //=========================================================================
