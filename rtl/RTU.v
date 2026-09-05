@@ -285,6 +285,18 @@ module RTU (
     input  wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc,
 
     //=========================================================================
+    // FPU -> RTU : M5 Task 4b FALU EX1 writeback (design doc S7.3 style --
+    // fvld/fdata/preg feed the new wbf0 FRF-writeback register below; xvld/
+    // xdata/preg join the EX1-group rbus arbiter as a third leg alongside
+    // ex1_fwd_vld/cp0_rtu_ex1_wb_vld (GPR-destined compare/classify results).
+    //=========================================================================
+    input  wire [63:0]              fpu_rtu_ex1_falu_fdata,
+    input  wire [63:0]              fpu_rtu_ex1_falu_xdata,
+    input  wire                     fpu_rtu_ex1_falu_fvld,
+    input  wire                     fpu_rtu_ex1_falu_xvld,
+    input  wire [GPR_IDX_WIDTH-1:0] fpu_rtu_ex1_falu_preg,
+
+    //=========================================================================
     // RTU -> CSR : trap-entry capture (RTU note S7).
     //=========================================================================
     output wire                     rtu_yy_xx_expt_vld,
@@ -330,6 +342,12 @@ module RTU (
     output wire [63:0]              rtu_idu_wb1_data,
     output wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg,
     output wire                     rtu_idu_wb1_vld,
+    // M5 Task 4b: FRF writeback, registered one cycle behind EX1 like wb0
+    // (design doc S7.3). wbf1 stays reserved/tied-off (future LSU-FRF path,
+    // "Task 4c") -- FALU is the only wbf0 producer today.
+    output wire [63:0]              rtu_idu_wbf0_data,
+    output wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf0_reg,
+    output wire                     rtu_idu_wbf0_vld,
     output wire                     rtu_idu_flush_fe,
     output wire                     rtu_idu_flush_stall,
     output wire                     rtu_idu_flush_wbt,
@@ -497,20 +515,27 @@ module RTU (
     end
     wire ex1_fwd_vld = |ex1_fwd_src_vld;
 
-    // ---- EX1-group overall winner: ALU/BJU-merged-fwd vs CP0 (mutually
-    // exclusive by single-issue dispatch; aq_rtu_rbus.v:372-407).
-    wire [1:0] ex1_wb_src_vld = {ex1_fwd_vld, cp0_rtu_ex1_wb_vld};
+    // ---- EX1-group overall winner: ALU/BJU-merged-fwd vs CP0 vs FALU's
+    // GPR-destined xvld (M5 Task 4b: fcmp/fclass results, compare/classify
+    // FUNC arms per FPU.v SECTION 12) -- mutually exclusive by single-issue
+    // dispatch, same discipline as the donor's 2-leg merge
+    // (aq_rtu_rbus.v:372-407); the FALU leg has no donor precedent (FP is a
+    // new EU not present in the donor's rbus scheme as adapted here) and is
+    // provably dead pre-Task-9 (misa.F/D=0 keeps d32_illegal=1 for every
+    // OP-FP arm, so ex1_eu_r[EU_FP_SEL] can never be true).
+    wire [2:0] ex1_wb_src_vld = {fpu_rtu_ex1_falu_xvld, ex1_fwd_vld, cp0_rtu_ex1_wb_vld};
     reg  [GPR_IDX_WIDTH-1:0] ex1_wb_preg;
     reg  [63:0]              ex1_wb_data;
     always @* begin
         case (ex1_wb_src_vld)
-            2'b01: begin ex1_wb_preg = cp0_rtu_ex1_wb_preg; ex1_wb_data = cp0_rtu_ex1_wb_data; end
-            2'b10: begin ex1_wb_preg = ex1_fwd_preg;        ex1_wb_data = ex1_fwd_data;        end
+            3'b001: begin ex1_wb_preg = cp0_rtu_ex1_wb_preg;      ex1_wb_data = cp0_rtu_ex1_wb_data;      end
+            3'b010: begin ex1_wb_preg = ex1_fwd_preg;             ex1_wb_data = ex1_fwd_data;             end
+            3'b100: begin ex1_wb_preg = fpu_rtu_ex1_falu_preg;    ex1_wb_data = fpu_rtu_ex1_falu_xdata;   end
             default: begin ex1_wb_preg = {GPR_IDX_WIDTH{1'b0}}; ex1_wb_data = 64'd0; end
         endcase
     end
     wire ex1_wb_dp  = |ex1_wb_src_vld;
-    wire ex1_wb_vld = iu_rtu_ex1_alu_wb_vld || iu_rtu_ex1_bju_wb_vld || cp0_rtu_ex1_wb_vld;
+    wire ex1_wb_vld = iu_rtu_ex1_alu_wb_vld || iu_rtu_ex1_bju_wb_vld || cp0_rtu_ex1_wb_vld || fpu_rtu_ex1_falu_xvld;
 
     // ---- Top arbiter + writeback-race grants (aq_rtu_rbus.v:467-468).
     wire div_wb_grant = !ex1_wb_dp;
@@ -911,6 +936,31 @@ module RTU (
     assign rtu_idu_wb1_vld  = lsu_rtu_wb_vld;
     assign rtu_idu_wb1_reg  = lsu_rtu_wb_preg;
     assign rtu_idu_wb1_data = lsu_rtu_wb_data;
+
+    // ---- wbf0 (M5 Task 4b): FRF write port, registered ONE cycle behind
+    // the EX1-cycle FALU producer -- same single register stage as wb0
+    // above (design doc S7.3). No arbiter needed: FALU is the only wbf0
+    // producer until FMAU/FDSU land (Tasks 5/6), at which point a merge
+    // analogous to ex1_fwd_src_vld's one-hot mux belongs here. wbf1 stays
+    // reserved/tied-off (future LSU-FRF path, "Task 4c").
+    reg        wbf0_vld_r;
+    reg [GPR_IDX_WIDTH-1:0] wbf0_preg_r;
+    reg [63:0] wbf0_data_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wbf0_vld_r  <= 1'b0;
+            wbf0_preg_r <= {GPR_IDX_WIDTH{1'b0}};
+            wbf0_data_r <= 64'd0;
+        end else begin
+            wbf0_vld_r  <= fpu_rtu_ex1_falu_fvld;
+            wbf0_preg_r <= fpu_rtu_ex1_falu_preg;
+            wbf0_data_r <= fpu_rtu_ex1_falu_fdata;
+        end
+    end
+
+    assign rtu_idu_wbf0_vld  = wbf0_vld_r;
+    assign rtu_idu_wbf0_reg  = wbf0_preg_r;
+    assign rtu_idu_wbf0_data = wbf0_data_r;
 
     // Internal aliases so the drain-gate section above (which is written
     // textually before this section) can read wb0/wb1 vld without a

@@ -258,6 +258,10 @@ module IDU (
     output wire                     idu_fpu_ex1_fcnvt_sel,
     output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
     output wire [2:0]               idu_fpu_ex1_rm,
+    // M5 Task 4b: destination register tag (rd), same pass-through shape as
+    // idu_iu_ex1_dst0_reg/idu_cp0_ex1_dst0_reg -- FPU forwards it unchanged
+    // to fpu_rtu_ex1_falu_preg for RTU's FRF/GPR writeback routing.
+    output wire [GPR_IDX_WIDTH-1:0] idu_fpu_ex1_dst0_reg,
 
     //=========================================================================
     // RTU -> IDU : the exclusive bypass network (IDU note S6) + the 2
@@ -867,6 +871,82 @@ module IDU (
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_CLASS] = 1'b1;
                 d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
             end
+            // M5 Task 4 (part b): OP-FP add/sub/minmax/sgnj/f2f-convert --
+            // FRF-destination (unlike part a's GPR-destined compare/classify).
+            // d32_dst0_vld is deliberately left 0 here: fpu_rtu_ex1_falu_fvld
+            // (FPU.v SECTION 12) is what marks these FRF-bound, computed
+            // there from the same FUNC bits set below -- no separate
+            // "FRF dest valid" decode signal is needed. d32_dst0_reg (the rd
+            // field, default-set above) still flows through unconditionally
+            // to idu_fpu_ex1_dst0_reg for the eventual FRF writeback tag.
+            // Same illegal/EU_FP-can't-dispatch-pre-swap reasoning as part a.
+            15'b0000000_???_10100: begin  // fadd.s
+                d32_eu = EU_FP; d32_func[FUNC_ADD] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0000001_???_10100: begin  // fadd.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_ADD] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0000100_???_10100: begin  // fsub.s
+                d32_eu = EU_FP; d32_func[FUNC_SUB] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0000101_???_10100: begin  // fsub.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_SUB] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010100_000_10100: begin  // fmin.s
+                d32_eu = EU_FP; d32_func[FUNC_MIN] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0010100_001_10100: begin  // fmax.s
+                d32_eu = EU_FP; d32_func[FUNC_MAX] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0010101_000_10100: begin  // fmin.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MIN] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010101_001_10100: begin  // fmax.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MAX] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010000_000_10100: begin  // fsgnj.s
+                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_J] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010000_001_10100: begin  // fsgnjn.s
+                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_N] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010000_010_10100: begin  // fsgnjx.s
+                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_X] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010001_000_10100: begin  // fsgnj.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_J] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010001_001_10100: begin  // fsgnjn.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_N] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0010001_010_10100: begin  // fsgnjx.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_X] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            // fcvt.s.d (double->single, a "narrow" conversion) / fcvt.d.s
+            // (single->double, "widen") -- rs2 selects the pair (00001/00000)
+            // like fclass's rs2=00000 above; not separately legality-checked
+            // (harmless: everything here is illegal anyway).
+            15'b0100000_???_10100: begin  // fcvt.s.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_CVT_NARROW] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0100001_???_10100: begin  // fcvt.d.s
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1; d32_func[FUNC_CVT_WIDDEN] = 1'b1;
+                d32_illegal = 1'b1;
+            end
             default: d32_illegal = 1'b1;   // FP/vector/AMO-LR-SC/custom-0/
                                             // dret/any unallocated encoding
                                             // (5.1's closed illegal-decode list;
@@ -1123,6 +1203,12 @@ module IDU (
     wire [4:0]            dis_dst0_reg5 = is32 ? d32_dst0_reg     : d16_dst0_reg;
     wire [63:0]           dis_src1_imm  = is32 ? d32_src1_imm     : d16_src1_imm;
     wire [63:0]           dis_src2_imm  = is32 ? d32_src2_imm     : d16_src2_imm;
+    // M5 Task 4b: OP-FP's funct3 field IS the rm field for FADD/FSUB/FCVT.f2f
+    // (dynamic rounding mode) and a fixed sub-op selector (already captured
+    // in FUNC bits above) for FMIN/FMAX/FSGNJ* -- passing it through
+    // unconditionally is harmless for the latter group since FPU.v's
+    // fspu/minmax result paths never consult idu_fpu_ex1_rm.
+    wire [2:0]            dis_rm        = inst[14:12];
 
     // M4 Task 6: the fetch-fault tags, live at ID exactly like `inst` itself
     // (IFU.v's own SECTION IBUF anchors both at ibuf_head/h0). Force EU_CP0
@@ -1526,6 +1612,8 @@ module IDU (
     reg [1:0]               ex1_bht_pred_r;
     reg [31:0]              ex1_opcode_r;
     reg                     ex1_illegal_r;
+    // M5 Task 4b: latched funct3/rm field, feeds idu_fpu_ex1_rm below.
+    reg [2:0]               ex1_rm_r;
     // M4 Task 6: fetch-fault siblings of ex1_illegal_r, latched the same
     // cycle/same way.
     reg                     ex1_fetch_pgflt_r, ex1_fetch_accflt_r;
@@ -1612,6 +1700,7 @@ module IDU (
             ex1_fetch_pgflt_r  <= 1'b0;
             ex1_fetch_accflt_r <= 1'b0;
             ex1_inst_len_r  <= 1'b0;
+            ex1_rm_r        <= 3'b000;
         end else if (adv) begin
             ex1_func_r      <= dis_func;
             ex1_src0_data_r <= dis_src0_data; ex1_src0_rdy_r <= dis_src0_rdy; ex1_src0_reg_r <= dis_src0_reg5;
@@ -1624,6 +1713,7 @@ module IDU (
             ex1_fetch_pgflt_r  <= dis_fetch_pgflt;
             ex1_fetch_accflt_r <= dis_fetch_accflt;
             ex1_inst_len_r  <= is32;
+            ex1_rm_r        <= dis_rm;
         end else begin
             if (lf0_hit) begin ex1_src0_data_r <= lf0_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src0_rdy_r <= 1'b1; end
             if (lf1_hit) begin ex1_src1_data_r <= lf1_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src1_rdy_r <= 1'b1; end
@@ -1679,7 +1769,8 @@ module IDU (
     assign idu_fpu_ex1_fcnvt_sel = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && (ex1_func_r[FUNC_CVT_WIDDEN] || ex1_func_r[FUNC_CVT_NARROW]);
     assign idu_fpu_ex1_func      = ex1_func_r;
-    assign idu_fpu_ex1_rm        = 3'b000;  // Task 4b wires real rm decode
+    assign idu_fpu_ex1_rm        = ex1_rm_r;
+    assign idu_fpu_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};
     // M4 Task 5 fix: same term set as idu_lsu_ex1_sel, minus !lsu_idu_full --
     // see the port declaration comment (~line 186).
     assign idu_lsu_ex1_raw_vld   = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit;

@@ -79,6 +79,11 @@ module FPU (
     input  wire [2:0]                  idu_fpu_ex1_rm,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc0_data,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc1_data,
+    // M5 Task 4b: destination register tag, pure pass-through (IU.v's
+    // `iu_rtu_ex1_alu_preg = idu_iu_ex1_dst0_reg` / CSR.v's
+    // `cp0_rtu_ex1_wb_preg = idu_cp0_ex1_dst0_reg` precedent) -- RTU uses
+    // this to route the FRF writeback (rtu_idu_wbf0_reg).
+    input  wire [GPR_IDX_WIDTH-1:0]    idu_fpu_ex1_dst0_reg,
 
     //=========================================================================
     // FPU -> RTU : the FALU's two answer shapes (rv12 FPUAlu.v's `ex1_mfvr`/
@@ -91,7 +96,8 @@ module FPU (
     output wire [XLEN-1:0]             fpu_rtu_ex1_falu_xdata,
     output wire [4:0]                  fpu_rtu_ex1_falu_fflags,
     output wire                        fpu_rtu_ex1_falu_fvld,
-    output wire                        fpu_rtu_ex1_falu_xvld
+    output wire                        fpu_rtu_ex1_falu_xvld,
+    output wire [GPR_IDX_WIDTH-1:0]    fpu_rtu_ex1_falu_preg
 );
 
     //=========================================================================
@@ -753,6 +759,11 @@ module FPU (
     // xvld: an integer-register-destination result -- compare or fclass.
     assign fpu_rtu_ex1_falu_xvld   = (idu_fpu_ex1_fadd_sel && op_cmp)
                                     || (idu_fpu_ex1_fspu_sel && spu_op_class);
+
+    // M5 Task 4b: pure pass-through, shared by both the fdata (FRF) and
+    // xdata (GPR) answer shapes -- RTU picks which regfile to write from
+    // fvld/xvld, not from this tag.
+    assign fpu_rtu_ex1_falu_preg   = idu_fpu_ex1_dst0_reg;
 
     // D1: clk/rst_n are frozen into the port list for FMAU/FDSU (later M5
     // tasks) but this task's FALU body is purely combinational.

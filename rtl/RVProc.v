@@ -397,6 +397,9 @@ module RVProc #(
     wire                     idu_fpu_ex1_fcnvt_sel;
     wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
     wire [2:0]               idu_fpu_ex1_rm;
+    // M5 Task 4b: FPU destination-register pass-through (IDU decode ->
+    // FPU -> RTU, mirrors idu_iu_ex1_dst0_reg/idu_cp0_ex1_dst0_reg).
+    wire [GPR_IDX_WIDTH-1:0] idu_fpu_ex1_dst0_reg;
 
     // M5 Task 3: FPU.v FALU outputs. IDU decode does not yet route to
     // FPU (Task 4), so these are landing pads with no consumer yet.
@@ -405,6 +408,9 @@ module RVProc #(
     wire [4:0]               fpu_rtu_ex1_falu_fflags;
     wire                     fpu_rtu_ex1_falu_fvld;
     wire                     fpu_rtu_ex1_falu_xvld;
+    // M5 Task 4b: FALU destination-register pass-through, feeds RTU's EX1
+    // rbus arbiter + the new wbf0 register (RTU.v).
+    wire [GPR_IDX_WIDTH-1:0] fpu_rtu_ex1_falu_preg;
     wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
     wire [15:0]              iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
 
@@ -539,8 +545,11 @@ module RVProc #(
     wire [63:0]              rtu_idu_wb1_data;
     wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg;
     wire                     rtu_idu_wb1_vld;
-    // M5 Task 2: FRF write ports. No producer exists until Task 3+ (RTU.v
-    // gains no FPU-facing ports yet) -- tied 0 at the instantiation below.
+    // M5 Task 4b: FRF write port (wbf0), real RTU-driven signals now.
+    // wbf1 stays tied 0 at the instantiation below (future LSU-FRF path).
+    wire [63:0]              rtu_idu_wbf0_data;
+    wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf0_reg;
+    wire                     rtu_idu_wbf0_vld;
 
     wire                     rtu_idu_flush_fe;
     wire                     rtu_idu_flush_stall;
@@ -885,6 +894,7 @@ module RVProc #(
         .idu_fpu_ex1_fcnvt_sel   (idu_fpu_ex1_fcnvt_sel),
         .idu_fpu_ex1_func        (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm          (idu_fpu_ex1_rm),
+        .idu_fpu_ex1_dst0_reg    (idu_fpu_ex1_dst0_reg),
 
         .rtu_idu_fwd0_data       (rtu_idu_fwd0_data),
         .rtu_idu_fwd0_reg        (rtu_idu_fwd0_reg),
@@ -901,9 +911,9 @@ module RVProc #(
         .rtu_idu_wb1_data        (rtu_idu_wb1_data),
         .rtu_idu_wb1_reg         (rtu_idu_wb1_reg),
         .rtu_idu_wb1_vld         (rtu_idu_wb1_vld),
-        .rtu_idu_wbf0_data       (64'd0),
-        .rtu_idu_wbf0_reg        ({GPR_IDX_WIDTH{1'b0}}),
-        .rtu_idu_wbf0_vld        (1'b0),
+        .rtu_idu_wbf0_data       (rtu_idu_wbf0_data),
+        .rtu_idu_wbf0_reg        (rtu_idu_wbf0_reg),
+        .rtu_idu_wbf0_vld        (rtu_idu_wbf0_vld),
         .rtu_idu_wbf1_data       (64'd0),
         .rtu_idu_wbf1_reg        ({GPR_IDX_WIDTH{1'b0}}),
         .rtu_idu_wbf1_vld        (1'b0),
@@ -1055,12 +1065,14 @@ module RVProc #(
         .idu_fpu_ex1_rm            (idu_fpu_ex1_rm),
         .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
         .idu_fpu_ex1_fsrc1_data    (idu_fpu_ex1_fsrc1_data),
+        .idu_fpu_ex1_dst0_reg      (idu_fpu_ex1_dst0_reg),
 
         .fpu_rtu_ex1_falu_fdata    (fpu_rtu_ex1_falu_fdata),
         .fpu_rtu_ex1_falu_xdata    (fpu_rtu_ex1_falu_xdata),
         .fpu_rtu_ex1_falu_fflags   (fpu_rtu_ex1_falu_fflags),
         .fpu_rtu_ex1_falu_fvld     (fpu_rtu_ex1_falu_fvld),
-        .fpu_rtu_ex1_falu_xvld     (fpu_rtu_ex1_falu_xvld)
+        .fpu_rtu_ex1_falu_xvld     (fpu_rtu_ex1_falu_xvld),
+        .fpu_rtu_ex1_falu_preg     (fpu_rtu_ex1_falu_preg)
     );
 
     //=========================================================================
@@ -1273,6 +1285,12 @@ module RVProc #(
         .cp0_rtu_ex1_chgflw_pc   (cp0_rtu_ex1_chgflw_pc),
         .cp0_rtu_trap_pc         (cp0_rtu_trap_pc),
 
+        .fpu_rtu_ex1_falu_fdata  (fpu_rtu_ex1_falu_fdata),
+        .fpu_rtu_ex1_falu_xdata  (fpu_rtu_ex1_falu_xdata),
+        .fpu_rtu_ex1_falu_fvld   (fpu_rtu_ex1_falu_fvld),
+        .fpu_rtu_ex1_falu_xvld   (fpu_rtu_ex1_falu_xvld),
+        .fpu_rtu_ex1_falu_preg   (fpu_rtu_ex1_falu_preg),
+
         .rtu_yy_xx_expt_vld      (rtu_yy_xx_expt_vld),
         .rtu_yy_xx_expt_int      (rtu_yy_xx_expt_int),
         .rtu_yy_xx_expt_vec      (rtu_yy_xx_expt_vec),
@@ -1302,6 +1320,9 @@ module RVProc #(
         .rtu_idu_wb1_data        (rtu_idu_wb1_data),
         .rtu_idu_wb1_reg         (rtu_idu_wb1_reg),
         .rtu_idu_wb1_vld         (rtu_idu_wb1_vld),
+        .rtu_idu_wbf0_data       (rtu_idu_wbf0_data),
+        .rtu_idu_wbf0_reg        (rtu_idu_wbf0_reg),
+        .rtu_idu_wbf0_vld        (rtu_idu_wbf0_vld),
         .rtu_idu_flush_fe        (rtu_idu_flush_fe),
         .rtu_idu_flush_stall     (rtu_idu_flush_stall),
         .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),

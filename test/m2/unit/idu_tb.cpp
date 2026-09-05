@@ -159,6 +159,18 @@ static const uint32_t FUNC_CMP_BIT      = 10;
 static const uint32_t FUNC_CMP_LE_BIT   = 2;
 static const uint32_t FUNC_CMP_LT_BIT   = 1;
 static const uint32_t FUNC_CMP_FEQ_BIT  = 0;
+// M5 Task 4b: FADD/FSUB/FMINMAX/FSGNJ/FCVT (f2f) arms (rvproc_pkg.sv).
+static const uint32_t FUNC_B_SINGLE_BIT   = 15;
+static const uint32_t FUNC_CVT_WIDDEN_BIT = 14;
+static const uint32_t FUNC_CVT_NARROW_BIT = 13;
+static const uint32_t FUNC_ADD_BIT        = 12;
+static const uint32_t FUNC_SUB_BIT        = 11;
+static const uint32_t FUNC_MAX_BIT        = 9;
+static const uint32_t FUNC_MIN_BIT        = 8;
+static const uint32_t FUNC_SPU_SGN_BIT    = 6;
+static const uint32_t FUNC_SPU_SGN_X_BIT  = 2;
+static const uint32_t FUNC_SPU_SGN_N_BIT  = 1;
+static const uint32_t FUNC_SPU_SGN_J_BIT  = 0;
 
 static uint32_t addi(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x0, rd, OP_OPIMM); }
 static uint32_t add_ (uint32_t rd, uint32_t rs1, uint32_t rs2) { return enc_r(0x00, rs2, rs1, 0x0, rd, OP_OP); }
@@ -195,6 +207,25 @@ static uint32_t flt_d(void) { return enc_r(0x51, 2, 1, 0x1, 5, OP_FP); }
 static uint32_t fle_d(void) { return enc_r(0x51, 2, 1, 0x0, 5, OP_FP); }
 static uint32_t fclass_s(void) { return enc_r(0x70, 0, 1, 0x1, 5, OP_FP); }
 static uint32_t fclass_d(void) { return enc_r(0x71, 0, 1, 0x1, 5, OP_FP); }
+// M5 Task 4b: OP-FP add/sub/minmax/sgnj-family/f2f-convert (IDU.v:883-948).
+// rd=5, rs1=1, rs2=2 (rs2 arbitrary/ignored for the f2f-convert pair, per
+// IDU.v's comment at 938-941 -- not separately legality-checked there).
+static uint32_t fadd_s(uint32_t rm) { return enc_r(0x00, 2, 1, rm, 5, OP_FP); }
+static uint32_t fadd_d(uint32_t rm) { return enc_r(0x01, 2, 1, rm, 5, OP_FP); }
+static uint32_t fsub_s(uint32_t rm) { return enc_r(0x04, 2, 1, rm, 5, OP_FP); }
+static uint32_t fsub_d(uint32_t rm) { return enc_r(0x05, 2, 1, rm, 5, OP_FP); }
+static uint32_t fmin_s(void) { return enc_r(0x14, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t fmax_s(void) { return enc_r(0x14, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fmin_d(void) { return enc_r(0x15, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t fmax_d(void) { return enc_r(0x15, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fsgnj_s(void)  { return enc_r(0x10, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t fsgnjn_s(void) { return enc_r(0x10, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fsgnjx_s(void) { return enc_r(0x10, 2, 1, 0x2, 5, OP_FP); }
+static uint32_t fsgnj_d(void)  { return enc_r(0x11, 2, 1, 0x0, 5, OP_FP); }
+static uint32_t fsgnjn_d(void) { return enc_r(0x11, 2, 1, 0x1, 5, OP_FP); }
+static uint32_t fsgnjx_d(void) { return enc_r(0x11, 2, 1, 0x2, 5, OP_FP); }
+static uint32_t fcvt_s_d(uint32_t rm) { return enc_r(0x20, 1, 1, rm, 5, OP_FP); }
+static uint32_t fcvt_d_s(uint32_t rm) { return enc_r(0x21, 0, 1, rm, 5, OP_FP); }
 static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
 static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
 
@@ -524,6 +555,119 @@ static void test_fp_cmp_class_decode(void) {
           && ((dut->idu_fpu_ex1_func >> FUNC_CLASS_BIT) & 1) == 1,
           "fclass.d: FUNC_DOUBLE+FUNC_CLASS bits set");
     test_result("T10c OP-FP compare/classify decode (M5 Task 4a): func bits correct, dead-wired pre-Task-9");
+}
+
+// ---- M5 Task 4b: OP-FP add/sub/minmax/sgnj-family/f2f-convert decode arms
+// (IDU.v:883-948). Same dead-wired-pre-Task-9 reasoning as T10c: FUNC bits
+// decode correctly (ex1_func_r is not illegal-gated) but fadd_sel/fspu_sel/
+// fcnvt_sel (gated on ex1_eu_r[EU_FP_SEL]) must stay 0 since misa.F/D=0
+// forces d32_illegal=1 -> dis_eu_final routes to EU_CP0, not EU_FP. Also
+// covers the real idu_fpu_ex1_rm/idu_fpu_ex1_dst0_reg plumbing (RTU.v/
+// RVProc.v wiring added alongside this decode). ----
+static void test_fp_arith_sgnj_cvt_decode(void) {
+    reset_dut();
+    present(fadd_s(0x5)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1,
+          "fadd.s: illegal pre-swap, dispatches to CP0");
+    check(((dut->idu_fpu_ex1_func >> FUNC_ADD_BIT) & 1) == 1,
+          "fadd.s: FUNC_ADD bit set");
+    check(dut->idu_fpu_ex1_rm == 0x5, "fadd.s: idu_fpu_ex1_rm == funct3 (rm field)",
+          dut->idu_fpu_ex1_rm, 0x5);
+    check(dut->idu_fpu_ex1_dst0_reg == 5, "fadd.s: idu_fpu_ex1_dst0_reg == rd (FRF dest tag)");
+    check(dut->idu_fpu_ex1_fadd_sel == 0 && dut->idu_fpu_ex1_fspu_sel == 0
+          && dut->idu_fpu_ex1_fcnvt_sel == 0,
+          "fadd.s: fadd/fspu/fcnvt_sel all stay 0 (ex1_eu_r forced to EU_CP0, not EU_FP)");
+
+    reset_dut();
+    present(fadd_d(0x0)); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_ADD_BIT) & 1) == 1,
+          "fadd.d: FUNC_DOUBLE+FUNC_ADD bits set");
+
+    reset_dut();
+    present(fsub_s(0x0)); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_SUB_BIT) & 1) == 1,
+          "fsub.s: FUNC_SUB bit set");
+
+    reset_dut();
+    present(fsub_d(0x0)); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SUB_BIT) & 1) == 1,
+          "fsub.d: FUNC_DOUBLE+FUNC_SUB bits set");
+
+    reset_dut();
+    present(fmin_s()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_MIN_BIT) & 1) == 1,
+          "fmin.s: FUNC_MIN bit set");
+
+    reset_dut();
+    present(fmax_s()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_MAX_BIT) & 1) == 1,
+          "fmax.s: FUNC_MAX bit set");
+
+    reset_dut();
+    present(fmin_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_MIN_BIT) & 1) == 1,
+          "fmin.d: FUNC_DOUBLE+FUNC_MIN bits set");
+
+    reset_dut();
+    present(fmax_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_MAX_BIT) & 1) == 1,
+          "fmax.d: FUNC_DOUBLE+FUNC_MAX bits set");
+
+    reset_dut();
+    present(fsgnj_s()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_J_BIT) & 1) == 1,
+          "fsgnj.s: FUNC_SPU_SGN+FUNC_SPU_SGN_J bits set");
+
+    reset_dut();
+    present(fsgnjn_s()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_N_BIT) & 1) == 1,
+          "fsgnjn.s: FUNC_SPU_SGN+FUNC_SPU_SGN_N bits set");
+
+    reset_dut();
+    present(fsgnjx_s()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_X_BIT) & 1) == 1,
+          "fsgnjx.s: FUNC_SPU_SGN+FUNC_SPU_SGN_X bits set");
+
+    reset_dut();
+    present(fsgnj_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_J_BIT) & 1) == 1,
+          "fsgnj.d: FUNC_DOUBLE+FUNC_SPU_SGN+FUNC_SPU_SGN_J bits set");
+
+    reset_dut();
+    present(fsgnjn_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_N_BIT) & 1) == 1,
+          "fsgnjn.d: FUNC_DOUBLE+FUNC_SPU_SGN+FUNC_SPU_SGN_N bits set");
+
+    reset_dut();
+    present(fsgnjx_d()); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_SPU_SGN_X_BIT) & 1) == 1,
+          "fsgnjx.d: FUNC_DOUBLE+FUNC_SPU_SGN+FUNC_SPU_SGN_X bits set");
+
+    reset_dut();
+    present(fcvt_s_d(0x0)); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CVT_NARROW_BIT) & 1) == 1,
+          "fcvt.s.d: FUNC_DOUBLE+FUNC_CVT_NARROW bits set (double->single)");
+
+    reset_dut();
+    present(fcvt_d_s(0x0)); tick(); present(0, false);
+    check(((dut->idu_fpu_ex1_func >> FUNC_B_SINGLE_BIT) & 1) == 1
+          && ((dut->idu_fpu_ex1_func >> FUNC_CVT_WIDDEN_BIT) & 1) == 1,
+          "fcvt.d.s: FUNC_B_SINGLE+FUNC_CVT_WIDDEN bits set (single->double)");
+    test_result("T10d OP-FP add/sub/minmax/sgnj/f2f-convert decode (M5 Task 4b): func bits + rm + FRF dst0_reg correct, dead-wired pre-Task-9");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
@@ -904,6 +1048,7 @@ int main(int argc, char **argv) {
     test_illegal_closed_list();
     test_fetch_fault_forces_cp0();
     test_fp_cmp_class_decode();
+    test_fp_arith_sgnj_cvt_decode();
     test_rvc_pairs();
     test_rvc_illegal();
 

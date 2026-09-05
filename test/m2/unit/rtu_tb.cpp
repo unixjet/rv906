@@ -114,6 +114,12 @@ static void tie_idle_inputs(void) {
     dut->cp0_rtu_ex1_chgflw    = 0;
     dut->cp0_rtu_ex1_chgflw_pc = 0;
     dut->cp0_rtu_trap_pc       = 0x80000010ULL;   // mtvec-equivalent target, arbitrary nonzero
+    // FALU (M5 Task 4b: EX1-group rbus arbiter's 3rd leg + registered wbf0)
+    dut->fpu_rtu_ex1_falu_fdata = 0;
+    dut->fpu_rtu_ex1_falu_xdata = 0;
+    dut->fpu_rtu_ex1_falu_fvld  = 0;
+    dut->fpu_rtu_ex1_falu_xvld  = 0;
+    dut->fpu_rtu_ex1_falu_preg  = 0;
 }
 
 static void tick(void) {
@@ -720,6 +726,115 @@ static void test_fwd_collision_mutation(void) {
     test_result("T17 fwd-collision assertion: fires on deliberate violation, x0 exempted, clears on revert");
 }
 
+//-----------------------------------------------------------------------------
+// T18: M5 Task 4b's 3rd EX1-group rbus leg -- fpu_rtu_ex1_falu_xvld/_preg/
+// _xdata (GPR-destined FALU results: fcmp/fclass, RTU.v:518-538). The OUTER
+// arbiter (ex1-group vs DIV vs MUL-EX3, RTU.v:549-568) mirrors T15's
+// peel-one-leg-at-a-time pattern and IS a priority chain -- the FALU xvld
+// leg must win it over DIV/MUL exactly like the ALU/BJU legs already do in
+// T15, and must gate div_wb_grant/mul_wb_grant (RTU.v:541-542, ex1_wb_dp is
+// leg-agnostic). The INNER ex1_wb_src_vld case (RTU.v:526-536) is NOT a
+// priority chain, just a one-hot mux over 3 mutually-exclusive producers
+// (assumed exclusive by single-issue dispatch, undefended in RTL) -- the
+// second sub-test below confirms that asserting two of its legs at once (a
+// structurally-unreachable combo) hits the case default for preg/data
+// while vld (a separate plain OR) still fires -- a latent landmine if that
+// combo were ever reachable, recorded here rather than fixed.
+//-----------------------------------------------------------------------------
+static void test_falu_xvld_arbiter_leg(void) {
+    // FALU alone vs DIV/MUL contending: FALU must win, grants must drop.
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_xvld = 1;
+    dut->fpu_rtu_ex1_falu_preg = 20;
+    dut->fpu_rtu_ex1_falu_xdata = 0xF1;
+    dut->iu_rtu_div_wb_dp  = 1;
+    dut->iu_rtu_div_wb_vld = 1;
+    dut->iu_rtu_div_data   = 0xD9;
+    dut->iu_rtu_div_preg   = 21;
+    dut->iu_rtu_ex3_mul_wb_vld = 1;
+    dut->iu_rtu_ex3_mul_data   = 0xE9;
+    dut->iu_rtu_ex3_mul_preg   = 22;
+    dut->eval();
+    check(dut->rtu_iu_div_wb_grant == 0, "FALU leg: DIV NOT granted while FALU xvld wants the bus");
+    check(dut->rtu_iu_mul_wb_grant == 0, "FALU leg: MUL NOT granted while FALU xvld wants the bus");
+    tick();
+    check(dut->rtu_idu_wb0_vld && dut->rtu_idu_wb0_data == 0xF1 && dut->rtu_idu_wb0_reg == 20,
+          "FALU leg: FALU xvld wins over DIV and MUL-EX3", dut->rtu_idu_wb0_data, 0xF1);
+
+    // The 3-way ex1_wb_src_vld case decodes only the one-hot patterns
+    // 3'b001/3'b010/3'b100 -- it is a mux, not a priority encoder, so
+    // asserting two legs at once (a structurally-unreachable combo under
+    // single-issue dispatch) hits the default arm for preg/data (both go
+    // to 0). Note ex1_wb_vld itself is a PLAIN OR of the four raw *_vld
+    // signals (RTU.v:538), independent of that case -- so vld still fires
+    // even though the data it's paired with is garbage. This is a latent
+    // landmine if the combo were ever reachable, but it structurally isn't
+    // (same "not defended against" property already noted for T15's
+    // outer arbiter) -- recorded here, not fixed, since fixing an
+    // unreachable path is out of scope.
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_xvld  = 1;
+    dut->fpu_rtu_ex1_falu_preg  = 23;
+    dut->fpu_rtu_ex1_falu_xdata = 0xF2;
+    dut->cp0_rtu_ex1_wb_vld  = 1;
+    dut->cp0_rtu_ex1_wb_data = 0xC1;
+    dut->cp0_rtu_ex1_wb_preg = 24;
+    dut->eval();
+    tick();
+    check(dut->rtu_idu_wb0_vld == 1 && dut->rtu_idu_wb0_data == 0 && dut->rtu_idu_wb0_reg == 0,
+          "FALU leg: simultaneous FALU+CP0 (structurally unreachable) hits the case default for data, vld still ORs true",
+          dut->rtu_idu_wb0_data, 0);
+
+    // FALU alone: div/mul grants held at 1 when it retreats.
+    tie_idle_inputs();
+    dut->eval();
+    check(dut->rtu_iu_div_wb_grant == 1, "FALU leg: DIV grant restored once FALU xvld retreats");
+    check(dut->rtu_iu_mul_wb_grant == 1, "FALU leg: MUL grant restored once FALU xvld retreats");
+    test_result("T18 FALU xvld arbiter leg (M5 Task 4b): wins EX1-group case, gates div/mul grants");
+}
+
+//-----------------------------------------------------------------------------
+// T19: M5 Task 4b's registered wbf0 output (FRF-destined FALU results:
+// fadd/fsub/fminmax/fsgnj/f2f-convert, RTU.v:955-963). Driven directly by
+// fpu_rtu_ex1_falu_fvld/_preg/_fdata with NO arbiter (FALU is the only wbf0
+// producer until FMAU/FDSU land) -- one cycle of register delay, mirroring
+// the existing wb0_vld_r/preg_r/data_r pattern exercised by T2/T15. Also
+// confirms wbf0 is independent of the xvld leg tested in T18 (driving both
+// simultaneously must not cross-contaminate either output).
+//-----------------------------------------------------------------------------
+static void test_wbf0_register(void) {
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_fvld  = 1;
+    dut->fpu_rtu_ex1_falu_preg  = 8;
+    dut->fpu_rtu_ex1_falu_fdata = 0x1122334455667788ULL;
+    dut->eval();
+    check(!dut->rtu_idu_wbf0_vld, "wbf0: not yet valid same cycle as fvld (registered, not combinational)");
+    tick();
+    check(dut->rtu_idu_wbf0_vld && dut->rtu_idu_wbf0_reg == 8 &&
+          dut->rtu_idu_wbf0_data == 0x1122334455667788ULL,
+          "wbf0: fires exactly ONE cycle after fvld", dut->rtu_idu_wbf0_data, 0x1122334455667788ULL);
+    tie_idle_inputs();
+    tick();
+    check(!dut->rtu_idu_wbf0_vld, "wbf0: clears once idle (no queue, no skid)");
+
+    // wbf0 (fvld/fdata) and the xvld arbiter leg (xvld/xdata) driven
+    // together must land on their own independent outputs, unmixed.
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_fvld  = 1;
+    dut->fpu_rtu_ex1_falu_preg  = 9;
+    dut->fpu_rtu_ex1_falu_fdata = 0xAAAA;
+    dut->fpu_rtu_ex1_falu_xvld  = 1;
+    dut->fpu_rtu_ex1_falu_preg  = 9;   // shared preg port, per RTU.v's port list
+    dut->fpu_rtu_ex1_falu_xdata = 0xBBBB;
+    dut->eval();
+    tick();
+    check(dut->rtu_idu_wbf0_vld && dut->rtu_idu_wbf0_data == 0xAAAA,
+          "wbf0: fvld/fdata land on wbf0 unmixed with the concurrent xvld leg", dut->rtu_idu_wbf0_data, 0xAAAA);
+    check(dut->rtu_idu_wb0_vld && dut->rtu_idu_wb0_data == 0xBBBB,
+          "wbf0: concurrent xvld/xdata land on wb0 unmixed with wbf0", dut->rtu_idu_wb0_data, 0xBBBB);
+    test_result("T19 wbf0 registered writeback (M5 Task 4b): one-cycle delay, independent of xvld leg");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -747,6 +862,8 @@ int main(int argc, char **argv) {
     test_rbus_arbitration_matrix();
     test_onehot_mutation();
     test_fwd_collision_mutation();
+    test_falu_xvld_arbiter_leg();
+    test_wbf0_register();
 
     printf("[rtu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

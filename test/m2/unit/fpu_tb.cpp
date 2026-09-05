@@ -103,6 +103,7 @@ static void tie_idle_inputs(void) {
     dut->idu_fpu_ex1_rm         = 0;
     dut->idu_fpu_ex1_fsrc0_data = 0;
     dut->idu_fpu_ex1_fsrc1_data = 0;
+    dut->idu_fpu_ex1_dst0_reg   = 0;
 }
 
 static void tick(void) {
@@ -489,6 +490,54 @@ static void test_fcnvt_f2f(void) {
     test_result("T7 FCNVT f2f: fcvt.d.s widen (exact) + fcvt.s.d narrow (rounding/flags)");
 }
 
+//-----------------------------------------------------------------------------
+// T8: idu_fpu_ex1_dst0_reg -> fpu_rtu_ex1_falu_preg pass-through (M5 Task
+// 4b, FPU.v:766: `assign fpu_rtu_ex1_falu_preg = idu_fpu_ex1_dst0_reg;`).
+// A plain combinational wire, unconditional on which EU-internal select
+// (fadd/fspu/fcnvt) drove the result -- checked once per select to confirm
+// none of them re-route or gate it.
+//-----------------------------------------------------------------------------
+static void test_dst0_reg_preg_passthrough(void) {
+    uint32_t f_add = bitv(FUNC_ADD) | bitv(FUNC_DOUBLE);
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fadd_sel   = 1;
+    dut->idu_fpu_ex1_func       = f_add;
+    dut->idu_fpu_ex1_rm         = RM_RNE;
+    dut->idu_fpu_ex1_fsrc0_data = d2b(1.0);
+    dut->idu_fpu_ex1_fsrc1_data = d2b(2.0);
+    dut->idu_fpu_ex1_dst0_reg   = 17;
+    dut->eval();
+    check(dut->fpu_rtu_ex1_falu_preg == 17, "dst0_reg passthrough: fadd_sel",
+          dut->fpu_rtu_ex1_falu_preg, 17);
+    tick();
+
+    uint32_t f_sgnj = bitv(FUNC_SPU_SGN) | bitv(FUNC_SPU_SGN_J);
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fspu_sel   = 1;
+    dut->idu_fpu_ex1_func       = f_sgnj;
+    dut->idu_fpu_ex1_fsrc0_data = d2b(1.0);
+    dut->idu_fpu_ex1_fsrc1_data = d2b(-1.0);
+    dut->idu_fpu_ex1_dst0_reg   = 22;
+    dut->eval();
+    check(dut->fpu_rtu_ex1_falu_preg == 22, "dst0_reg passthrough: fspu_sel",
+          dut->fpu_rtu_ex1_falu_preg, 22);
+    tick();
+
+    uint32_t f_widen = bitv(FUNC_CVT_WIDDEN) | bitv(FUNC_B_SINGLE);
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fcnvt_sel  = 1;
+    dut->idu_fpu_ex1_func       = f_widen;
+    dut->idu_fpu_ex1_rm         = RM_RNE;
+    dut->idu_fpu_ex1_fsrc0_data = f2b(1.5f);
+    dut->idu_fpu_ex1_dst0_reg   = 31;
+    dut->eval();
+    check(dut->fpu_rtu_ex1_falu_preg == 31, "dst0_reg passthrough: fcnvt_sel",
+          dut->fpu_rtu_ex1_falu_preg, 31);
+    tick();
+
+    test_result("T8 idu_fpu_ex1_dst0_reg -> fpu_rtu_ex1_falu_preg pass-through (M5 Task 4b)");
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     dut = new VFPU;
@@ -501,6 +550,7 @@ int main(int argc, char **argv) {
     test_fspu_sgnj();
     test_fspu_fclass();
     test_fcnvt_f2f();
+    test_dst0_reg_preg_passthrough();
 
     printf("[fpu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);
