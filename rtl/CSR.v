@@ -691,8 +691,11 @@ module CSR #(
 
     wire [PC_WIDTH-1:0] mtvec_pc    = {mtvec_base, 2'b00};   // mode forced 0 (direct)
     wire [PC_WIDTH-1:0] stvec_pc    = {stvec_base, 2'b00};
-    wire [63:0]         mtvec_value = {{(64-PC_WIDTH){1'b0}}, mtvec_pc};
-    wire [63:0]         stvec_value = {{(64-PC_WIDTH){1'b0}}, stvec_pc};
+    // Sign-extend for CSR reads (csrr mtvec/stvec): a kernel-space vector
+    // base must read back as a canonical VA, same defect class as
+    // IU.v's iu_ifu_tar_pc/ag_rs1_live/bju_wb_data.
+    wire [63:0]         mtvec_value = {{(64-PC_WIDTH){mtvec_pc[PC_WIDTH-1]}}, mtvec_pc};
+    wire [63:0]         stvec_value = {{(64-PC_WIDTH){stvec_pc[PC_WIDTH-1]}}, stvec_pc};
 
     // The trap redirect target RTU reads every cycle it takes a trap (see
     // this file's header "TASK 2 DISCOVERED GAP" note) -- muxed on the
@@ -730,8 +733,10 @@ module CSR #(
 
     wire [PC_WIDTH-1:0] mepc_pc    = {mepc_reg, 1'b0};
     wire [PC_WIDTH-1:0] sepc_pc    = {sepc_reg, 1'b0};
-    wire [63:0]         mepc_value = {{(64-PC_WIDTH){1'b0}}, mepc_pc};
-    wire [63:0]         sepc_value = {{(64-PC_WIDTH){1'b0}}, sepc_pc};
+    // Sign-extend for CSR reads (csrr mepc/sepc): same defect class as
+    // mtvec_value/stvec_value above.
+    wire [63:0]         mepc_value = {{(64-PC_WIDTH){mepc_pc[PC_WIDTH-1]}}, mepc_pc};
+    wire [63:0]         sepc_value = {{(64-PC_WIDTH){sepc_pc[PC_WIDTH-1]}}, sepc_pc};
 
     // mret/sret redirect targets -- CP0 computes the return PC itself and
     // asserts chgflw/chgflw_pc during the xret's own EX1 cycle, uniform with
