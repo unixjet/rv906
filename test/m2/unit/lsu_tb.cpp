@@ -229,6 +229,7 @@ static void idle_issue(void)
 {
     dut->idu_lsu_ex1_dp_sel     = 0;
     dut->idu_lsu_ex1_sel        = 0;
+    dut->idu_lsu_ex1_raw_vld    = 0;   // M4 Task 5 fix: mirrors sel (see do_op)
     dut->idu_lsu_ex1_func       = 0;
     dut->idu_lsu_ex1_src0_data  = 0;
     dut->idu_lsu_ex1_src0_ready = 1;
@@ -350,6 +351,12 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
 
     dut->idu_lsu_ex1_dp_sel     = dp_sel ? 1 : 0;
     dut->idu_lsu_ex1_sel        = sel ? 1 : 0;
+    // M4 Task 5 fix: `idu_lsu_ex1_raw_vld` is `idu_lsu_ex1_sel` minus its own
+    // `!lsu_idu_full` gate (see LSU.v's `ag_raw_ready`) -- since this
+    // harness only ever drives `sel` once `lsu_idu_full` has already
+    // dropped (the wait loop above), `sel`'s driven value already equals
+    // what the real, ungated raw signal would read: mirror it exactly.
+    dut->idu_lsu_ex1_raw_vld    = sel ? 1 : 0;
     dut->idu_lsu_ex1_func       = func;
     dut->idu_lsu_ex1_src0_data  = src0;
     dut->idu_lsu_ex1_src0_ready = 1;
@@ -406,6 +413,7 @@ static LsuResult do_op_held(uint32_t func, uint64_t src0, uint64_t src1, uint64_
     dut->idu_lsu_ex1_dst0_reg   = dst0;
     dut->idu_lsu_ex1_dp_sel     = 1;
     dut->idu_lsu_ex1_sel        = 1;
+    dut->idu_lsu_ex1_raw_vld    = 1;   // M4 Task 5 fix: mirrors sel below
     tick();
 
     LsuResult r;
@@ -413,8 +421,9 @@ static LsuResult do_op_held(uint32_t func, uint64_t src0, uint64_t src1, uint64_
         // sel/dp_sel drop the moment lsu_idu_full reads 1 (the real gate);
         // every OTHER field (func/src*/dst0) stays exactly as first driven.
         if (dut->lsu_idu_full) {
-            dut->idu_lsu_ex1_dp_sel = 0;
-            dut->idu_lsu_ex1_sel    = 0;
+            dut->idu_lsu_ex1_dp_sel  = 0;
+            dut->idu_lsu_ex1_sel     = 0;
+            dut->idu_lsu_ex1_raw_vld = 0;
         }
         if (dut->lsu_rtu_ex1_cmplt_dp) {
             r.cmplt    = true;
@@ -485,6 +494,7 @@ static void issue_only(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
     while (dut->lsu_idu_full && waited < 500) { idle_issue(); tick(); waited++; }
     dut->idu_lsu_ex1_dp_sel     = 1;
     dut->idu_lsu_ex1_sel        = 1;
+    dut->idu_lsu_ex1_raw_vld    = 1;   // M4 Task 5 fix: mirrors sel
     dut->idu_lsu_ex1_func       = func;
     dut->idu_lsu_ex1_src0_data  = src0;
     dut->idu_lsu_ex1_src0_ready = 1;
@@ -1391,6 +1401,7 @@ static void test_ag_wait_flush(void)
     dut->idu_lsu_ex1_dst0_reg   = 5;
     dut->idu_lsu_ex1_dp_sel     = 1;
     dut->idu_lsu_ex1_sel        = 1;
+    dut->idu_lsu_ex1_raw_vld    = 1;   // M4 Task 5 fix: mirrors sel
     tick();
     idle_issue();
 

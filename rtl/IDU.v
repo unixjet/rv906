@@ -184,6 +184,12 @@ module IDU (
     //=========================================================================
     output wire                     idu_lsu_ex1_dp_sel,
     output wire                     idu_lsu_ex1_sel,
+    // M4 Task 5 fix (entry-cycle gap): `idu_lsu_ex1_sel` minus its own
+    // `!lsu_idu_full` gate -- LSU needs this UNGATED "an LSU op truly sits
+    // in EX1 right now" signal to detect a fresh DTLB-miss entry without
+    // circularity (lsu_idu_full itself must not appear on the input side of
+    // that detection -- see LSU.v's `ag_raw_ready` comment).
+    output wire                     idu_lsu_ex1_raw_vld,
     output wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func,
     output wire [63:0]              idu_lsu_ex1_src0_data,
     output wire                     idu_lsu_ex1_src0_ready,
@@ -1458,6 +1464,9 @@ module IDU (
     assign idu_cp0_ex1_sel       = ex1_eu_r[EU_CP0_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit;
     assign idu_lsu_ex1_sel       = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit && !lsu_idu_full;
     assign idu_lsu_ex1_dp_sel    = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && !lsu_idu_full;
+    // M4 Task 5 fix: same term set as idu_lsu_ex1_sel, minus !lsu_idu_full --
+    // see the port declaration comment (~line 186).
+    assign idu_lsu_ex1_raw_vld   = ex1_eu_r[EU_LSU_SEL]  && !ctrl_ex1_internal_stall && rtu_idu_commit;
 
     assign idu_iu_ex1_func       = ex1_func_r;
     assign idu_iu_ex1_src0_data  = ex1_src0_data_r;

@@ -148,6 +148,19 @@ module MMU (
     output wire                     mmu_pmp_load,
     output wire                     mmu_pmp_store,
     output wire                     mmu_pmp_data_vld,
+    // MPRV-resolved privilege for the data channel's M-mode-bypass check
+    // (donor aq_pmp_acc.v:118-119, commented-out
+    // "cp0_priv_mode = pmp_mprv_status ? cp0_pmp_mpp : cur_priv_mode" --
+    // the donor's caller resolves this per access type before presenting
+    // it to the single shared aq_pmp_acc channel; rv906's split fetch/data
+    // channels need the resolution only on the data side, since MPRV never
+    // affects fetches). Time-shared the same way as mmu_pmp_data_pa above:
+    // the walker's per-level PT-page check uses the priv captured at walk
+    // start (ptw_priv_mode, itself sampled from lsu_mmu_priv_mode -- SECTION
+    // 6.5), everything else uses the live lsu_mmu_priv_mode (mirrors
+    // lsu_supv/lsu_user's use of it for the DTLB-hit permission check,
+    // SECTION 7 below).
+    output wire [1:0]               mmu_pmp_data_priv_mode,
     input  wire                     pmp_mmu_data_deny
 );
 
@@ -642,7 +655,6 @@ module MMU (
         if (!rst_n) ptw_st <= PTW_IDLE;
         else        ptw_st <= ptw_nxt_st;
     end
-
     wire ptw_data_req = (ptw_st == PTW_FST_DATA) || (ptw_st == PTW_SCD_DATA)
                       || (ptw_st == PTW_THD_DATA);
     assign mmu_lsu_data_req      = ptw_data_req;
@@ -761,6 +773,8 @@ module MMU (
     assign mmu_pmp_store = dtlb_store_now;
     assign mmu_pmp_data_vld = (ptw_pmp_beat && !ptw_is_fetch)
                              || (lsu_mmu_va_vld && (lsu_mach_path || dtlb_hit_r));
+    assign mmu_pmp_data_priv_mode = (ptw_pmp_beat && !ptw_is_fetch) ? ptw_priv_mode
+                                                                     : lsu_mmu_priv_mode;
 
     wire itlb_pmp_deny_now = pmp_mmu_fetch_deny && (ifu_mach_path || itlb_hit_r);
     wire dtlb_pmp_deny_now = pmp_mmu_data_deny  && (lsu_mach_path || dtlb_hit_r);

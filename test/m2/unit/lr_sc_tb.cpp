@@ -173,6 +173,7 @@ static void idle_issue(void)
 {
     dut->idu_lsu_ex1_dp_sel     = 0;
     dut->idu_lsu_ex1_sel        = 0;
+    dut->idu_lsu_ex1_raw_vld    = 0;   // M4 Task 5 fix: mirrors sel (see do_op)
     dut->idu_lsu_ex1_func       = 0;
     dut->idu_lsu_ex1_src0_data  = 0;
     dut->idu_lsu_ex1_src0_ready = 1;
@@ -270,6 +271,12 @@ static LsuResult do_op(uint32_t func, uint64_t src0, uint64_t src1, uint64_t src
     // back-to-back store slip past admission and deadlock at REPLY.)
     dut->idu_lsu_ex1_dp_sel     = dp_sel ? 1 : 0;
     dut->idu_lsu_ex1_sel        = 0;
+    // M4 Task 5 fix: `idu_lsu_ex1_raw_vld` is `idu_lsu_ex1_sel` minus its
+    // own `!lsu_idu_full` gate (see LSU.v's `ag_raw_ready`) -- unlike `sel`
+    // (held low here while admission is pending), the real raw signal has
+    // no full-gate, so it must mirror `dp_sel` and stay asserted through
+    // the whole admission wait below, not just the final issue tick.
+    dut->idu_lsu_ex1_raw_vld    = dp_sel ? 1 : 0;
     dut->idu_lsu_ex1_func       = func;
     dut->idu_lsu_ex1_src0_data  = src0;
     dut->idu_lsu_ex1_src0_ready = 1;

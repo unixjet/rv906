@@ -84,6 +84,10 @@ module LSU #(
     //=========================================================================
     input  wire                     idu_lsu_ex1_dp_sel,
     input  wire                     idu_lsu_ex1_sel,
+    // M4 Task 5 fix: `idu_lsu_ex1_sel` minus its own `!lsu_idu_full` gate --
+    // see `ag_raw_ready` (SECTION AG WAIT-STATE) for why the entry-cycle
+    // detection needs this ungated signal instead of `ag_valid`.
+    input  wire                     idu_lsu_ex1_raw_vld,
     input  wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func,
     input  wire [63:0]              idu_lsu_ex1_src0_data, // base addr reg
     input  wire                     idu_lsu_ex1_src0_ready,
@@ -428,16 +432,29 @@ module LSU #(
     // `ag_wait_r` below (declared ahead of use, matching this file's own
     // forward-reference style throughout) -- so the walk sees a stable
     // request for its whole duration. `ag_addr` is itself the buffer/live
-    // mux (SECTION AG above) so this stays the SAME va for the whole wait
-    // even though IDU does NOT hold EX1 across the wait (verified against
-    // IDU.v's adv/ctrl_ex1_eu_full chain -- EX1 reloads the very cycle the
-    // miss is detected, one cycle before ag_wait_r itself sets).
-    assign lsu_mmu_va_vld    = ag_valid || ag_wait_r;
+    // mux (SECTION AG above) so this stays the SAME va for the whole wait.
+    // M4 Task 5 fix: uses `ag_raw_ready` (declared just below), NOT
+    // `ag_valid` -- `ag_valid = idu_lsu_ex1_sel` is itself gated by
+    // `!lsu_idu_full`, and `lsu_idu_full` needs to read 1 on the very entry
+    // cycle of a fresh DTLB miss (see `ag_raw_ready`'s own comment) --
+    // using `ag_valid` here would go transiently, incorrectly low for one
+    // cycle on every miss entry (`ag_valid ==
+    // ag_raw_ready && !ag_wait_r`, and `ag_wait_r` is still 0 on that exact
+    // cycle), dropping the MMU request the same cycle it is first raised.
+    assign lsu_mmu_va_vld    = ag_raw_ready || ag_wait_r;
     // M4 Task 1: effective data-access privilege (donor aq_lsu_ag.v:674-675:
     // MPRV redirects loads/stores to MPP's privilege). While MPRV=0 this is
     // the current mode (M-mode = 2'b11 for the existing battery).
     assign lsu_mmu_priv_mode = cp0_lsu_mprv ? cp0_lsu_mpp : cp0_yy_priv_mode;
-    assign lsu_mmu_st_inst   = ag_is_store;
+    // M4 Task 5: AMO and SC are write accesses too -- they must gate the
+    // MMU's write-permission/D-bit checks (MMU.v's ptw_is_store and
+    // dtlb_hit_perm_pf) exactly like a plain store, matching this same
+    // file's own `mmu_fault_is_store` classification below (SECTION
+    // TRAP-AT-ISSUE: `ag_is_store || ag_is_amo_c || ag_is_sc_c`). Without
+    // this, an AMO to a D=0 page never raises the required StoreAMOPageFault
+    // (D-M4-1): ag_is_store alone is 0 for AMO/SC, so ptw_is_store latches 0
+    // and `(ptw_is_store && !pte_d)` never fires.
+    assign lsu_mmu_st_inst   = ag_is_store || ag_is_amo_c || ag_is_sc_c;
 
     //-------------------------------------------------------------------------
     // SECTION AG WAIT-STATE (M4 Task 5, D1) -- a DTLB miss (mmu_lsu_pa_vld=0
@@ -452,11 +469,36 @@ module LSU #(
     // so `ag_mmu_wait_start` below never fires and `ag_wait_r` never sets.
     //-------------------------------------------------------------------------
     reg ag_wait_r;
+    // M4 Task 5 fix (closes the entry-cycle gap): the RAW "an LSU op sits
+    // in EX1 right now" test, with `ag_valid`'s full non-circular term set
+    // applied to `idu_lsu_ex1_raw_vld` INSTEAD of `idu_lsu_ex1_sel` --
+    // `ag_valid = idu_lsu_ex1_sel = idu_lsu_ex1_raw_vld && !lsu_idu_full`,
+    // and every term of `lsu_idu_full` other than its own `ag_wait_r`
+    // OR-terms is repeated here (state/clean_active/stb_full+needs_slot/
+    // rf_port_busy/lfb_cmplt_fire/ptw_sv_busy -- all forward-referenced,
+    // same style as `ag_issue_ready` below). Using `idu_lsu_ex1_raw_vld`
+    // directly (instead of gating through `lsu_idu_full`) breaks what
+    // would otherwise be a comb loop: folding the entry-detection term
+    // straight into `lsu_idu_full` (see that assign) would make
+    // `lsu_idu_full` depend on `ag_mmu_wait_start` depend on
+    // `ag_issue_ready` depend on `ag_valid` depend on `lsu_idu_full`.
+    // `ag_raw_ready` has no such dependency: none of its terms touch
+    // `lsu_idu_full`/`ag_valid`.
+    wire ag_raw_ready = idu_lsu_ex1_raw_vld && (state == ST_IDLE)
+                       && !clean_active && !(stb_full && ag_needs_slot_c)
+                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
     // "would issue but for the MMU" -- every OTHER admission gate issue_real
     // already applies (state/clean/rf_port/lfb_cmplt/ptw_sv, the last two
     // declared ahead in SECTION PTW SERVANT, same forward-reference style),
     // OR'ing in ag_wait_r itself so a parked op keeps re-checking every cycle.
-    wire ag_issue_ready = (state == ST_IDLE) && (ag_valid || ag_wait_r)
+    // Uses `ag_raw_ready`, not `ag_valid` -- see that wire's comment: this
+    // makes `ag_mmu_wait_start` below fully acyclic (no term touches
+    // `lsu_idu_full`), which is what lets `lsu_idu_full` fold in the
+    // entry-detection term below without a comb loop. Behavior-identical
+    // to the old `(ag_valid || ag_wait_r)` form: `ag_valid` is exactly
+    // `ag_raw_ready && !ag_wait_r`, so `(ag_valid || ag_wait_r) ==
+    // (ag_raw_ready || ag_wait_r)`.
+    wire ag_issue_ready = (state == ST_IDLE) && (ag_raw_ready || ag_wait_r)
                          && !clean_active && !rf_port_busy && !lfb_cmplt_fire
                          && !ptw_sv_busy;
     wire ag_mmu_wait_start = ag_issue_ready && !mmu_lsu_pa_vld;
@@ -680,7 +722,43 @@ module LSU #(
     // SECTION drain-vs-issue arbitration (from IDLE only).
     //-------------------------------------------------------------------------
     wire any_stb_vld = stb_vld[0] || stb_vld[1] || stb_vld[2] || stb_vld[3];
-    wire [1:0] drain_pick = stb_vld[0] ? 2'd0 : stb_vld[1] ? 2'd1 : stb_vld[2] ? 2'd2 : 2'd3;
+    // M3b/M4 audit fix -- an STB entry whose dword matches a still-in-flight
+    // LFB entry (lfb_state != E_IDLE, i.e. not yet retired via
+    // lfb_cmplt_fire) must not opportunistically drain here. That deferred
+    // load's STB-forward merge (lfb_stb_m0..3, SECTION LFB) is evaluated
+    // live against the CURRENT stb_vld/stb_addr every cycle but only
+    // SAMPLED once, at lfb_cmplt_fire; the refill data it merges against
+    // (lfb_rdata_r) was captured earlier, at the refill's own completion.
+    // If this entry drains away in between, the forward is silently lost:
+    // the load completes from the stale pre-store refill snapshot with no
+    // STB entry left to correct it (mmu_pmpstore.elf TESTNUM 2: a store
+    // immediately followed by a load to the same freshly-mapped, still-
+    // uncached line -- the load misses, defers into the LFB, and the STB
+    // entry drains out from under it before the refill lands). lfb_addr[]
+    // and stb_addr[] are both VA (dc_addr_r <= ag_addr for both a real
+    // issue and a drain), so the dword compare here matches the one the
+    // LFB's own forward check already uses. lfb_state/LFB_DEPTH/E_IDLE are
+    // forward-referenced (SECTION LFB, below), matching this file's existing
+    // forward-reference style (rf_port_busy/lfb_cmplt_fire/ptw_sv_busy, etc).
+    integer stb_lfb_chk_i;
+    reg [3:0] stb_lfb_block_c;
+    always @* begin
+        for (stb_lfb_chk_i = 0; stb_lfb_chk_i < 4; stb_lfb_chk_i = stb_lfb_chk_i + 1) begin
+            stb_lfb_block_c[stb_lfb_chk_i] = 1'b0;
+            for (lfb_i = 0; lfb_i < LFB_DEPTH; lfb_i = lfb_i + 1) begin
+                if ((lfb_state[lfb_i] != E_IDLE) && stb_vld[stb_lfb_chk_i]
+                    && (stb_addr[stb_lfb_chk_i][63:3] == lfb_addr[lfb_i][63:3]))
+                    stb_lfb_block_c[stb_lfb_chk_i] = 1'b1;
+            end
+        end
+    end
+    wire [3:0] stb_drainable = {stb_vld[3] && !stb_lfb_block_c[3],
+                                stb_vld[2] && !stb_lfb_block_c[2],
+                                stb_vld[1] && !stb_lfb_block_c[1],
+                                stb_vld[0] && !stb_lfb_block_c[0]};
+    wire any_stb_drainable = |stb_drainable;
+    wire [1:0] drain_pick = stb_drainable[0] ? 2'd0 : stb_drainable[1] ? 2'd1
+                            : stb_drainable[2] ? 2'd2 : 2'd3;
     // M3 audit fix -- STB-full admission control. Store/SC/AMO entries are
     // created at REPLY; if the STB is full and the completion cannot merge,
     // REPLY would stall waiting for a free slot -- but drains start only
@@ -714,7 +792,15 @@ module LSU #(
                               || idu_lsu_ex1_func == LSU_FUNC_SC_W
                               || idu_lsu_ex1_func == LSU_FUNC_SC_D)
                              && !ag_misalign && !ag_stb_match_c;
-    wire drain_want = !ag_valid && any_stb_vld && (state == ST_IDLE);
+    // M4 LFB/STB-race fix: gate on any_stb_drainable (not any_stb_vld) --
+    // an entry whose dword collides with a still-in-flight LFB entry
+    // (stb_lfb_block_c, SECTION drain-vs-issue arbitration above) must not
+    // be opportunistically drained, so drain_want itself must not fire on
+    // the strength of ONLY such entries being valid: any_stb_vld=1 with
+    // any_stb_drainable=0 would still set issue_drain (line ~1010) and let
+    // drain_pick's ternary fall through to its 2'd3 default, draining a
+    // slot that may not even be stb_vld[3].
+    wire drain_want = !ag_valid && any_stb_drainable && (state == ST_IDLE);
 
     //-------------------------------------------------------------------------
     // SECTION DCache.v instance -- see DCache.v's own header for why it is
@@ -931,7 +1017,6 @@ module LSU #(
     wire issue_real  = ag_issue_ready && mmu_lsu_pa_vld;
     wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
                        && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
-
     // M4 misalign fix (contract 3 + donor aq_lsu_ag.v, which raises misalign
     // at AG, NOT at the reply): a misaligned access must trap at its ISSUE
     // cycle. Raising it late at ST_REPLY let the front end keep dispatching
@@ -1152,9 +1237,13 @@ module LSU #(
             // MISALIGNED LR traps and must install NO reservation (donor
             // gates lm_set on !expt_ack/!expt_exit, aq_lsu_lm.v:129). M4
             // Task 5: a DTLB-faulting LR traps at issue too (mmu_fault_issue)
-            // and must install no reservation for the same reason.
-            if (issue_real && (idu_lsu_ex1_func == LSU_FUNC_LR_W
-                               || idu_lsu_ex1_func == LSU_FUNC_LR_D)) begin
+            // and must install no reservation for the same reason. Must read
+            // ag_func_eff, not idu_lsu_ex1_func: issue_real can fire on a
+            // later cycle than a waited LR's own EX1 cycle, by which point
+            // the live wire has drifted to whatever op IDU has since decoded
+            // (same bug class as amo_is_amo above).
+            if (issue_real && (ag_func_eff == LSU_FUNC_LR_W
+                               || ag_func_eff == LSU_FUNC_LR_D)) begin
                 if (!ag_misalign && !mmu_fault_issue) begin
                     lr_addr_r <= ag_addr[55:0];
                     lr_size_r <= ag_size;
@@ -1262,7 +1351,7 @@ module LSU #(
     wire [63:0] amo_new_c = amo_alu_compute(amo_old_c, amo_src0_r, amo_op_r, amo_is_dw_r);
 
     assign lsu_idu_full = (state != ST_IDLE) || clean_active
-                          || ag_wait_r        // M4 Task 5 fix: a parked DTLB-miss
+                          || (ag_wait_r && !issue_real) // M4 Task 5 fix: a parked DTLB-miss
                                              // op holds ST_IDLE (by design, D1 --
                                              // it never touches the array/STB), so
                                              // without this term lsu_idu_full reads
@@ -1290,6 +1379,64 @@ module LSU #(
                                              // new dispatch while a park is live;
                                              // ag_wait_r is rv906's single-flop
                                              // equivalent of that buffer-valid bit.
+                                             //
+                                             // That term alone only covers cycles
+                                             // 2+ of the wait: `ag_wait_r` itself
+                                             // doesn't set until the cycle AFTER
+                                             // the miss is detected, so on the
+                                             // TRUE entry/detection cycle
+                                             // (ag_mmu_wait_start && !ag_wait_r)
+                                             // this OR-chain still read 0 and EX1
+                                             // advanced one cycle too early --
+                                             // the SAME root cause, just the one
+                                             // remaining uncovered cycle. Folding
+                                             // in that term directly (below) needs
+                                             // `ag_mmu_wait_start` to be acyclic
+                                             // w.r.t. `lsu_idu_full`/`ag_valid`,
+                                             // which is why `ag_issue_ready` above
+                                             // uses `ag_raw_ready` instead of
+                                             // `ag_valid`.
+                                             //
+                                             // The `&& !issue_real` above is the
+                                             // EXIT-side twin of the entry-side fix
+                                             // below: bare `ag_wait_r` stays 1
+                                             // through the resolution cycle itself
+                                             // (the flop's own clear is registered,
+                                             // taking effect only next cycle -- see
+                                             // the always block a few lines up), so
+                                             // on that exact cycle this OR-chain
+                                             // would read 1 from `ag_wait_r` AND
+                                             // (next cycle) 1 from `state != ST_IDLE`
+                                             // -- lsu_idu_full never has the single
+                                             // free cycle an ORDINARY (non-wait)
+                                             // dispatch gets for free (its issue
+                                             // cycle is still ST_IDLE combinationally,
+                                             // so `state != ST_IDLE` reads 0 THAT
+                                             // cycle and IDU's EX1 advances to the
+                                             // next instruction in parallel with the
+                                             // op going busy). Denied that same
+                                             // cycle, EX1 sits pinned on the AMO for
+                                             // its entire busy window and, when
+                                             // lsu_idu_full finally clears at
+                                             // completion, idu_lsu_ex1_sel fires on
+                                             // the STALE (never-advanced) EX1
+                                             // content -- a spurious re-dispatch of
+                                             // the SAME AMO, double-executing its
+                                             // read-modify-write (traced directly:
+                                             // mmu_amo TESTNUM 2, cyc=755 resolves
+                                             // the wait with lsu_idu_full still 1,
+                                             // vs. an ordinary op's issue cycle
+                                             // e.g. cyc=648 where lsu_idu_full=0).
+                                             // Gating on `issue_real` (defined
+                                             // above, acyclic w.r.t. this wire --
+                                             // see the ag_raw_ready note) excludes
+                                             // exactly the resolving cycle, giving
+                                             // the wait-driven op the same one free
+                                             // advance cycle an ordinary op already
+                                             // gets.
+                          || (ag_mmu_wait_start && !ag_wait_r) // M4 Task 5 fix:
+                                             // the entry/detection cycle itself
+                                             // (see the long comment above).
                           || (stb_full && ag_needs_slot_c)
                           || rf_port_busy   // M3b: don't accept a new op while a
                                              // background refill owns the D-cache
@@ -1304,10 +1451,6 @@ module LSU #(
                                              // advances EX1 past an op LSU is
                                              // about to silently refuse, dropping
                                              // it forever (rv64ui-p-ld_st hang).
-                          || ag_wait_r       // M4 Task 5 (D1): a DTLB miss parks
-                                             // this EX1-resident op until the walk
-                                             // lands -- IDU must hold it (adv=0),
-                                             // not advance past it.
                           || ptw_sv_busy;    // M4 Task 5 (D3): the array/AXI-read
                                              // port is committed to a PTE fetch
                                              // this cycle (this port's own walk OR
@@ -1603,7 +1746,11 @@ module LSU #(
         .cp0_lsu_dcache_pref_dist(cp0_lsu_dcache_pref_dist),
         .clean_active(clean_active),
         .pfb_ld_vld(pfb_ld_vld_c), .pfb_ld_miss(pfb_ld_miss_c),
-        .pfb_ld_pc(dc_pc_r), .pfb_ld_chk_pa(dc_addr_r[39:0]),
+        .pfb_ld_pc(dc_pc_r),
+        // M4: PFB wants the physical address (it feeds real prefetch-read
+        // addresses, PFB.v:315,512) -- dc_addr_r is VA (see the AXI
+        // direct-write fix above); rebuild the PA from dc_tag_r/dc_index_r.
+        .pfb_ld_chk_pa({dc_tag_r, dc_index_r, dc_addr_r[5:0]}),
         .lfb_grant(pfb_grant_c),
         .lfb_hit_idx(pfb_lfb_hit_c), .stb_hit_idx(pfb_stb_hit_c),
         .vb_hit_idx(pfb_vb_hit), .dc_hit_idx(pfb_dc_hit),
@@ -1841,9 +1988,16 @@ module LSU #(
                                     // sub-word beat is positioned at (addr[5:0])
                                     // inside the 64B line and the AXI memory
                                     // model sizes the write from addr[5:0].
-                                    // dc_addr_r holds the full store PA for both
-                                    // a real store (AG) and a drained entry.
-                                    axi_w_addr_r  <= dc_addr_r;
+                                    // M4: dc_addr_r itself is VA (see the
+                                    // SECTION drain-vs-issue comment above,
+                                    // ~line 781); dc_tag_r/dc_index_r are the
+                                    // MMU-translated PA (latched from ag_pa
+                                    // at issue, or from stb_tag/stb_index at
+                                    // drain). Rebuild the PA the same way the
+                                    // read-miss path below does (dc_addr_r[5:0]
+                                    // is safe to reuse -- Sv39's page offset
+                                    // is untranslated).
+                                    axi_w_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, dc_addr_r[5:0]};
                                     axi_w_data_r  <= ({448'b0, (dc_is_drain_r ? stb_data[dc_drain_idx_r] : dc_store_data_r)})
                                                        << ({58'b0, (dc_is_drain_r ? stb_dw_off[dc_drain_idx_r] : dc_dw_off_r)} * 64);
                                     axi_w_strb_r  <= ({56'b0, (dc_is_drain_r ? stb_byte_vld[dc_drain_idx_r] : dc_byte_mask_r)})
@@ -2315,7 +2469,6 @@ module LSU #(
             default: lfb_wb_data = lfb_rotated;
         endcase
     end
-
     //-------------------------------------------------------------------------
     // SECTION AMO ALU (M3 Task 4) -- combinational read-modify-write compute,
     // cloned from donor aq_lsu_amo_alu.v. src0 = register operand (the value
@@ -2323,13 +2476,21 @@ module LSU #(
     // result is the NEW value to store back; the OLD value (src1) is what
     // gets written to the destination register.
     //-------------------------------------------------------------------------
-    // Decode AMO op from the latched func (bits[8:4] carry the funct5).
-    wire [4:0] amo_op   = idu_lsu_ex1_func[8:4];
+    // Decode AMO op from the latched func (bits[8:4] carry the funct5). These
+    // feed `issue_real && amo_is_amo` below, and issue_real fires on the
+    // (possibly much later) cycle a DTLB-miss wait resolves -- by then the
+    // live idu_lsu_ex1_func has drifted to whatever op IDU has since decoded
+    // (IDU does not hold EX1 across the wait, see SECTION AG's ag_func_eff
+    // comment). Must read the same buffer/live mux ag_is_amo_c already uses,
+    // or a waited AMO silently loses its amo_active commit (mmu_amo.elf
+    // TESTNUM 2: the RMW write-back never fires, ld reads back the
+    // unmodified word).
+    wire [4:0] amo_op   = ag_func_eff[8:4];
     // Width lives in func[3:2] (same field ag_size uses for the read-phase
     // access size): 10=W, 11=D.
-    wire       amo_wd   = (idu_lsu_ex1_func[3:2] == 2'b10);  // .W
-    wire       amo_dw   = (idu_lsu_ex1_func[3:2] == 2'b11);  // .D
-    wire       amo_is_amo = (idu_lsu_ex1_func[19:12] == 8'h01);  // AMO func prefix
+    wire       amo_wd   = (ag_func_eff[3:2] == 2'b10);  // .W
+    wire       amo_dw   = (ag_func_eff[3:2] == 2'b11);  // .D
+    wire       amo_is_amo = (ag_func_eff[19:12] == 8'h01);  // AMO func prefix
 
     wire amo_add  = (amo_op == 5'b00000);
     wire amo_swap = (amo_op == 5'b00001);
@@ -2482,8 +2643,11 @@ module LSU #(
     reg        sc_match_r;           // SC success latched at ST_DCS
 
     wire sc_func_is_sc = (sc_func_r == LSU_FUNC_SC_W) || (sc_func_r == LSU_FUNC_SC_D);
-    wire sc_issue      = issue_real && ((idu_lsu_ex1_func == LSU_FUNC_SC_W)
-                                        || (idu_lsu_ex1_func == LSU_FUNC_SC_D));
+    // ag_func_eff, not idu_lsu_ex1_func: issue_real's cycle can trail a
+    // waited SC's own EX1 cycle, by which point the live wire has drifted
+    // (same bug class as amo_is_amo/the LR check above).
+    wire sc_issue      = issue_real && ((ag_func_eff == LSU_FUNC_SC_W)
+                                        || (ag_func_eff == LSU_FUNC_SC_D));
     // Combinational match at ST_DCS -- built from exactly the inputs the
     // latch samples that same cycle (sc_addr_set itself is an NBA, so it
     // is still 0 during the first DCS cycle). The DC-stage forward below
@@ -2499,9 +2663,9 @@ module LSU #(
             sc_func_r <= 20'd0;
             sc_match_r <= 1'b0;
         end else begin
-            // Latch opcode at issue_real
+            // Latch opcode at issue_real -- ag_func_eff (see sc_issue above).
             if (sc_issue) begin
-                sc_func_r <= idu_lsu_ex1_func;
+                sc_func_r <= ag_func_eff;
             end
             // Latch the reservation match at ST_DCS entry. SC succeeds only
             // if there is a VALID reservation (lr_valid_r) AND the SC address
@@ -2599,6 +2763,22 @@ module LSU #(
     // module that is exactly `issue_real`: a real (non-drain) instruction is
     // in AG (ag_valid) and the DC FSM is idle and about to accept it. Drains
     // are internal, not instructions, so they never advance the pcgen.
+    //
+    // M4 Task 5 (D1): a DTLB-miss wait needs NO special-case pulse here.
+    // `issue_real = ag_issue_ready && mmu_lsu_pa_vld` is false throughout
+    // the wait (that IS the miss) and fires exactly once, on the cycle the
+    // walk resolves (successful translation or a page fault -- both are
+    // `issue_real`; `mmu_fault_issue` is a subset of it) -- the SAME single
+    // pulse IDU's own EX1 advance now lines up with, now that `lsu_idu_full`
+    // correctly holds EX1 from the TRUE entry cycle onward (see the
+    // `ag_raw_ready`/`lsu_idu_full` fix above). An earlier version of this
+    // fix ALSO OR'd in an early `(ag_mmu_wait_start && !ag_wait_r)` pulse
+    // here to compensate for EX1 drifting one cycle early -- that
+    // compensating pulse is removed now that the root cause (the
+    // entry-cycle gap in `lsu_idu_full`) is fixed directly: EX1 no longer
+    // drifts, so pulsing early here would now be the bug (a spurious
+    // advance of IU's bju_pcgen_pc one cycle before EX1 actually holds
+    // still, double-counting against the later genuine `issue_real` pulse).
     assign lsu_rtu_ex1_cmplt_for_pcgen = issue_real;
     // Task 7.3: the completing LSU instruction's length (drains excluded by
     // the same !dc_is_drain_r the cmplt above already applies).

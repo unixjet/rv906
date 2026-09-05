@@ -54,9 +54,20 @@ module PMP #(
     output wire [63:0]             pmp_addr_value,    // selected pmpaddr read
 
     //-------------------------------------------------------------------------
-    // Current privilege (for the M-mode bypass).
+    // Current privilege (for the M-mode bypass). Fetches are never MPRV-
+    // adjusted (privileged spec: MPRV affects only "explicit memory
+    // accesses"), so priv_mode carries the RAW current privilege and feeds
+    // the fetch channel only. The data channel gets its own MPRV-resolved
+    // privilege (donor aq_pmp_acc.v:118-119's commented-out
+    // "cp0_priv_mode = pmp_mprv_status ? cp0_pmp_mpp : cur_priv_mode" --
+    // the donor's caller resolves this before presenting it to the single
+    // shared aq_pmp_acc channel; MMU.v's mmu_pmp_data_priv_mode does the
+    // equivalent resolution for rv906's split data channel, mirroring the
+    // existing lsu_mmu_priv_mode resolution already used for the DTLB
+    // permission check, LSU.v's lsu_mmu_priv_mode assign).
     //-------------------------------------------------------------------------
     input  wire [1:0]              priv_mode,
+    input  wire [1:0]              data_priv_mode,
 
     //-------------------------------------------------------------------------
     // Check channels: {addr[39:0], load, store, fetch} -> deny.
@@ -266,7 +277,8 @@ module PMP #(
     // flag is {L,X,W,R}. M-mode bypasses PMP UNLESS the matching entry is
     // locked (then even M-mode is checked). No hit: M-mode allow, S/U deny.
     //=========================================================================
-    wire mach_mode = (priv_mode == 2'b11);
+    wire fetch_mach_mode = (priv_mode == 2'b11);
+    wire data_mach_mode  = (data_priv_mode == 2'b11);
 
     // lowest-hit priority encode -> flag {L,X,W,R}
     reg [3:0] data_flg;
@@ -302,20 +314,20 @@ module PMP #(
     // deny logic (donor aq_pmp_acc.v). For a hit entry, M-mode is denied only
     // if locked and the access bit is clear; S/U are denied if the access bit
     // is clear. For no hit, M-mode allows, S/U deny.
-    wire data_mach_bypass  = mach_mode && !data_flg[3];   // M & not locked
+    wire data_mach_bypass  = data_mach_mode && !data_flg[3];   // M & not locked
     wire data_access_ok    = data_any_hit
                              ? (chk_load  ? data_flg[0] : 1'b1)
                                & (chk_store ? data_flg[1] : 1'b1)
                              : 1'b0;
     wire data_deny_raw = chk_data_vld &&
                          (data_any_hit ? !(data_mach_bypass || data_access_ok)
-                                       : !mach_mode);
+                                       : !data_mach_mode);
 
-    wire fetch_mach_bypass = mach_mode && !fetch_flg[3];
+    wire fetch_mach_bypass = fetch_mach_mode && !fetch_flg[3];
     wire fetch_access_ok  = fetch_any_hit ? fetch_flg[2] : 1'b0;  // X bit
     wire fetch_deny_raw = chk_fetch_vld &&
                           (fetch_any_hit ? !(fetch_mach_bypass || fetch_access_ok)
-                                         : !mach_mode);
+                                         : !fetch_mach_mode);
 
     assign pmp_data_deny  = data_deny_raw;
     assign pmp_fetch_deny = fetch_deny_raw;

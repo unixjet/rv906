@@ -915,6 +915,7 @@ module IFU (
     // ---- Output to IDU (frozen ports) --------------------------------------
     assign ifu_idu_id_inst_vld = pop_entry_vld;                                      // ibuf.v:1354
     assign ifu_idu_id_inst     = {ibuf_h1, ibuf_h0};                                  // ibuf.v:1355-1356
+
     // ifu_idu_id_bht_pred (ibuf.v:1357-1358) rides pred_ibuf_br_taken{0,1}
     // alongside each halfword in the real RTL. TASK 9: BPU.v's BHT is real
     // now, and `pred_ibuf_br_taken0/1` carry the genuine captured 2-bit

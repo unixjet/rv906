@@ -237,6 +237,7 @@ module RVProc #(
     wire                     mmu_pmp_load;
     wire                     mmu_pmp_store;
     wire                     mmu_pmp_data_vld;
+    wire [1:0]               mmu_pmp_data_priv_mode;
 
     //=========================================================================
     // IFU <-> BPU seam (see BPU.v's header for the port rationale).
@@ -351,6 +352,7 @@ module RVProc #(
     //=========================================================================
     wire                     idu_lsu_ex1_dp_sel;
     wire                     idu_lsu_ex1_sel;
+    wire                     idu_lsu_ex1_raw_vld;
     wire [FUNC_WIDTH-1:0]    idu_lsu_ex1_func;
     wire [63:0]              idu_lsu_ex1_src0_data;
     wire                     idu_lsu_ex1_src0_ready;
@@ -780,6 +782,7 @@ module RVProc #(
         .mmu_pmp_load           (mmu_pmp_load),
         .mmu_pmp_store          (mmu_pmp_store),
         .mmu_pmp_data_vld       (mmu_pmp_data_vld),
+        .mmu_pmp_data_priv_mode (mmu_pmp_data_priv_mode),
         .pmp_mmu_data_deny      (pmp_data_deny),
 
         .cp0_mmu_satp_data      (cp0_mmu_satp_data),
@@ -827,6 +830,7 @@ module RVProc #(
 
         .idu_lsu_ex1_dp_sel      (idu_lsu_ex1_dp_sel),
         .idu_lsu_ex1_sel         (idu_lsu_ex1_sel),
+        .idu_lsu_ex1_raw_vld     (idu_lsu_ex1_raw_vld),
         .idu_lsu_ex1_func        (idu_lsu_ex1_func),
         .idu_lsu_ex1_src0_data   (idu_lsu_ex1_src0_data),
         .idu_lsu_ex1_src0_ready  (idu_lsu_ex1_src0_ready),
@@ -1013,6 +1017,7 @@ module RVProc #(
 
         .idu_lsu_ex1_dp_sel      (idu_lsu_ex1_dp_sel),
         .idu_lsu_ex1_sel         (idu_lsu_ex1_sel),
+        .idu_lsu_ex1_raw_vld     (idu_lsu_ex1_raw_vld),
         .idu_lsu_ex1_func        (idu_lsu_ex1_func),
         .idu_lsu_ex1_src0_data   (idu_lsu_ex1_src0_data),
         .idu_lsu_ex1_src0_ready  (idu_lsu_ex1_src0_ready),
@@ -1360,6 +1365,7 @@ module RVProc #(
         .pmpaddr_rsel       (pmp_addr_rsel),
         .pmp_addr_value     (pmp_addr_value),
         .priv_mode          (cp0_pmp_priv_mode),
+        .data_priv_mode     (mmu_pmp_data_priv_mode),
         .chk_fetch_pa       (mmu_pmp_fetch_pa),
         .chk_fetch_vld      (mmu_pmp_fetch_vld),
         .chk_data_pa        (mmu_pmp_data_pa),
