@@ -664,8 +664,15 @@ module IU (
     wire [PC_WIDTH-1:0] bju_inc_pc_live = bju_pc_now + (idu_iu_ex1_inst_len ? PC_INC32 : PC_INC16);
     wire [PC_WIDTH-1:0] bju_inc_pc_rt   = bju_pc_now + (rtu_iu_ex1_inst_len  ? PC_INC32 : PC_INC16);
 
+    // Sign-extend (not zero-extend) bju_pc_now: this adder also produces the
+    // full 64b AUIPC writeback (bju_wb_data = ag_result_live below), so a
+    // zero-extended base corrupts AUIPC's pc+imm result whenever the AUIPC
+    // itself sits in Sv39 kernel space (PC bit PC_WIDTH-1 set) -- the same
+    // class of bug as the iu_ifu_tar_pc fix above. The JAL/branch target use
+    // of this adder (bju_target_now) truncates back to PC_WIDTH bits, so it
+    // was unaffected either way.
     wire [63:0] ag_rs1_live = bju_is_jalr_live ? idu_iu_ex1_src0_data
-                                                : {{(64-PC_WIDTH){1'b0}}, bju_pc_now};
+                                                : {{(64-PC_WIDTH){bju_pc_now[PC_WIDTH-1]}}, bju_pc_now};
     wire [63:0] ag_rs2_live = idu_iu_ex1_src2_data;
     wire [63:0] ag_result_live = ag_rs1_live + ag_rs2_live;
     // JALR's target (rs1+imm) can have an odd LSB (imm[0] is a real encoded
@@ -769,6 +776,30 @@ module IU (
     wire bju_pc_reg_mispred  = bju_is_jalr_live && !bju_entry_vld_r
                             && (idu_iu_ex1_src0_reg[4:0] != 5'd1);
 
+    // Donor aq_iu_bju.v:637-638,687-707 (`bju_bht_mispred_entry` /
+    // `bju_not_ex1_chgflw` / `bju_not_ex1_tar_pc`): a parked-entry
+    // conditional-branch mispredict must self-correct bju_pcgen_pc THE SAME
+    // cycle the entry pops, ahead of (bypassing) the rtu_iu_ex1_cmplt-gated
+    // advance below. Without this the entry clears next cycle, an unrelated
+    // instruction occupies ex1_eu_r/ex1_func_r, and bju_pcgen_next_pc
+    // silently falls through by +len from the branch's own PC instead of
+    // applying its target -- the tracker permanently drifts onto the
+    // fall-through path (found via BJUDBG/JMPDBG tracing on
+    // rv64ui-v-simple.elf: bju_pcgen_pc advanced ...147c -> ...1480, +4
+    // fall-through, across the mispredicted-taken branch's own pop cycle,
+    // silently discarding tar_pc=...1558; the stale tracker then spuriously
+    // re-fires mispredict logic at the unrelated PC ...1480, corrupting
+    // next_pc for every later retiring instruction). The donor's RAS-mispred
+    // OR-term (`bju_ras_mispred_vld`) is dropped: rv906 does not implement
+    // RAS mispredict tracking (see the header's RAS note; `bju_ras_mispred_
+    // vld`-equivalent stays absent), so `bju_not_ex1_chgflw` reduces to just
+    // the BHT/entry term. Target is rv906's existing `bju_not_pred_pc` mux
+    // (line below): already entry-selected, so on the pop cycle
+    // (bju_entry_vld_r still 1) it reads the entry's captured
+    // bju_entry_not_pred_pc_r -- exactly the donor's bju_not_pred_pc_flop.
+    wire bju_bht_mispred_entry = bju_cond_br_mispred && bju_entry_pop;
+    wire bju_not_ex1_chgflw    = bju_bht_mispred_entry;
+
     // "Resolves now" = either the entry just got both operands, or this is
     // a live (non-parking) dispatch resolving in the same EX1 cycle.
     wire bju_resolves_now = bju_entry_pop
@@ -816,7 +847,13 @@ module IU (
 
     assign iu_ifu_tar_pc_vld  = bju_redirect_now;
     assign iu_idu_br_cancel   = bju_redirect_now;   // donor aq_iu_bju.v:783 (iu_yy_xx_cancel = iu_ifu_tar_pc_vld)
-    assign iu_ifu_tar_pc      = {{(64-PC_WIDTH){1'b0}}, bju_next_pc};
+    // Sign-extend (not zero-extend) to 64b -- matches every other PC-widening
+    // site (IFU.v pcgen_ifpc: lines ~319,363,369, `{{(64-PC_WIDTH){pc[PC_WIDTH-1]}},pc}`).
+    // Zero-extension here corrupted any Sv39 kernel-half (VA bit 38 set) BJU
+    // redirect target into a non-canonical VA, tripping MMU.v's va_illegal
+    // check and forcing a permanent vec-12 fetch-page-fault loop (found via
+    // IFUDBG tracing: cnt=124 va ffffffffffe01 -> 000000ffffe01 on this path).
+    assign iu_ifu_tar_pc      = {{(64-PC_WIDTH){bju_next_pc[PC_WIDTH-1]}}, bju_next_pc};
     assign iu_ifu_pc_mispred  = bju_resolves_now && bju_pc_reg_mispred;
     assign iu_ifu_bht_mispred = bju_cond_br_mispred;
     assign iu_ifu_br_vld      = bju_resolves_now && bju_is_cond_br_sel;
@@ -847,15 +884,23 @@ module IU (
     // `bju_next_pc` (line ~705), whose non-taken term is now the RVC-aware
     // `bju_inc_pc_rt` (aq_iu_bju.v:576-583,581).
     //
-    // Out of scope here (documented, matches the header's RAS note): the
-    // donor's 3rd branch `bju_not_ex1_chgflw` (aq_iu_bju.v:687-691) -- the
-    // parked-entry/BHT-mispred and RAS-mispred fast-redirect. Our M2 does not
-    // build the RAS path (`ifu_iu_ex1_pc_pred` absent, `iu_rtu_ex2_bju_ras_
-    // mispred` tied 0), and a mispredict's redirect still reaches this
-    // register through the higher-priority changeflow branch (the RTU flush
-    // drives `ifu_iu_chgflw_vld`). Re-verify in the Task 9 mispredict
-    // bring-up test if a parked-entry BHT mispredict is observed to leave the
-    // tracker stale.
+    // RE-VERIFIED (Task 9 mispredict bring-up, rv64ui-v-simple.elf): the
+    // prior version of this comment claimed a mispredict's redirect "still
+    // reaches this register through the higher-priority changeflow branch,"
+    // i.e. that `ifu_iu_chgflw_vld` alone was sufficient. Empirically false
+    // for a parked-entry resolve: BJUDBG/JMPDBG tracing caught the exact
+    // predicted failure (a parked cond-branch resolves mispredicted-taken
+    // with tar_pc=...1558, but `rtu_iu_ex1_cmplt` is 0 that cycle, so the
+    // normal advance below misses the window; ~20 cycles later the tracker
+    // is found to have fallen through +4 to ...1480 instead, then spuriously
+    // re-triggers stale mispredict logic at that unrelated PC). The donor's
+    // 3rd branch (`bju_not_ex1_chgflw`, aq_iu_bju.v:687-707) IS required and
+    // is now ported below as `bju_not_ex1_chgflw`/`bju_bht_mispred_entry`
+    // (defined above, near `bju_cond_br_mispred`) -- an immediate, same-
+    // cycle self-correction of this tracker on a parked-entry BHT
+    // mispredict, independent of `rtu_iu_ex1_cmplt` timing. The donor's
+    // RAS-mispred OR-term stays dropped (RAS mispredict tracking not
+    // implemented, per the header's RAS note).
     // -----------------------------------------------------------------
     reg [PC_WIDTH-1:0] bju_pcgen_pc;
 
@@ -864,6 +909,8 @@ module IU (
             bju_pcgen_pc <= cp0_xx_mrvbr;
         else if (ifu_iu_chgflw_vld)
             bju_pcgen_pc <= ifu_iu_chgflw_pc;
+        else if (bju_not_ex1_chgflw)
+            bju_pcgen_pc <= bju_not_pred_pc;
         else if (rtu_iu_ex1_cmplt && !rtu_iu_ex1_inst_split)
             bju_pcgen_pc <= bju_pcgen_next_pc;
     end
@@ -881,8 +928,12 @@ module IU (
     // -----------------------------------------------------------------
     wire bju_writes_reg = (bju_uncond_sel || (bju_is_auipc_live && !bju_entry_vld_r))
                         && idu_iu_ex1_bju_sel;
+    // Sign-extend the JAL/JALR link address (pc+len written to rd): same
+    // zero-extension defect as ag_rs1_live/iu_ifu_tar_pc above -- a call
+    // (jal/jalr) executed from kernel-space code (PC bit PC_WIDTH-1 set)
+    // must produce a canonical return address for the later `ret` to work.
     wire [63:0] bju_wb_data = bju_uncond_sel
-                            ? {{(64-PC_WIDTH){1'b0}}, bju_inc_pc_live}
+                            ? {{(64-PC_WIDTH){bju_inc_pc_live[PC_WIDTH-1]}}, bju_inc_pc_live}
                             : ag_result_live;
 
     assign iu_rtu_ex1_bju_cmplt            = bju_resolves_now;
