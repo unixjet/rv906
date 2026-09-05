@@ -224,6 +224,21 @@ module IDU (
     output wire                     idu_cp0_ex1_inst_len,
 
     //=========================================================================
+    // IDU -> FPU : M5 Task 2 (D2/D-M5-3) -- FRF read-port outputs, latched
+    // the same EX1 cycle as the GPR ex1_src*_data_r trio (SECTION FRF EX1
+    // LATCH below). NOT YET CONNECTED to any consumer -- FPU.v doesn't
+    // exist until Task 3, so these dangle at the RVProc.v instantiation
+    // until then (safe: `-Wno-fatal`, test/m2/unit/Makefile:31). No
+    // OP-FP/LOAD-FP/STORE-FP decode arm exists yet either (Task 4 owns
+    // all of those) -- these three read fixed FP instruction-field
+    // positions unconditionally (SECTION FRF below), exactly like
+    // imm_i/imm_s/etc in SECTION DECODE.
+    //=========================================================================
+    output wire [63:0]              idu_fpu_ex1_fsrc0_data,
+    output wire [63:0]              idu_fpu_ex1_fsrc1_data,
+    output wire [63:0]              idu_fpu_ex1_fsrc2_data,
+
+    //=========================================================================
     // RTU -> IDU : the exclusive bypass network (IDU note S6) + the 2
     // architectural commit ports.
     //=========================================================================
@@ -242,6 +257,22 @@ module IDU (
     input  wire [63:0]              rtu_idu_wb1_data,
     input  wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg,
     input  wire                     rtu_idu_wb1_vld,
+    // M5 Task 2 (D2): FRF write ports, sized/split like GPR's wb0/wb1
+    // rather than the donor's single write port (aq_vidu_vid_gpr_fp.v:28-30
+    // `vpu_vidu_fp_wb_reg/_data/_vld`, one port only, servicing the vector
+    // issue slot) -- rv906 mirrors RTU.v's OWN wb0/wb1 producer split
+    // instead (RTU.v:46-68: wb0 = arbitrated ALU/BJU/CP0/DIV/MUL compute
+    // result, wb1 = dedicated, uncontested LSU load result): wbf0 will
+    // carry the FALU/FMAU/FDSU compute result (Task 3/5/6/7), wbf1 the
+    // dedicated FLW/FLD load result (Task 4/D8), the same compute-vs-LSU
+    // split GPR already uses. NOT YET DRIVEN -- RTU.v gains no FPU-facing
+    // ports until Task 3+; tied 0 at the RVProc.v instantiation until then.
+    input  wire [63:0]              rtu_idu_wbf0_data,
+    input  wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf0_reg,
+    input  wire                     rtu_idu_wbf0_vld,
+    input  wire [63:0]              rtu_idu_wbf1_data,
+    input  wire [GPR_IDX_WIDTH-1:0] rtu_idu_wbf1_reg,
+    input  wire                     rtu_idu_wbf1_vld,
 
     //=========================================================================
     // IU -> IDU : point-to-point stall/full signals (contract 8; matches
@@ -1235,6 +1266,89 @@ module IDU (
     wire [63:0] gpr_src2_data = gpr_read(dis_src2_reg5);
 
     //=========================================================================
+    // SECTION FRF (M5 Task 2, D2) -- 32-entry FP register file, added
+    // inline next to GPR rather than as a separate module: the donor's FP
+    // register file (`aq_vidu_vid_gpr_fp.v`) lives in the `vidu` cluster
+    // only because C906 bundles its vector engine and FPU together; rv906
+    // has no vector extension, so there is no second top-level cluster to
+    // put it in (D2/D3 in the M5 design doc).
+    //
+    // Structurally sized like GPR (2 write ports, 3 read ports) rather
+    // than the donor's single vector-issue writeback port
+    // (aq_vidu_vid_gpr_fp.v:28-30 `vpu_vidu_fp_wb_reg/_data/_vld`) -- see
+    // the rtu_idu_wbf0/wbf1 port comment above for the reasoning (mirrors
+    // RTU.v's own compute-vs-LSU wb0/wb1 split, not an arbitrary donor
+    // deviation).
+    //
+    // No hardwired-zero entry: per spec f0 is a real architectural
+    // register, unlike x0 -- frf_read() below has no x0-style special
+    // case. Sized [0:31] for the same verisim-harness index-mapping
+    // reason as GPR's [0:31] (Task 7.2's comment above).
+    //
+    // NOT YET CONNECTED to any consumer (M5 Task 2 scope): the write
+    // ports are real new IDU.v inputs, undriven until Task 3 (FPU.v) and
+    // Task 4 (LSU FRF-destination plumbing) exist. The read ports feed
+    // new output ports (idu_fpu_ex1_fsrc0/1/2_data) so this task's idu_tb
+    // rows can exercise reads/writes directly -- no OP-FP decode arm
+    // exists yet (Task 4 owns all of those), so unlike GPR's
+    // dis_src0_reg5 (decode-class-dependent, picking among several
+    // possible instruction-field positions per format), the FP source
+    // registers sit at FIXED bit positions for every FP instruction
+    // format in the base ISA encoding (rs1=inst[19:15], rs2=inst[24:20],
+    // rs3=inst[31:27] for the R4-type FMA family), so they're sliced
+    // unconditionally here -- the same "computed regardless of decode
+    // legality" convention this file already uses for imm_i/imm_s/etc.
+    // in SECTION DECODE.
+    //=========================================================================
+    reg [63:0] frf_r [0:31] /* verilator public */;
+
+    wire [31:0] frf_wbf0_oh = onehot32(rtu_idu_wbf0_reg[4:0], rtu_idu_wbf0_vld);
+    wire [31:0] frf_wbf1_oh = onehot32(rtu_idu_wbf1_reg[4:0], rtu_idu_wbf1_vld);
+
+    genvar fj;
+    generate
+        for (fj = 0; fj < 32; fj = fj + 1) begin : g_frf
+            // Same same-cycle wbf0==wbf1 collision policy as GPR (silently
+            // dropped, no 2'b11 arm) -- a consistent structural choice
+            // paralleling gpr_r's gated_reg.v-derived policy, not a
+            // distinct donor citation of its own (the donor's FRF has
+            // only 1 write port and therefore no such collision case).
+            always @(posedge clk) begin
+                case ({frf_wbf1_oh[fj], frf_wbf0_oh[fj]})
+                    2'b01:   frf_r[fj] <= rtu_idu_wbf0_data;
+                    2'b10:   frf_r[fj] <= rtu_idu_wbf1_data;
+                    default: frf_r[fj] <= frf_r[fj];
+                endcase
+            end
+        end
+    endgenerate
+
+    // Read-during-write merge, mirroring gpr_read() (no x0 special case).
+    function [63:0] frf_read(input [4:0] regnum);
+        reg [1:0] wsel;
+        begin
+            wsel = {frf_wbf1_oh[regnum], frf_wbf0_oh[regnum]};
+            case (wsel)
+                2'b01:   frf_read = rtu_idu_wbf0_data;
+                2'b10:   frf_read = rtu_idu_wbf1_data;
+                default: frf_read = frf_r[regnum];
+            endcase
+        end
+    endfunction
+
+    // Fixed FP source-register field positions (base ISA encoding, same
+    // across every OP-FP/LOAD-FP/STORE-FP/FMADD/FMSUB/FNMSUB/FNMADD
+    // format) -- computed unconditionally, same convention as
+    // imm_i/imm_s/etc above.
+    wire [4:0] dis_fsrc0_reg5 = inst[19:15];
+    wire [4:0] dis_fsrc1_reg5 = inst[24:20];
+    wire [4:0] dis_fsrc2_reg5 = inst[31:27];
+
+    wire [63:0] frf_src0_data = frf_read(dis_fsrc0_reg5);
+    wire [63:0] frf_src1_data = frf_read(dis_fsrc1_reg5);
+    wire [63:0] frf_src2_data = frf_read(dis_fsrc2_reg5);
+
+    //=========================================================================
     // SECTION FORWARD MUX (IDU note S6, aq_idu_id_dp.v:639-727) -- 3-way
     // one-hot compare against rtu_idu_fwd0/1/2, falls to `{64{1'bx}}` on a
     // non-hit exactly like the donor (the mutual-exclusivity invariant that
@@ -1445,6 +1559,27 @@ module IDU (
             if (lf2_hit) begin ex1_src2_data_r <= lf2_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src2_rdy_r <= 1'b1; end
         end
     end
+
+    //=========================================================================
+    // SECTION FRF EX1 LATCH (M5 Task 2, D2) -- mirrors ex1_src*_data_r
+    // above exactly: unconditional on `adv`, no EU-dispatch/legality
+    // gating (no FP consumer exists yet to need either), no late-forward
+    // network (Task 4/5 add hazard tracking once FMA exists).
+    //=========================================================================
+    reg [63:0] ex1_fsrc0_data_r, ex1_fsrc1_data_r, ex1_fsrc2_data_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ex1_fsrc0_data_r <= 64'd0; ex1_fsrc1_data_r <= 64'd0; ex1_fsrc2_data_r <= 64'd0;
+        end else if (adv) begin
+            ex1_fsrc0_data_r <= frf_src0_data;
+            ex1_fsrc1_data_r <= frf_src1_data;
+            ex1_fsrc2_data_r <= frf_src2_data;
+        end
+    end
+
+    assign idu_fpu_ex1_fsrc0_data = ex1_fsrc0_data_r;
+    assign idu_fpu_ex1_fsrc1_data = ex1_fsrc1_data_r;
+    assign idu_fpu_ex1_fsrc2_data = ex1_fsrc2_data_r;
 
     //=========================================================================
     // SECTION EU DISPATCH (IDU note S7, ctrl.v:619-663) -- the EX1

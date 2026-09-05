@@ -41,6 +41,8 @@ static void tie_idle_inputs(void) {
     dut->rtu_idu_fwd2_data = 0; dut->rtu_idu_fwd2_reg = 0; dut->rtu_idu_fwd2_vld = 0;
     dut->rtu_idu_wb0_data  = 0; dut->rtu_idu_wb0_reg  = 0; dut->rtu_idu_wb0_vld  = 0;
     dut->rtu_idu_wb1_data  = 0; dut->rtu_idu_wb1_reg  = 0; dut->rtu_idu_wb1_vld  = 0;
+    dut->rtu_idu_wbf0_data = 0; dut->rtu_idu_wbf0_reg = 0; dut->rtu_idu_wbf0_vld = 0;
+    dut->rtu_idu_wbf1_data = 0; dut->rtu_idu_wbf1_reg = 0; dut->rtu_idu_wbf1_vld = 0;
 
     dut->iu_idu_mult_issue_stall = 0;
     dut->iu_idu_mult_full        = 0;
@@ -201,6 +203,24 @@ static void write_gpr(uint32_t reg, uint64_t data) {
     dut->rtu_idu_wb0_vld  = 0;
     dut->rtu_idu_wb0_reg  = 0;
     dut->rtu_idu_wb0_data = 0;
+}
+
+static void write_frf(uint32_t reg, uint64_t data) {
+    dut->rtu_idu_wbf0_reg  = reg;
+    dut->rtu_idu_wbf0_data = data;
+    dut->rtu_idu_wbf0_vld  = 1;
+    tick();
+    dut->rtu_idu_wbf0_vld  = 0;
+    dut->rtu_idu_wbf0_reg  = 0;
+    dut->rtu_idu_wbf0_data = 0;
+}
+
+// Raw OP-FP-shaped word (op=0x53) placing rs3 at inst[31:27] and fmt at
+// inst[26:25] via f7=(rs3<<2)|fmt, per the R4-type FP format. No casez arm
+// decodes OP-FP yet (Task 4), but dis_fsrc0/1/2_reg5 slice these bit
+// positions unconditionally, so this is sufficient to probe FRF reads.
+static uint32_t enc_fp_r4(uint32_t rs3, uint32_t fmt, uint32_t rs2, uint32_t rs1, uint32_t f3, uint32_t rd) {
+    return enc_r((rs3 << 2) | fmt, rs2, rs1, f3, rd, 0x53u);
 }
 
 static void present(uint32_t inst, bool vld = true) {
@@ -713,6 +733,68 @@ static void test_ex1_issue_gate_full_holds_and_backpressures(void) {
     test_result("T29 EX1 issue-gate: <EU>_idu_full holds the instruction and backpressures the front end");
 }
 
+// ---- M5 Task 2: FRF read/write, f0 has NO hardwired-zero, wbf0==wbf1 collision ----
+static void test_frf_basic_rw(void) {
+    reset_dut();
+    write_frf(5, 0x40091EB851EB851FULL); // 3.14 as a double bit pattern
+    present(enc_fp_r4(0, 0, 0, 5, 0, 6)); tick(); present(0, false);
+    check(dut->idu_fpu_ex1_fsrc0_data == 0x40091EB851EB851FULL,
+          "frf: read-back matches prior write", dut->idu_fpu_ex1_fsrc0_data, 0x40091EB851EB851FULL);
+    test_result("T30 FRF basic write-then-read (fsrc0 == rs1 field)");
+}
+
+static void test_frf_f0_not_hardwired(void) {
+    reset_dut();
+    // unlike GPR's x0, f0 is an architecturally real register -- a write
+    // must stick, not be silently discarded.
+    write_frf(0, 0xDEADBEEFCAFEBABEULL);
+    present(enc_fp_r4(0, 0, 0, 0, 0, 6)); tick(); present(0, false);
+    check(dut->idu_fpu_ex1_fsrc0_data == 0xDEADBEEFCAFEBABEULL,
+          "frf: f0 holds a written value (no x0-style hardwired zero)",
+          dut->idu_fpu_ex1_fsrc0_data, 0xDEADBEEFCAFEBABEULL);
+    test_result("T31 FRF f0 is NOT hardwired to zero (deviation from GPR x0)");
+}
+
+static void test_frf_all_three_read_ports(void) {
+    reset_dut();
+    write_frf(1, 0x11);
+    write_frf(2, 0x22);
+    write_frf(3, 0x33);
+    // rs1=1, rs2=2, rs3=3
+    present(enc_fp_r4(3, 0, 2, 1, 0, 6)); tick(); present(0, false);
+    check(dut->idu_fpu_ex1_fsrc0_data == 0x11, "frf: fsrc0 == rs1(f1)", dut->idu_fpu_ex1_fsrc0_data, 0x11);
+    check(dut->idu_fpu_ex1_fsrc1_data == 0x22, "frf: fsrc1 == rs2(f2)", dut->idu_fpu_ex1_fsrc1_data, 0x22);
+    check(dut->idu_fpu_ex1_fsrc2_data == 0x33, "frf: fsrc2 == rs3(f3)", dut->idu_fpu_ex1_fsrc2_data, 0x33);
+    test_result("T32 FRF all three read ports (fsrc0/1/2 == rs1/rs2/rs3, fixed positions)");
+}
+
+static void test_frf_wbf0_eq_wbf1_collision(void) {
+    reset_dut();
+    write_frf(7, 0x11);   // baseline value
+    // same-cycle wbf0==wbf1 on register f7 -- mirrors GPR's gated_reg.v
+    // collision case (no 2'b11 arm): the write must be DROPPED.
+    dut->rtu_idu_wbf0_reg = 7; dut->rtu_idu_wbf0_data = 0xAAAA; dut->rtu_idu_wbf0_vld = 1;
+    dut->rtu_idu_wbf1_reg = 7; dut->rtu_idu_wbf1_data = 0xBBBB; dut->rtu_idu_wbf1_vld = 1;
+    tick();
+    dut->rtu_idu_wbf0_vld = 0; dut->rtu_idu_wbf1_vld = 0;
+    present(enc_fp_r4(0, 0, 0, 7, 0, 6)); tick(); present(0, false);
+    check(dut->idu_fpu_ex1_fsrc0_data == 0x11, "frf: wbf0==wbf1 collision drops the write, old value holds",
+          dut->idu_fpu_ex1_fsrc0_data, 0x11);
+    test_result("T33 FRF wbf0==wbf1 collision on one register: write silently dropped (matches GPR policy)");
+}
+
+static void test_frf_wbf0_wbf1_no_collision(void) {
+    reset_dut();
+    dut->rtu_idu_wbf0_reg = 9;  dut->rtu_idu_wbf0_data = 0x9999; dut->rtu_idu_wbf0_vld = 1;
+    dut->rtu_idu_wbf1_reg = 10; dut->rtu_idu_wbf1_data = 0xAAAA; dut->rtu_idu_wbf1_vld = 1;
+    tick();
+    dut->rtu_idu_wbf0_vld = 0; dut->rtu_idu_wbf1_vld = 0;
+    present(enc_fp_r4(0, 0, 10, 9, 0, 6)); tick(); present(0, false);
+    check(dut->idu_fpu_ex1_fsrc0_data == 0x9999, "frf: wbf0->f9 landed");
+    check(dut->idu_fpu_ex1_fsrc1_data == 0xAAAA, "frf: wbf1->f10 landed");
+    test_result("T34 FRF wbf0/wbf1 to different registers: no collision, both land");
+}
+
 //=============================================================================
 // Main
 //=============================================================================
@@ -755,6 +837,12 @@ int main(int argc, char **argv) {
     test_eu_onehot_dispatch();
     test_ex1_issue_gate_commit0();
     test_ex1_issue_gate_full_holds_and_backpressures();
+
+    test_frf_basic_rw();
+    test_frf_f0_not_hardwired();
+    test_frf_all_three_read_ports();
+    test_frf_wbf0_eq_wbf1_collision();
+    test_frf_wbf0_wbf1_no_collision();
 
     printf("%s\n", g_fail ? "UNIT-FAIL" : "UNIT-PASS");
     delete dut;

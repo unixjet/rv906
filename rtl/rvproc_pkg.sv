@@ -740,4 +740,24 @@ parameter [FUNC_WIDTH-1:0] LSU_FUNC_SH  = 20'h00305;  // cfig.h:514
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SW  = 20'h00309;  // cfig.h:515
 parameter [FUNC_WIDTH-1:0] LSU_FUNC_SD  = 20'h0030d;  // cfig.h:516
 
+// M5 Task 2: FP instruction-encoding constants (standard RISC-V ISA-spec
+// facts, not donor implementation details -- same carve-out already used
+// for the M2/M4 CSR addresses above). fmt (inst[26:25]) selects the OP-FP
+// operand width; rm (inst[14:12], or the frm CSR when rm==3'b111=DYN)
+// selects the rounding mode. FUNC_*-style implementation-defined constants
+// (FALU/FMAU/FDSU opcodes) are deliberately deferred to Task 3/4, pinned
+// alongside their real RTL consumer -- same ALU_FUNC_*/CP0_FUNC_* precedent
+// used throughout this file.
+parameter [1:0] FP_FMT_S   = 2'b00;   // single-precision
+parameter [1:0] FP_FMT_D   = 2'b01;   // double-precision
+parameter [1:0] FP_FMT_H   = 2'b10;   // half-precision (unused, Q extension not implemented)
+parameter [1:0] FP_FMT_Q   = 2'b11;   // quad-precision (unused, Q extension not implemented)
+
+parameter [2:0] FP_RM_RNE  = 3'b000;  // round to nearest, ties to even
+parameter [2:0] FP_RM_RTZ  = 3'b001;  // round towards zero
+parameter [2:0] FP_RM_RDN  = 3'b010;  // round down (towards -inf)
+parameter [2:0] FP_RM_RUP  = 3'b011;  // round up (towards +inf)
+parameter [2:0] FP_RM_RMM  = 3'b100;  // round to nearest, ties to max magnitude
+parameter [2:0] FP_RM_DYN  = 3'b111;  // dynamic -- use frm CSR
+
 endpackage

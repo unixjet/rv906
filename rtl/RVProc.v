@@ -382,6 +382,11 @@ module RVProc #(
     wire [63:0]              idu_cp0_ex1_src1_data;
     wire [GPR_IDX_WIDTH-1:0] idu_cp0_ex1_dst0_reg;
     wire                     idu_cp0_ex1_inst_len;   // Task 7.3
+    // M5 Task 2: FRF read-port outputs. No consumer exists until Task 3
+    // (FPU.v) -- dangling here, same as any pre-consumer landing pad.
+    wire [63:0]              idu_fpu_ex1_fsrc0_data;
+    wire [63:0]              idu_fpu_ex1_fsrc1_data;
+    wire [63:0]              idu_fpu_ex1_fsrc2_data;
     wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
     wire [15:0]              iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
 
@@ -516,6 +521,8 @@ module RVProc #(
     wire [63:0]              rtu_idu_wb1_data;
     wire [GPR_IDX_WIDTH-1:0] rtu_idu_wb1_reg;
     wire                     rtu_idu_wb1_vld;
+    // M5 Task 2: FRF write ports. No producer exists until Task 3+ (RTU.v
+    // gains no FPU-facing ports yet) -- tied 0 at the instantiation below.
 
     wire                     rtu_idu_flush_fe;
     wire                     rtu_idu_flush_stall;
@@ -852,6 +859,10 @@ module RVProc #(
         .idu_cp0_ex1_dst0_reg    (idu_cp0_ex1_dst0_reg),
         .idu_cp0_ex1_inst_len    (idu_cp0_ex1_inst_len),
 
+        .idu_fpu_ex1_fsrc0_data  (idu_fpu_ex1_fsrc0_data),
+        .idu_fpu_ex1_fsrc1_data  (idu_fpu_ex1_fsrc1_data),
+        .idu_fpu_ex1_fsrc2_data  (idu_fpu_ex1_fsrc2_data),
+
         .rtu_idu_fwd0_data       (rtu_idu_fwd0_data),
         .rtu_idu_fwd0_reg        (rtu_idu_fwd0_reg),
         .rtu_idu_fwd0_vld        (rtu_idu_fwd0_vld),
@@ -867,6 +878,12 @@ module RVProc #(
         .rtu_idu_wb1_data        (rtu_idu_wb1_data),
         .rtu_idu_wb1_reg         (rtu_idu_wb1_reg),
         .rtu_idu_wb1_vld         (rtu_idu_wb1_vld),
+        .rtu_idu_wbf0_data       (64'd0),
+        .rtu_idu_wbf0_reg        ({GPR_IDX_WIDTH{1'b0}}),
+        .rtu_idu_wbf0_vld        (1'b0),
+        .rtu_idu_wbf1_data       (64'd0),
+        .rtu_idu_wbf1_reg        ({GPR_IDX_WIDTH{1'b0}}),
+        .rtu_idu_wbf1_vld        (1'b0),
 
         .iu_idu_mult_issue_stall (iu_idu_mult_issue_stall),
         .iu_idu_mult_full        (iu_idu_mult_full),
