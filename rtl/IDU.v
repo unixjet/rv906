@@ -1101,6 +1101,69 @@ module IDU (
                 d32_func[FUNC_MAU_NEG] = 1'b1;
                 d32_illegal = 1'b1;
             end
+            // M5 Task 7: fcvt.{w,wu,l,lu}.{s,d} -- float->int, xvld-class,
+            // GPR destination (part-a pattern, like feq/flt/fle/fclass
+            // above). rs2 (inst[24:20]) is NOT part of the 15-bit casez
+            // key (funct7/funct3/opcode only), so all four of w/wu/l/lu
+            // share one arm per FP-source-width and are told apart here
+            // by inst[21:20] -- the RISC-V rs2 encoding for this family is
+            // itself {wide64,unsigned} (00=w,01=wu,10=l,11=lu), which maps
+            // directly onto FUNC_CVT_WIDE64/FUNC_CVT_UNSIGNED with no
+            // reordering.
+            15'b1100000_???_10100: begin  // fcvt.w/wu/l/lu.s
+                d32_eu = EU_FP; d32_func[FUNC_CVT_INT] = 1'b1; d32_func[FUNC_CVT_F2I] = 1'b1;
+                d32_func[FUNC_CVT_UNSIGNED] = inst[20]; d32_func[FUNC_CVT_WIDE64] = inst[21];
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1100001_???_10100: begin  // fcvt.w/wu/l/lu.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_CVT_INT] = 1'b1; d32_func[FUNC_CVT_F2I] = 1'b1;
+                d32_func[FUNC_CVT_UNSIGNED] = inst[20]; d32_func[FUNC_CVT_WIDE64] = inst[21];
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            // fcvt.s/d.{w,wu,l,lu} -- int->float, FRF-destination (part-b
+            // pattern: d32_dst0_vld left 0, same reasoning as fadd/fsub).
+            15'b1101000_???_10100: begin  // fcvt.s.w/wu/l/lu
+                d32_eu = EU_FP; d32_func[FUNC_CVT_INT] = 1'b1;
+                d32_func[FUNC_CVT_UNSIGNED] = inst[20]; d32_func[FUNC_CVT_WIDE64] = inst[21];
+                d32_illegal = 1'b1;
+            end
+            15'b1101001_???_10100: begin  // fcvt.d.w/wu/l/lu
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
+                d32_func[FUNC_CVT_INT] = 1'b1;
+                d32_func[FUNC_CVT_UNSIGNED] = inst[20]; d32_func[FUNC_CVT_WIDE64] = inst[21];
+                d32_illegal = 1'b1;
+            end
+            // fmv.x.w/fmv.x.d -- fp->int passthrough, xvld-class, GPR
+            // destination (part-a pattern). fmv.w.x/fmv.d.x -- int->fp
+            // passthrough, FRF-destination (part-b pattern). rs2=00000
+            // (fixed) is not separately checked, same convention as
+            // fclass's rs2=00000 above (harmless: everything here is
+            // illegal pre-Task-9 anyway).
+            // FUNC_SPU_SGN is set here (not just FUNC_SPU_MV) so that
+            // idu_fpu_ex1_fspu_sel's dispatch OR-term stays on the
+            // already-safe FUNC_SPU_SGN bit rather than on FUNC_SPU_MV,
+            // which aliases FUNC_MAU_NEG's bit position -- see the
+            // fspu_sel comment above.
+            15'b1110000_000_10100: begin  // fmv.x.w
+                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1;
+                d32_func[FUNC_SPU_MV] = 1'b1; d32_func[FUNC_SPU_MV_XF] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1110001_000_10100: begin  // fmv.x.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_SPU_SGN] = 1'b1;
+                d32_func[FUNC_SPU_MV] = 1'b1; d32_func[FUNC_SPU_MV_XF] = 1'b1;
+                d32_dst0_vld = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1111000_000_10100: begin  // fmv.w.x
+                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1;
+                d32_func[FUNC_SPU_MV] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b1111001_000_10100: begin  // fmv.d.x
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_SPU_SGN] = 1'b1;
+                d32_func[FUNC_SPU_MV] = 1'b1;
+                d32_illegal = 1'b1;
+            end
             default: d32_illegal = 1'b1;   // FP/vector/AMO-LR-SC/custom-0/
                                             // dret/any unallocated encoding
                                             // (5.1's closed illegal-decode list;
@@ -1898,12 +1961,21 @@ module IDU (
     // gating (no FP consumer exists yet to need either), no late-forward
     // network (Task 4/5 add hazard tracking once FMA exists).
     //=========================================================================
+    // M5 Task 7: fcvt.{s,d}.{w,wu,l,lu} and fmv.{w.x,d.x} read their
+    // source from the INTEGER regfile (rs1, inst[19:15]) rather than the
+    // FP regfile -- dis_src0_data (the already-forwarding-resolved GPR
+    // value read via the SAME inst[19:15] field, see dis_src0_reg5) is
+    // substituted for frf_src0_data on exactly these two int-sourced
+    // op groups. Every other FP op (dis_gpr_fsrc0=0) is bit-identical to
+    // before this task.
+    wire dis_gpr_fsrc0 = (dis_func[FUNC_CVT_INT] && !dis_func[FUNC_CVT_F2I])
+                       || (dis_func[FUNC_SPU_MV] && !dis_func[FUNC_SPU_MV_XF]);
     reg [63:0] ex1_fsrc0_data_r, ex1_fsrc1_data_r, ex1_fsrc2_data_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             ex1_fsrc0_data_r <= 64'd0; ex1_fsrc1_data_r <= 64'd0; ex1_fsrc2_data_r <= 64'd0;
         end else if (adv) begin
-            ex1_fsrc0_data_r <= frf_src0_data;
+            ex1_fsrc0_data_r <= dis_gpr_fsrc0 ? dis_src0_data : frf_src0_data;
             ex1_fsrc1_data_r <= frf_src1_data;
             ex1_fsrc2_data_r <= frf_src2_data;
         end
@@ -1935,10 +2007,21 @@ module IDU (
     assign idu_fpu_ex1_fadd_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && (ex1_func_r[FUNC_ADD] || ex1_func_r[FUNC_SUB]
                                       || ex1_func_r[FUNC_CMP] || ex1_func_r[FUNC_MAX] || ex1_func_r[FUNC_MIN]);
+    // M5 Task 7: fmv.{x.w,w.x,x.d,d.x} dispatch into FSPU rides the
+    // decode arms also setting FUNC_SPU_SGN (see below) -- NOT a new
+    // bare OR-term on FUNC_SPU_MV, because FUNC_SPU_MV aliases
+    // FUNC_MAU_NEG's bit position (rvproc_pkg.sv), which IS genuinely
+    // set by fnmadd.{s,d}/fnmsub.{s,d} (FMAU); a bare OR on it here
+    // would spuriously co-fire fspu_sel alongside fmau_sel for those
+    // four instructions and (SECTION 13's fspu>fmau priority) corrupt
+    // their result. FUNC_SPU_MV stays purely AND-gated (spu_op_mv_fx/
+    // mv_xf in FPU.v), which is safe. FUNC_CVT_INT (FCNVT dispatch,
+    // below) has no such collision: its aliased bit (FUNC_CMP_FNE) is
+    // never set by any decode arm.
     assign idu_fpu_ex1_fspu_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && (ex1_func_r[FUNC_SPU_SGN] || ex1_func_r[FUNC_CLASS]);
     assign idu_fpu_ex1_fcnvt_sel = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
-                                  && (ex1_func_r[FUNC_CVT_WIDDEN] || ex1_func_r[FUNC_CVT_NARROW]);
+                                  && (ex1_func_r[FUNC_CVT_WIDDEN] || ex1_func_r[FUNC_CVT_NARROW] || ex1_func_r[FUNC_CVT_INT]);
     // M5 Task 5: FUNC_MAU_MUL alone identifies FMAU-class ops (see the
     // port declaration comment -- FUSED/SUB/NEG can't serve this role
     // since plain fmul sets FUSED=0 with SUB/NEG don't-care).

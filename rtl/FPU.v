@@ -143,6 +143,23 @@ module FPU (
         end
     endfunction
 
+    // Leading-zero count over a 64-bit integer magnitude (M5 Task 7 i2f).
+    // Returns 64 for zero (../rv12/rtl/FPUAlu.v:355-378, verbatim shape).
+    function [7:0] lzc64;
+        input [63:0] v;
+        integer i;
+        reg    found;
+        begin
+            lzc64 = 8'd64;
+            found = 1'b0;
+            for (i = 63; i >= 0; i = i - 1)
+                if (v[i] && !found) begin
+                    found = 1'b1;
+                    lzc64 = 8'd63 - i[7:0];
+                end
+        end
+    endfunction
+
     // THE ROUND DECISION. Five modes, RISC-V's own encoding (rm = 000 RNE,
     // 001 RTZ, 010 RDN, 011 RUP, 100 RMM). 101/110 reserved (IDU refuses
     // them); 111 DYN is resolved before it reaches this module.
@@ -628,13 +645,17 @@ module FPU (
          (!add_spe_sel && !add_op_sel) ? add_path_nx      : 1'b0};
 
     //=========================================================================
-    // SECTION 9: FSPU -- SIGN INJECTION AND fclass ONLY (D-TASK3-1: fmv.*
-    // dropped, deferred to Task 7)
+    // SECTION 9: FSPU -- SIGN INJECTION, fclass, AND fmv.{x.w,w.x,x.d,d.x}
+    // (M5 Task 7 adds the fmv.* pair below; ../rv12/rtl/FPUAlu.v:1019-1114
+    // is the donor, adapted from its two-bit {MV_FX,MV_XF} encoding to
+    // rv906's single FUNC_SPU_MV trigger + FUNC_SPU_MV_XF direction bit)
     //=========================================================================
     wire spu_op_sgnjx = idu_fpu_ex1_func[FUNC_SPU_SGN] && idu_fpu_ex1_func[FUNC_SPU_SGN_X];
     wire spu_op_sgnjn = idu_fpu_ex1_func[FUNC_SPU_SGN] && idu_fpu_ex1_func[FUNC_SPU_SGN_N];
     wire spu_op_sgnj  = idu_fpu_ex1_func[FUNC_SPU_SGN] && idu_fpu_ex1_func[FUNC_SPU_SGN_J];
     wire spu_op_class = idu_fpu_ex1_func[FUNC_CLASS];
+    wire spu_op_mv_fx = idu_fpu_ex1_func[FUNC_SPU_MV] && !idu_fpu_ex1_func[FUNC_SPU_MV_XF]; // fmv.w.x/d.x
+    wire spu_op_mv_xf = idu_fpu_ex1_func[FUNC_SPU_MV] &&  idu_fpu_ex1_func[FUNC_SPU_MV_XF]; // fmv.x.w/x.d
 
     // The unboxed single views: fsgnj*.s and fclass.s are defined on
     // single-precision VALUES and therefore unbox.
@@ -666,6 +687,20 @@ module FPU (
                                a_s && !a_e_max && !a_e_z && !a_cnan, // -normal
                                a_s && a_e_max && a_f_z   && !a_cnan }; // -inf
 
+    // fmv.w.x/fmv.d.x -- int->fp passthrough. Source is
+    // idu_fpu_ex1_fsrc0_data, GPR-valued for this op via IDU.v's
+    // dis_gpr_fsrc0 mux (M5 Task 7). fmv.w.x boxes into NaN-boxed single;
+    // fmv.d.x is the 64-bit identity (../rv12/rtl/FPUAlu.v:1019-1114).
+    wire [63:0] spu_mtvr   = idu_fpu_ex1_fsrc0_data;
+    wire [63:0] spu_mtvr_s = {32'hffffffff, spu_mtvr[31:0]};
+    wire [63:0] spu_mtvr_d = spu_mtvr;
+
+    // fmv.x.w/fmv.x.d -- fp->int passthrough, reading the RAW (boxed or
+    // not) src0 bits -- no NaN-box canonicalization, unlike spu_a_s32.
+    // fmv.x.w sign-extends the raw 32-bit view; fmv.x.d is identity.
+    wire [63:0] spu_mfvr_s = {{32{idu_fpu_ex1_fsrc0_data[31]}}, idu_fpu_ex1_fsrc0_data[31:0]};
+    wire [63:0] spu_mfvr_d = idu_fpu_ex1_fsrc0_data;
+
     // The freg-destination result -- leaves at EX1, D1 (no completion latch).
     wire [63:0] fspu_ex1_result =
           ({64{spu_op_sgnj  &&  f_double}} & spu_sgnj_d)
@@ -673,28 +708,49 @@ module FPU (
         | ({64{spu_op_sgnjx &&  f_double}} & spu_sgnjx_d)
         | ({64{spu_op_sgnj  && !f_double}} & spu_sgnj_s)
         | ({64{spu_op_sgnjn && !f_double}} & spu_sgnjn_s)
-        | ({64{spu_op_sgnjx && !f_double}} & spu_sgnjx_s);
+        | ({64{spu_op_sgnjx && !f_double}} & spu_sgnjx_s)
+        | ({64{spu_op_mv_fx &&  f_double}} & spu_mtvr_d)
+        | ({64{spu_op_mv_fx && !f_double}} & spu_mtvr_s);
 
-    // ... and the mfvr (integer-destination) answer, fclass only in this task.
-    wire [63:0] fspu_mfvr_data = ({64{spu_op_class}} & spu_class);
+    // ... and the mfvr (integer-destination) answer: fclass or fmv.x.w/x.d.
+    wire [63:0] fspu_mfvr_data = ({64{spu_op_class}} & spu_class)
+                                | ({64{spu_op_mv_xf &&  f_double}} & spu_mfvr_d)
+                                | ({64{spu_op_mv_xf && !f_double}} & spu_mfvr_s);
 
     //=========================================================================
-    // SECTION 10: FCNVT EX1 -- FORMAT DECODE AND SOURCE PREPARE, FLOAT-ONLY
-    // (D-TASK3-2: int<->float dropped, deferred to Task 7 -- cvt_src_flt/
-    // cvt_dest_flt hardwired 1'b1 rather than read from FUNC_CVT_SRC_FLT/
-    // _DEST_FLT, which don't exist yet)
+    // SECTION 10: FCNVT EX1 -- FORMAT DECODE AND SOURCE PREPARE (M5 Task 7
+    // adds int<->float below the pre-existing f2f-only decode; donor
+    // ../rv12/rtl/FPUAlu.v:1116-1315 SECTION 10/11a/11b, adapted from its
+    // 4-bit {SRC_FLT,SRC_SI,DEST_FLT,DEST_SI} scheme to rv906's
+    // FUNC_CVT_INT/FUNC_CVT_F2I trigger+direction pair)
     //=========================================================================
     wire cvt_widden = idu_fpu_ex1_func[FUNC_CVT_WIDDEN] && !idu_fpu_ex1_func[FUNC_CVT_NARROW];
     wire cvt_narrow = !idu_fpu_ex1_func[FUNC_CVT_WIDDEN] && idu_fpu_ex1_func[FUNC_CVT_NARROW];
     wire cvt_equal  = !idu_fpu_ex1_func[FUNC_CVT_WIDDEN] && !idu_fpu_ex1_func[FUNC_CVT_NARROW];
 
+    // int<->float trigger/direction/width bits (int-convert ops always
+    // carry cvt_widden=cvt_narrow=0, i.e. cvt_equal=1 -- neither WIDDEN nor
+    // NARROW is ever set by IDU.v's fcvt.*.{w,wu,l,lu} decode arms).
+    wire cvt_is_int   = idu_fpu_ex1_func[FUNC_CVT_INT];
+    wire cvt_f2i      = idu_fpu_ex1_func[FUNC_CVT_F2I];      // 1=fp->int, 0=int->fp
+    wire cvt_unsigned = idu_fpu_ex1_func[FUNC_CVT_UNSIGNED];
+    wire cvt_wide64   = idu_fpu_ex1_func[FUNC_CVT_WIDE64];   // int-side width
+
     wire cvt_src_l64  = idu_fpu_ex1_func[FUNC_DOUBLE] || (idu_fpu_ex1_func[FUNC_B_SINGLE] && cvt_narrow);
-    wire cvt_src_l32  = idu_fpu_ex1_func[FUNC_B_SINGLE] && !cvt_narrow;
+    // cvt_src_l32 additionally fires for a single-precision f2i source --
+    // FUNC_B_SINGLE is f2f-only plumbing (never set by the int-convert
+    // decode arms) so the box-check below would otherwise never trigger
+    // for fcvt.w/wu/l/lu.s.
+    wire cvt_src_l32  = (idu_fpu_ex1_func[FUNC_B_SINGLE] && !cvt_narrow)
+                      || (cvt_is_int && cvt_f2i && !idu_fpu_ex1_func[FUNC_DOUBLE]);
     wire cvt_dest_l64 = (cvt_src_l64 && cvt_equal) || (cvt_src_l32 && cvt_widden);
 
     wire cvt_dest_dbl = cvt_dest_l64;   // cvt_dest_flt hardwired 1 (D-TASK3-2)
 
-    //-- the FLOAT source, classified in its own width -----------------------
+    //-- the FLOAT source, classified in its own width -- reused UNCHANGED
+    //-- for f2i: cvt_src_l64/cvt_src_l32 above already collapse to
+    //-- f_double/!f_double for every int-convert op, so this block needs
+    //-- no int-convert-specific logic of its own. ----------------------
     wire        cvt_s_dbl  = cvt_src_l64;
     wire        cvt_f_cnan = cvt_src_l32 && !(&idu_fpu_ex1_fsrc0_data[63:32]);
     wire        cvt_f_s    = cvt_s_dbl ? idu_fpu_ex1_fsrc0_data[63] : idu_fpu_ex1_fsrc0_data[31];
@@ -714,6 +770,17 @@ module FPU (
         $signed({2'b0, (cvt_f_ez ? 11'd1 : cvt_f_ef)})
       - $signed({2'b0, (cvt_s_dbl ? BIAS_D : BIAS_S)});
 
+    //-- the INTEGER source, prepared for i2f (../rv12/rtl/FPUAlu.v ~1200,
+    //-- adapted: cvt_src_si -> cvt_int_signed, cvt_src_l64 -> cvt_wide64).
+    //-- idu_fpu_ex1_fsrc0_data is GPR-valued here via IDU.v's dis_gpr_fsrc0
+    //-- mux. Meaningless (and unused) when !cvt_is_int or cvt_f2i.
+    wire cvt_int_signed = !cvt_unsigned;   // shared: i2f src-signed / f2i dst-signed
+    wire cvt_i_neg = cvt_is_int && !cvt_f2i && cvt_int_signed
+                   && (cvt_wide64 ? idu_fpu_ex1_fsrc0_data[63] : idu_fpu_ex1_fsrc0_data[31]);
+    wire [63:0] cvt_i_ext = cvt_wide64 ? idu_fpu_ex1_fsrc0_data
+                          : {{32{cvt_int_signed & idu_fpu_ex1_fsrc0_data[31]}}, idu_fpu_ex1_fsrc0_data[31:0]};
+    wire [63:0] cvt_i_mag = cvt_i_neg ? (~cvt_i_ext + 64'd1) : cvt_i_ext;
+
     //-- FLATTENED EX1->EX2 (D1) -- see SECTION 4's note; f2f-only subset.
     wire        e2_cvt_dest_dbl = cvt_dest_dbl;
     wire        e2_cvt_f_s      = cvt_f_s;
@@ -726,8 +793,7 @@ module FPU (
     wire [2:0]  e2_cvt_rm       = idu_fpu_ex1_rm;
 
     //=========================================================================
-    // SECTION 11: FCNVT -- FLOAT->FLOAT ONLY (D-TASK3-2: SECTIONS 11a/11b's
-    // float<->int machinery dropped, deferred to Task 7)
+    // SECTION 11: FCNVT -- FLOAT->FLOAT
     //=========================================================================
     // The source's exponent is re-biased to the destination's format and the
     // packer does the rest -- including fcvt.s.d's rounding/overflow/
@@ -744,13 +810,137 @@ module FPU (
                                             : {32'hffffffff, e2_cvt_f_s, 8'hff, 23'b0};
     wire [63:0] f2f_zero  = e2_cvt_dest_dbl ? {e2_cvt_f_s, 63'b0}
                                             : {32'hffffffff, e2_cvt_f_s, 31'b0};
-    wire [63:0] fcnvt_ex1_result = (e2_cvt_f_snan || e2_cvt_f_qnan) ? f2f_canon
-                                 : e2_cvt_f_inf                     ? f2f_inf
-                                 : e2_cvt_f_zero                    ? f2f_zero
-                                                                    : f2f_pack[PACK_W-1:5];
-    wire [4:0]  fcnvt_ex1_flags = (e2_cvt_f_snan)                    ? 5'b10000
-                                : (e2_cvt_f_qnan || e2_cvt_f_inf || e2_cvt_f_zero) ? 5'b0
-                                                                     : f2f_pack[4:0];
+    wire [63:0] f2f_result = (e2_cvt_f_snan || e2_cvt_f_qnan) ? f2f_canon
+                            : e2_cvt_f_inf                     ? f2f_inf
+                            : e2_cvt_f_zero                    ? f2f_zero
+                                                                : f2f_pack[PACK_W-1:5];
+    wire [4:0]  f2f_flags  = (e2_cvt_f_snan)                    ? 5'b10000
+                           : (e2_cvt_f_qnan || e2_cvt_f_inf || e2_cvt_f_zero) ? 5'b0
+                                                                : f2f_pack[4:0];
+
+    //=========================================================================
+    // SECTION 11a: FCNVT -- FLOAT->INTEGER (M5 Task 7; donor verbatim,
+    // ../rv12/rtl/FPUAlu.v ~1220-1290. e2_cvt_dest_si/l64 -> cvt_int_signed/
+    // cvt_wide64; the NaN->MAXIMUM-only saturation asymmetry is DELIBERATE
+    // -- do not "tidy" it into a shared max/min term, see donor comment and
+    // ct_fcnvt_double_dp.v:1212-1236.)
+    //=========================================================================
+    wire f2i_huge  = (cvt_f_eunb >= 13'sd64) || cvt_f_inf || cvt_f_snan || cvt_f_qnan;
+    wire f2i_tiny  = (cvt_f_eunb <  -13'sd1);
+    wire signed [12:0] f2i_rsh_s = 13'sd52 - cvt_f_eunb;
+    wire signed [12:0] f2i_lsh_s = cvt_f_eunb - 13'sd52;
+    wire [6:0]  f2i_rsh   = f2i_rsh_s[6:0];
+    wire [6:0]  f2i_lsh   = f2i_lsh_s[6:0];
+
+    // Donor verbatim (../rv12/rtl/FPUAlu.v:1239-1256; e2_cvt_f_sig ->
+    // cvt_f_sig, e2_cvt_f_eunb -> cvt_f_eunb): the magnitude is the 53-bit
+    // significand zero-extended to 65 and shifted into place; the guard/
+    // sticky terms mask the RAW 53-bit significand (no pre-widening, no
+    // shift-amount guards); the huge branch parks f2i_mag all-ones (the
+    // f2i_rmag below re-asserts them independently of f2i_mag).
+    reg  [64:0] f2i_mag;
+    reg         f2i_g, f2i_s;
+    always @* begin
+        f2i_mag = 65'b0;
+        f2i_g   = 1'b0;
+        f2i_s   = 1'b0;
+        if (f2i_huge) begin
+            f2i_mag = {65{1'b1}};
+        end else if (f2i_tiny) begin
+            f2i_s   = |cvt_f_sig;
+        end else if (cvt_f_eunb >= 13'sd52) begin
+            f2i_mag = {12'b0, cvt_f_sig} << f2i_lsh;
+        end else begin
+            f2i_mag = {12'b0, cvt_f_sig} >> f2i_rsh;
+            f2i_g   = |(cvt_f_sig & ({53{1'b1}} & (53'd1 << (f2i_rsh - 7'd1))));
+            f2i_s   = |(cvt_f_sig & ~({53{1'b1}} << (f2i_rsh - 7'd1)));
+        end
+    end
+
+    wire f2i_inc  = round_up(cvt_f_s, f2i_mag[0], f2i_g, f2i_s, idu_fpu_ex1_rm);
+    wire [64:0] f2i_rmag = f2i_huge ? {65{1'b1}} : (f2i_mag + {64'b0, f2i_inc});
+
+    wire f2i_nan = cvt_f_snan || cvt_f_qnan;
+
+    // Donor verbatim (../rv12/rtl/FPUAlu.v:1264-1271): the range terms
+    // compare the ROUNDED 65-bit magnitude against the destination's
+    // max/min constants. (The bit-test forms that stood here before
+    // mis-placed sat_si64/sat_ui64 one bit early -- 2**62/2**63 instead
+    // of 2**63/2**64 -- and dropped min_si32's "above 2**31 with the low
+    // 31 bits clear" arm, e.g. exactly -2**32.)
+    wire f2i_sat_si64 = !cvt_f_s && (f2i_rmag >  {2'b0, {63{1'b1}}});
+    wire f2i_min_si64 =  cvt_f_s && (f2i_rmag >  {1'b0, 1'b1, 63'b0});
+    wire f2i_sat_ui64 = !cvt_f_s && (f2i_rmag >  {1'b0, {64{1'b1}}});
+    wire f2i_min_ui64 =  cvt_f_s && (|f2i_rmag);
+    wire f2i_sat_si32 = !cvt_f_s && (f2i_rmag >  {34'b0, {31{1'b1}}});
+    wire f2i_min_si32 =  cvt_f_s && (f2i_rmag >  {33'b0, 1'b1, 31'b0});
+    wire f2i_sat_ui32 = !cvt_f_s && (f2i_rmag >  {33'b0, {32{1'b1}}});
+    wire f2i_min_ui32 =  cvt_f_s && (|f2i_rmag);
+
+    wire f2i_of = cvt_wide64 ? (cvt_int_signed ? f2i_sat_si64 : f2i_sat_ui64) : (cvt_int_signed ? f2i_sat_si32 : f2i_sat_ui32);
+    wire f2i_uf = cvt_wide64 ? (cvt_int_signed ? f2i_min_si64 : f2i_min_ui64) : (cvt_int_signed ? f2i_min_si32 : f2i_min_ui32);
+
+    // *** SATURATION TABLE ASYMMETRY IS DELIBERATE: a NaN converts to the
+    // MAXIMUM representable value only, never the minimum (RISC-V spec). ***
+    wire f2i_dst_max_s =  cvt_int_signed && (f2i_of || f2i_nan);
+    wire f2i_dst_min_s =  cvt_int_signed &&  f2i_uf;
+    wire f2i_dst_max_u = !cvt_int_signed && (f2i_of || f2i_nan);
+    wire f2i_dst_min_u = !cvt_int_signed &&  f2i_uf;
+
+    wire [63:0] f2i_raw64 = cvt_f_s ? (~f2i_rmag[63:0] + 64'd1) : f2i_rmag[63:0];
+    wire [63:0] f2i_s64 = f2i_dst_max_s ? {1'b0,{63{1'b1}}} : f2i_dst_min_s ? {1'b1,63'b0} : f2i_raw64;
+    wire [63:0] f2i_u64 = f2i_dst_max_u ? {64{1'b1}}        : f2i_dst_min_u ? 64'b0        : f2i_raw64;
+    wire [31:0] f2i_s32 = f2i_dst_max_s ? {1'b0,{31{1'b1}}} : f2i_dst_min_s ? {1'b1,31'b0} : f2i_raw64[31:0];
+    wire [31:0] f2i_u32 = f2i_dst_max_u ? {32{1'b1}}        : f2i_dst_min_u ? 32'b0        : f2i_raw64[31:0];
+
+    wire [63:0] f2i_l64_result = cvt_int_signed ? f2i_s64 : f2i_u64;
+    // Zero-extends by design -- the RV64 w/wu sign-extension is composed
+    // below (f2i_xdata) and consumed at SECTION 13's xdata mux, matching
+    // FMV.X.W's own boxing convention (SECTION 9's spu_mfvr_s).
+    wire [63:0] f2i_l32_result = cvt_int_signed ? {32'b0, f2i_s32} : {32'b0, f2i_u32};
+    wire [63:0] f2i_result = cvt_wide64 ? f2i_l64_result : f2i_l32_result;
+
+    // RV64 GPR writeback boxing for the 32-bit answers -- fmv.x.w's own
+    // sign-extension (SECTION 9's spu_mfvr_s shape), selected on the
+    // integer-side width: l/lu pass through, w/wu sign-extend bit 31.
+    // Matches the donor's crack, whose uop-1 is fmv.x.w for the whole
+    // 32-bit family and fmv.x.d for l/lu (C910 ct_idu_id_split_short.v
+    // :644-649/:677-682, ported in ../rv12's mk_fp_uop1).
+    wire [63:0] f2i_xdata = cvt_wide64 ? f2i_result
+                                        : {{32{f2i_result[31]}}, f2i_result[31:0]};
+
+    wire f2i_nv = f2i_of || f2i_uf || f2i_nan;
+    wire [4:0] f2i_flags = {f2i_nv, 1'b0, 1'b0, 1'b0, !f2i_nv && (f2i_g || f2i_s)};
+
+    //=========================================================================
+    // SECTION 11b: FCNVT -- INTEGER->FLOAT (M5 Task 7; donor verbatim,
+    // ../rv12/rtl/FPUAlu.v ~1290-1315. e2_cvt_i_neg/_mag/_rm/_dest_dbl ->
+    // cvt_i_neg/cvt_i_mag/idu_fpu_ex1_rm/f_double. rv12 special-cases
+    // cvt_i_mag==0 explicitly rather than relying on fp_pack's own
+    // internal zero-path -- preserved here, NOT redundant to drop.)
+    //=========================================================================
+    wire [7:0]  i2f_lz  = lzc64(cvt_i_mag);
+    wire [7:0]  i2f_rsh = (i2f_lz < 8'd8) ? (8'd8 - i2f_lz) : 8'd0;
+    wire [7:0]  i2f_lsh = (i2f_lz < 8'd8) ? 8'd0 : (i2f_lz - 8'd8);
+    wire [63:0] i2f_sh  = (i2f_lz < 8'd8) ? (cvt_i_mag >> i2f_rsh) : (cvt_i_mag << i2f_lsh);
+    wire [PW-1:0] i2f_p = i2f_sh[PW-1:0];
+    wire        i2f_st  = (i2f_lz < 8'd8) && (|(cvt_i_mag & ~({64{1'b1}} << i2f_rsh)));
+    wire signed [12:0] i2f_e = $signed({5'b0, (8'd63 - i2f_lz)}) + $signed({2'b0, (f_double ? BIAS_D : BIAS_S)});
+    wire [PACK_W-1:0] i2f_pack = fp_pack(cvt_i_neg, i2f_e, i2f_p, i2f_st, idu_fpu_ex1_rm, f_double);
+    wire [63:0] i2f_result = (cvt_i_mag == 64'b0) ? (f_double ? 64'b0 : {32'hffffffff, 32'b0}) : i2f_pack[PACK_W-1:5];
+    wire [4:0]  i2f_flags  = (cvt_i_mag == 64'b0) ? 5'b0 : i2f_pack[4:0];
+
+    //=========================================================================
+    // SECTION 11c: FCNVT -- RESULT MERGE. f2f when neither WIDDEN/NARROW nor
+    // FUNC_CVT_INT selects an int-convert path (mutually exclusive by
+    // construction: IDU.v never sets both groups of bits on one dispatch).
+    //=========================================================================
+    wire [63:0] fcnvt_ex1_result = !cvt_is_int ? f2f_result
+                                  : cvt_f2i     ? f2i_result
+                                                : i2f_result;
+    wire [4:0]  fcnvt_ex1_flags  = !cvt_is_int ? f2f_flags
+                                  : cvt_f2i     ? f2i_flags
+                                                : i2f_flags;
 
     //=========================================================================
     // SECTION 12: FMAU -- FUSED MULTIPLY-ADD (fmul.{s,d}, and the fmadd/
@@ -1180,7 +1370,8 @@ module FPU (
 
     assign fpu_rtu_ex1_falu_xdata  = idu_fpu_ex1_fadd_sel  ? fadd_mfvr_data
                                     : idu_fpu_ex1_fspu_sel  ? fspu_mfvr_data
-                                                             : 64'b0;
+                                    : idu_fpu_ex1_fcnvt_sel && cvt_is_int && cvt_f2i ? f2i_xdata
+                                                                                     : 64'b0;
 
     assign fpu_rtu_ex1_falu_fflags = idu_fpu_ex1_fadd_sel  ? fadd_ex2_flags
                                     : idu_fpu_ex1_fcnvt_sel ? fcnvt_ex1_flags
@@ -1189,24 +1380,27 @@ module FPU (
                                                              : 5'b0;
 
     // fvld: an FP-register-destination result -- add/sub/min/max/sgnj*/f2f/
-    // fma/fdiv/fsqrt, but NOT a compare (that's xvld) and NOT fclass (also
-    // xvld). FMAU/FDSU never target an integer destination (RISC-V spec),
-    // so they only ever contribute to fvld/fdata, never xvld/xdata. FDSU's
-    // term is gated on `fdsu_cmplt_now` (FSM state), NOT on
-    // `idu_fpu_ex1_fdsu_sel` (the dispatch-select signal), because that
-    // signal may still legitimately be asserted on the CMPLT cycle itself
-    // (full is deasserted then) for a reason unrelated to gating this
-    // writeback -- exactly like DIV's own independence of iu_rtu_div_wb_vld
-    // from idu_iu_ex1_div_sel.
+    // i2f/fma/fdiv/fsqrt, but NOT a compare (that's xvld), NOT fclass
+    // (also xvld), NOT fmv.x.w/x.d (xvld) and NOT f2i (xvld -- the float->
+    // int convert writes the GPR, not the FRF). FMAU/FDSU never target an
+    // integer destination (RISC-V spec), so they only ever contribute to
+    // fvld/fdata, never xvld/xdata. FDSU's term is gated on
+    // `fdsu_cmplt_now` (FSM state), NOT on `idu_fpu_ex1_fdsu_sel` (the
+    // dispatch-select signal), because that signal may still legitimately
+    // be asserted on the CMPLT cycle itself (full is deasserted then) for
+    // a reason unrelated to gating this writeback -- exactly like DIV's own
+    // independence of iu_rtu_div_wb_vld from idu_iu_ex1_div_sel.
     assign fpu_rtu_ex1_falu_fvld   = (idu_fpu_ex1_fadd_sel  && !op_cmp)
-                                    || (idu_fpu_ex1_fspu_sel  && !spu_op_class)
-                                    || idu_fpu_ex1_fcnvt_sel
+                                    || (idu_fpu_ex1_fspu_sel  && !spu_op_class && !spu_op_mv_xf)
+                                    || (idu_fpu_ex1_fcnvt_sel && !(cvt_is_int && cvt_f2i))
                                     || idu_fpu_ex1_fmau_sel
                                     || fdsu_cmplt_now;
 
-    // xvld: an integer-register-destination result -- compare or fclass.
+    // xvld: an integer-register-destination result -- compare, fclass,
+    // fmv.x.w/x.d (the mfvr moves), and f2i (fcvt.{w,wu,l,lu}.{s,d}).
     assign fpu_rtu_ex1_falu_xvld   = (idu_fpu_ex1_fadd_sel && op_cmp)
-                                    || (idu_fpu_ex1_fspu_sel && spu_op_class);
+                                    || (idu_fpu_ex1_fspu_sel && (spu_op_class || spu_op_mv_xf))
+                                    || (idu_fpu_ex1_fcnvt_sel && cvt_is_int && cvt_f2i);
 
     // M5 Task 4b: pure pass-through, shared by both the fdata (FRF) and
     // xdata (GPR) answer shapes -- RTU picks which regfile to write from

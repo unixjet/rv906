@@ -62,6 +62,17 @@ static const unsigned FUNC_SPU_SGN_N  = 1;
 static const unsigned FUNC_SPU_SGN_J  = 0;
 static const unsigned FUNC_CVT_WIDDEN = 14;
 static const unsigned FUNC_CVT_NARROW = 13;
+// FUNC_CVT_* int<->float bits (rvproc_pkg.sv M5 Task 7 block). The 0/1/2/4
+// values REUSE the FUNC_CMP_FEQ/LT/LE/FNE positions and FUNC_SPU_MV/_XF
+// reuse FUNC_MAU_NEG/FUNC_CMP_FORD by this file's established bit-reuse
+// convention -- FALU-compare and FCNVT/MV dispatches are mutually exclusive,
+// so the reuse is legal.
+static const unsigned FUNC_CVT_INT      = 4;  // trigger: fcvt int<->float family
+static const unsigned FUNC_CVT_F2I      = 2;  // direction: 1=fp->int, 0=int->fp
+static const unsigned FUNC_CVT_UNSIGNED = 1;  // 1=wu/lu, 0=w/l
+static const unsigned FUNC_CVT_WIDE64   = 0;  // 1=l/lu, 0=w/wu
+static const unsigned FUNC_SPU_MV       = 17; // trigger: fmv.{x.w,w.x,x.d,d.x}
+static const unsigned FUNC_SPU_MV_XF    = 3;  // 1=fp->int (fmv.x.*), 0=int->fp
 static const unsigned FUNC_MAU_FUSED  = 5;
 static const unsigned FUNC_MAU_SUB    = 7;
 static const unsigned FUNC_MAU_NEG    = 17;
@@ -248,12 +259,18 @@ static FpuResult fspu_op(uint32_t func, uint64_t fsrc0, uint64_t fsrc1) {
     return r;
 }
 
-static FpuResult fcnvt_op(uint32_t func, unsigned rm, uint64_t fsrc0) {
+// fcnvt dispatch: f2f/f2i carry the FP source on fsrc0 (NaN-boxed for
+// single); i2f carries the GPR value there (IDU's dis_gpr_fsrc0 mux feeds
+// the same port). dst0_reg is the integer-destination preg for the f2i and
+// fmv.x.* rows (checked via fpu_rtu_ex1_falu_preg).
+static FpuResult fcnvt_op(uint32_t func, unsigned rm, uint64_t fsrc0,
+                          uint32_t dst0_reg = 0) {
     tie_idle_inputs();
     dut->idu_fpu_ex1_fcnvt_sel  = 1;
     dut->idu_fpu_ex1_func       = func;
     dut->idu_fpu_ex1_rm         = rm;
     dut->idu_fpu_ex1_fsrc0_data = fsrc0;
+    dut->idu_fpu_ex1_dst0_reg   = dst0_reg;
     dut->eval();
     FpuResult r = read_result();
     tick();
@@ -920,6 +937,376 @@ static void test_fdsu_busy_preg(void) {
     test_result("T18 FDSU busy/full timing + preg passthrough via fdsu_preg_flop");
 }
 
+//-----------------------------------------------------------------------------
+// i2f inexactness oracle -- same widening trick as add_exact_*: x86-64
+// long double (80-bit, 64-bit significand) holds every 32/64-bit integer
+// exactly, so if the native (correctly-rounded) int->float/double cast
+// differs from the integer itself, the conversion lost bits (NX).
+//-----------------------------------------------------------------------------
+static bool i2f_exact_f(int64_t  v) { return (long double)(float)v  == (long double)v; }
+static bool i2f_exact_f(uint64_t v) { return (long double)(float)v  == (long double)v; }
+static bool i2f_exact_d(int64_t  v) { return (long double)(double)v == (long double)v; }
+static bool i2f_exact_d(uint64_t v) { return (long double)(double)v == (long double)v; }
+
+//-----------------------------------------------------------------------------
+// T19: FCNVT f2i, 64-bit destinations -- fcvt.l.s/l.d/lu.s/lu.d. Value +
+// RNE tie handling, the 2**62/2**63/2**64 boundary rows that pin the
+// donor's range terms (rv12 FPUAlu.v:1264-1271), and the NaN->MAXIMUM-only
+// saturation asymmetry (NV set, NX masked). xvld routing, not fvld.
+//-----------------------------------------------------------------------------
+static void test_fcnvt_f2i_64(void) {
+    uint32_t f_l_s  = bitv(FUNC_CVT_INT) | bitv(FUNC_CVT_F2I) | bitv(FUNC_CVT_WIDE64);
+    uint32_t f_lu_s = f_l_s | bitv(FUNC_CVT_UNSIGNED);
+    uint32_t f_l_d  = f_l_s | bitv(FUNC_DOUBLE);
+    uint32_t f_lu_d = f_lu_s | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fcnvt_op(f_l_s, RM_RNE, box(f2b(1.75f)), 5);
+    check(r.xdata == 2 && r.xvld && !r.fvld, "FCVT.L.S 1.75 -> 2, xvld routing", r.xdata, 2);
+    check(r.fflags == 0x1, "FCVT.L.S 1.75 inexact, NX only", r.fflags, 0x1);
+    check(dut->fpu_rtu_ex1_falu_preg == 5, "FCVT.L.S preg == dst0_reg (GPR writeback)",
+          dut->fpu_rtu_ex1_falu_preg, 5);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(f2b(-1.75f)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFEULL, "FCVT.L.S -1.75 -> -2", r.xdata, 0xFFFFFFFFFFFFFFFEULL);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(f2b(1.5f)));
+    check(r.xdata == 2 && r.fflags == 0x1, "FCVT.L.S 1.5 RNE tie -> 2 (to even), NX", r.xdata, 2);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(f2b(2.5f)));
+    check(r.xdata == 2 && r.fflags == 0x1, "FCVT.L.S 2.5 RNE tie -> 2 (to even), NX", r.xdata, 2);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(f2b(-2.5f)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFEULL && r.fflags == 0x1,
+          "FCVT.L.S -2.5 RNE tie -> -2 (to even), NX", r.xdata, 0xFFFFFFFFFFFFFFFEULL);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(0x4E800000u));   // 2**30, exact
+    check(r.xdata == 0x40000000ULL && r.fflags == 0, "FCVT.L.S 2**30 exact, no flags",
+          r.xdata, 0x40000000ULL);
+
+    // 2**62 fits signed 64-bit -- the old sat_si64 test fired one bit early
+    // (at 2**62) and would have saturated this row to INT64_MAX.
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(ldexp(1.0, 62)));
+    check(r.xdata == 0x4000000000000000ULL && r.fflags == 0,
+          "FCVT.L.D 2**62 fits int64, no saturation", r.xdata, 0x4000000000000000ULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(-ldexp(1.0, 62)));
+    check(r.xdata == 0xC000000000000000ULL && r.fflags == 0,
+          "FCVT.L.D -2**62 fits int64, no saturation", r.xdata, 0xC000000000000000ULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(ldexp(1.0, 63) - 1024.0));   // 2**63 - 1024, exact
+    check(r.xdata == 0x7FFFFFFFFFFFFC00ULL && r.fflags == 0,
+          "FCVT.L.D 2**63-1024 just below INT64_MAX, no saturation",
+          r.xdata, 0x7FFFFFFFFFFFFC00ULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(ldexp(1.0, 63)));
+    check(r.xdata == 0x7FFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.L.D 2**63 -> INT64_MAX, NV", r.xdata, 0x7FFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(-ldexp(1.0, 63)));
+    check(r.xdata == 0x8000000000000000ULL && r.fflags == 0,
+          "FCVT.L.D -2**63 -> INT64_MIN exactly, no NV", r.xdata, 0x8000000000000000ULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, d2b(-(ldexp(1.0, 63) + 2048.0)));
+    check(r.xdata == 0x8000000000000000ULL && r.fflags == 0x10,
+          "FCVT.L.D -(2**63+2048) -> INT64_MIN, NV", r.xdata, 0x8000000000000000ULL);
+
+    // 2**63 fits UNSIGNED 64-bit -- the old sat_ui64 test fired at 2**63
+    // (bit 63) and would have saturated this row to UINT64_MAX.
+    r = fcnvt_op(f_lu_d, RM_RNE, d2b(ldexp(1.0, 63)));
+    check(r.xdata == 0x8000000000000000ULL && r.fflags == 0,
+          "FCVT.LU.D 2**63 fits uint64, no saturation", r.xdata, 0x8000000000000000ULL);
+
+    r = fcnvt_op(f_lu_d, RM_RNE, d2b((double)((1LL << 53) - 1) * 2048.0));  // 2**64 - 2048
+    check(r.xdata == 0xFFFFFFFFFFFFF800ULL && r.fflags == 0,
+          "FCVT.LU.D 2**64-2048 fits uint64, no saturation",
+          r.xdata, 0xFFFFFFFFFFFFF800ULL);
+
+    r = fcnvt_op(f_lu_d, RM_RNE, d2b(ldexp(1.0, 64)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.LU.D 2**64 -> UINT64_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_lu_s, RM_RNE, box(0x4F000000u));   // 2**31f
+    check(r.xdata == 0x80000000ULL && r.fflags == 0, "FCVT.LU.S 2**31 exact, no flags",
+          r.xdata, 0x80000000ULL);
+
+    r = fcnvt_op(f_lu_s, RM_RNE, box(0x53800000u));   // 2**40f
+    check(r.xdata == 0x10000000000ULL && r.fflags == 0, "FCVT.LU.S 2**40 exact, no flags",
+          r.xdata, 0x10000000000ULL);
+
+    // NaN converts to the MAXIMUM of the destination, never the minimum.
+    r = fcnvt_op(f_l_s, RM_RNE, box(QNAN_S));
+    check(r.xdata == 0x7FFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.L.S qNaN -> INT64_MAX, NV", r.xdata, 0x7FFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, SNAN_D);
+    check(r.xdata == 0x7FFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.L.D sNaN -> INT64_MAX, NV", r.xdata, 0x7FFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_lu_d, RM_RNE, QNAN_D);
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.LU.D qNaN -> UINT64_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_l_d, RM_RNE, PINF_D);
+    check(r.xdata == 0x7FFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.L.D +inf -> INT64_MAX, NV", r.xdata, 0x7FFFFFFFFFFFFFFFULL);
+    r = fcnvt_op(f_l_d, RM_RNE, NINF_D);
+    check(r.xdata == 0x8000000000000000ULL && r.fflags == 0x10,
+          "FCVT.L.D -inf -> INT64_MIN, NV", r.xdata, 0x8000000000000000ULL);
+
+    r = fcnvt_op(f_lu_d, RM_RNE, PINF_D);
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.LU.D +inf -> UINT64_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+    r = fcnvt_op(f_lu_d, RM_RNE, NINF_D);
+    check(r.xdata == 0 && r.fflags == 0x10, "FCVT.LU.D -inf -> 0, NV", r.xdata, 0);
+
+    r = fcnvt_op(f_l_s, RM_RNE, box(f2b(1e30f)));   // huge single (e > 64)
+    check(r.xdata == 0x7FFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.L.S 1e30f -> INT64_MAX, NV", r.xdata, 0x7FFFFFFFFFFFFFFFULL);
+
+    test_result("T19 FCNVT f2i 64-bit (l.s/l.d/lu.s/lu.d): value, RNE ties, "
+                "2**62/2**63/2**64 boundaries, NaN->MAX, inf, xvld routing");
+}
+
+//-----------------------------------------------------------------------------
+// T20: FCNVT f2i, 32-bit destinations -- fcvt.w.s/w.d/wu.s/wu.d. The 32-bit
+// answers are sign-extended to 64 bits in xdata (the donor crack's uop-1 is
+// fmv.x.w for the whole w/wu family -- see f2i_xdata in FPU.v SECTION 11a),
+// so w/wu rows check the extended 64-bit value. Includes the -2**32 row that
+// the old min_si32 term missed (exactly 2**32 with the low 31 bits clear).
+//-----------------------------------------------------------------------------
+static void test_fcnvt_f2i_32(void) {
+    uint32_t f_w_s  = bitv(FUNC_CVT_INT) | bitv(FUNC_CVT_F2I);
+    uint32_t f_wu_s = f_w_s | bitv(FUNC_CVT_UNSIGNED);
+    uint32_t f_w_d  = f_w_s | bitv(FUNC_DOUBLE);
+    uint32_t f_wu_d = f_wu_s | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fcnvt_op(f_w_s, RM_RNE, box(f2b(1.75f)));
+    check(r.xdata == 2 && r.xvld && !r.fvld, "FCVT.W.S 1.75 -> 2, xvld routing", r.xdata, 2);
+    check(r.fflags == 0x1, "FCVT.W.S 1.75 inexact, NX only", r.fflags, 0x1);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(f2b(-1.75f)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFEULL, "FCVT.W.S -1.75 -> -2 (sign-extended)",
+          r.xdata, 0xFFFFFFFFFFFFFFFEULL);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(f2b(2.5f)));
+    check(r.xdata == 2 && r.fflags == 0x1, "FCVT.W.S 2.5 RNE tie -> 2 (to even), NX", r.xdata, 2);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(f2b(-2.5f)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFEULL && r.fflags == 0x1,
+          "FCVT.W.S -2.5 RNE tie -> -2 (to even), NX", r.xdata, 0xFFFFFFFFFFFFFFFEULL);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(f2b(0.4f)));
+    check(r.xdata == 0 && r.fflags == 0x1, "FCVT.W.S 0.4 -> 0, NX", r.xdata, 0);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(0x4E800000u));   // 2**30f, exact
+    check(r.xdata == 0x40000000ULL && r.fflags == 0, "FCVT.W.S 2**30 exact, no flags",
+          r.xdata, 0x40000000ULL);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(0x4F000000u));   // 2**31f
+    check(r.xdata == 0x7FFFFFFFULL && r.fflags == 0x10,
+          "FCVT.W.S 2**31 -> INT32_MAX, NV", r.xdata, 0x7FFFFFFFULL);
+
+    r = fcnvt_op(f_w_s, RM_RNE, box(0xCF000000u));   // -2**31f
+    check(r.xdata == 0xFFFFFFFF80000000ULL && r.fflags == 0,
+          "FCVT.W.S -2**31 -> INT32_MIN exactly, no NV", r.xdata, 0xFFFFFFFF80000000ULL);
+
+    // exactly -2**32: the old min_si32 bit-test required the low 31 bits
+    // nonzero and would have returned 0 instead of INT32_MIN.
+    r = fcnvt_op(f_w_s, RM_RNE, box(0xCF800000u));   // -2**32f
+    check(r.xdata == 0xFFFFFFFF80000000ULL && r.fflags == 0x10,
+          "FCVT.W.S -2**32 -> INT32_MIN, NV", r.xdata, 0xFFFFFFFF80000000ULL);
+
+    r = fcnvt_op(f_w_d, RM_RNE, d2b(ldexp(1.0, 31)));
+    check(r.xdata == 0x7FFFFFFFULL && r.fflags == 0x10,
+          "FCVT.W.D 2**31 -> INT32_MAX, NV", r.xdata, 0x7FFFFFFFULL);
+
+    r = fcnvt_op(f_w_d, RM_RNE, d2b(-ldexp(1.0, 32)));
+    check(r.xdata == 0xFFFFFFFF80000000ULL && r.fflags == 0x10,
+          "FCVT.W.D -2**32 -> INT32_MIN, NV", r.xdata, 0xFFFFFFFF80000000ULL);
+
+    r = fcnvt_op(f_w_d, RM_RNE, QNAN_D);
+    check(r.xdata == 0x7FFFFFFFULL && r.fflags == 0x10,
+          "FCVT.W.D qNaN -> INT32_MAX, NV", r.xdata, 0x7FFFFFFFULL);
+
+    r = fcnvt_op(f_w_d, RM_RNE, PINF_D);
+    check(r.xdata == 0x7FFFFFFFULL && r.fflags == 0x10, "FCVT.W.D +inf -> INT32_MAX, NV",
+          r.xdata, 0x7FFFFFFFULL);
+    r = fcnvt_op(f_w_d, RM_RNE, NINF_D);
+    check(r.xdata == 0xFFFFFFFF80000000ULL && r.fflags == 0x10,
+          "FCVT.W.D -inf -> INT32_MIN, NV", r.xdata, 0xFFFFFFFF80000000ULL);
+
+    // wu family: 32-bit answers still take the fmv.x.w sign-extension in
+    // xdata (the donor crack's uop-1 is fmv.x.w for w AND wu).
+    r = fcnvt_op(f_wu_s, RM_RNE, box(0x4F000000u));   // 2**31f
+    check(r.xdata == 0xFFFFFFFF80000000ULL && r.fflags == 0,
+          "FCVT.WU.S 2**31 -> 0x80000000, sign-extended, no NV",
+          r.xdata, 0xFFFFFFFF80000000ULL);
+
+    r = fcnvt_op(f_wu_s, RM_RNE, box(0x50000000u));   // 2**32f
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.WU.S 2**32 -> UINT32_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_wu_d, RM_RNE, d2b(ldexp(1.0, 32)));
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.WU.D 2**32 -> UINT32_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_wu_d, RM_RNE, d2b(-1.0));
+    check(r.xdata == 0 && r.fflags == 0x10, "FCVT.WU.D -1.0 -> 0, NV", r.xdata, 0);
+
+    r = fcnvt_op(f_wu_d, RM_RNE, QNAN_D);
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.WU.D qNaN -> UINT32_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fcnvt_op(f_wu_d, RM_RNE, NINF_D);
+    check(r.xdata == 0 && r.fflags == 0x10, "FCVT.WU.D -inf -> 0, NV", r.xdata, 0);
+    r = fcnvt_op(f_wu_d, RM_RNE, PINF_D);
+    check(r.xdata == 0xFFFFFFFFFFFFFFFFULL && r.fflags == 0x10,
+          "FCVT.WU.D +inf -> UINT32_MAX, NV", r.xdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    test_result("T20 FCNVT f2i 32-bit (w.s/w.d/wu.s/wu.d): value, RNE ties, "
+                "INT32/UINT32 saturation, sign-extension, -2**32 min fix");
+}
+
+//-----------------------------------------------------------------------------
+// T21: FCNVT i2f -- all eight forms (fcvt.s.w/wu/l/lu, fcvt.d.w/wu/l/lu).
+// Value oracle: the host's native correctly-rounded int->float/double cast;
+// NX via the i2f_exact_* widening trick. FRF destination (fvld, not xvld).
+//-----------------------------------------------------------------------------
+static void test_fcnvt_i2f(void) {
+    uint32_t f_s_w  = bitv(FUNC_CVT_INT);
+    uint32_t f_s_wu = f_s_w | bitv(FUNC_CVT_UNSIGNED);
+    uint32_t f_s_l  = f_s_w | bitv(FUNC_CVT_WIDE64);
+    uint32_t f_s_lu = f_s_wu | bitv(FUNC_CVT_WIDE64);
+    uint32_t f_d_w  = f_s_w  | bitv(FUNC_DOUBLE);
+    uint32_t f_d_wu = f_s_wu | bitv(FUNC_DOUBLE);
+    uint32_t f_d_l  = f_s_l  | bitv(FUNC_DOUBLE);
+    uint32_t f_d_lu = f_s_lu | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fcnvt_op(f_s_w, RM_RNE, 0x000000007FFFFFFFULL);   // INT32_MAX
+    check(r.fdata == box(f2b((float)(int32_t)0x7FFFFFFF)) && r.fvld && !r.xvld,
+          "FCVT.S.W INT32_MAX -> 2**31 (rounds up), fvld routing",
+          r.fdata, box(f2b((float)(int32_t)0x7FFFFFFF)));
+    check((r.fflags & 0x1) == (i2f_exact_f((int64_t)0x7FFFFFFF) ? 0u : 1u),
+          "FCVT.S.W INT32_MAX sets NX (2**31-1 not representable in single)", r.fflags, 1);
+
+    r = fcnvt_op(f_s_w, RM_RNE, 0x0000000080000000ULL);   // INT32_MIN
+    check(r.fdata == box(f2b((float)(int32_t)0x80000000u)) && r.fflags == 0,
+          "FCVT.S.W INT32_MIN exact", r.fdata, box(f2b((float)(int32_t)0x80000000u)));
+
+    r = fcnvt_op(f_s_w, RM_RNE, 0xFFFFFFFFFFFFFFFFULL);   // -1
+    check(r.fdata == box(f2b(-1.0f)) && r.fflags == 0, "FCVT.S.W -1 exact", r.fdata, box(f2b(-1.0f)));
+
+    r = fcnvt_op(f_s_w, RM_RNE, 0);
+    check(r.fdata == box(0) && r.fflags == 0, "FCVT.S.W 0 -> +0.0, no flags", r.fdata, box(0));
+
+    r = fcnvt_op(f_s_wu, RM_RNE, 0xFFFFFFFFULL);   // 2**32 - 1
+    check(r.fdata == box(f2b((float)(uint32_t)0xFFFFFFFFu)),
+          "FCVT.S.WU 2**32-1 -> 2**32", r.fdata, box(f2b((float)(uint32_t)0xFFFFFFFFu)));
+    check((r.fflags & 0x1) == (i2f_exact_f((uint64_t)0xFFFFFFFFu) ? 0u : 1u),
+          "FCVT.S.WU 2**32-1 sets NX", r.fflags, 1);
+
+    r = fcnvt_op(f_s_wu, RM_RNE, 0x80000000ULL);   // 2**31 as unsigned
+    check(r.fdata == box(f2b((float)(uint32_t)0x80000000u)) && r.fflags == 0,
+          "FCVT.S.WU 2**31 exact (unsigned view)", r.fdata, box(f2b((float)(uint32_t)0x80000000u)));
+
+    r = fcnvt_op(f_s_l, RM_RNE, 0x7FFFFFFFFFFFFFFFULL);   // INT64_MAX
+    check(r.fdata == box(f2b((float)(int64_t)0x7FFFFFFFFFFFFFFFULL)),
+          "FCVT.S.L INT64_MAX -> 2**63", r.fdata, box(f2b((float)(int64_t)0x7FFFFFFFFFFFFFFFULL)));
+    check((r.fflags & 0x1) == (i2f_exact_f((int64_t)0x7FFFFFFFFFFFFFFFULL) ? 0u : 1u),
+          "FCVT.S.L INT64_MAX sets NX", r.fflags, 1);
+
+    r = fcnvt_op(f_s_l, RM_RNE, 0x20000000000000ULL);   // 2**53
+    check(r.fdata == box(f2b((float)(int64_t)(1LL << 53))) && r.fflags == 0,
+          "FCVT.S.L 2**53 exact", r.fdata, box(f2b((float)(int64_t)(1LL << 53))));
+
+    r = fcnvt_op(f_s_l, RM_RNE, 0x8000000000000000ULL);   // -2**63
+    check(r.fdata == box(f2b((float)(int64_t)(-(1LL << 63)))) && r.fflags == 0,
+          "FCVT.S.L -2**63 exact", r.fdata, box(f2b((float)(int64_t)(-(1LL << 63)))));
+
+    r = fcnvt_op(f_s_lu, RM_RNE, 0xFFFFFFFFFFFFFFFFULL);   // UINT64_MAX
+    check(r.fdata == box(f2b((float)(uint64_t)0xFFFFFFFFFFFFFFFFULL)),
+          "FCVT.S.LU UINT64_MAX -> 2**64", r.fdata, box(f2b((float)(uint64_t)0xFFFFFFFFFFFFFFFFULL)));
+    check((r.fflags & 0x1) == (i2f_exact_f((uint64_t)0xFFFFFFFFFFFFFFFFULL) ? 0u : 1u),
+          "FCVT.S.LU UINT64_MAX sets NX", r.fflags, 1);
+
+    r = fcnvt_op(f_s_lu, RM_RNE, 0x100000000ULL);   // 2**32
+    check(r.fdata == box(f2b((float)(uint64_t)(1ULL << 32))) && r.fflags == 0,
+          "FCVT.S.LU 2**32 exact", r.fdata, box(f2b((float)(uint64_t)(1ULL << 32))));
+
+    r = fcnvt_op(f_d_w, RM_RNE, 0xFFFFFFFFFFFFFFFFULL);   // -1
+    check(r.fdata == d2b(-1.0) && r.fflags == 0, "FCVT.D.W -1 exact", r.fdata, d2b(-1.0));
+
+    r = fcnvt_op(f_d_w, RM_RNE, 0x0000000080000000ULL);   // INT32_MIN
+    check(r.fdata == d2b((double)(int32_t)0x80000000u) && r.fflags == 0,
+          "FCVT.D.W INT32_MIN exact", r.fdata, d2b((double)(int32_t)0x80000000u));
+
+    r = fcnvt_op(f_d_wu, RM_RNE, 0xFFFFFFFFULL);   // 2**32 - 1
+    check(r.fdata == d2b(4294967295.0) && r.fflags == 0,
+          "FCVT.D.WU 2**32-1 exact (fits binary64)", r.fdata, d2b(4294967295.0));
+
+    r = fcnvt_op(f_d_l, RM_RNE, 0x8000000000000000ULL);   // -2**63
+    check(r.fdata == d2b(-ldexp(1.0, 63)) && r.fflags == 0,
+          "FCVT.D.L -2**63 exact", r.fdata, d2b(-ldexp(1.0, 63)));
+
+    r = fcnvt_op(f_d_l, RM_RNE, 0x7FFFFFFFFFFFFFFFULL);   // 2**63 - 1
+    check(r.fdata == d2b(ldexp(1.0, 63)),
+          "FCVT.D.L 2**63-1 -> 2**63 (RNE tie to even)", r.fdata, d2b(ldexp(1.0, 63)));
+    check((r.fflags & 0x1) == (i2f_exact_d((int64_t)0x7FFFFFFFFFFFFFFFULL) ? 0u : 1u),
+          "FCVT.D.L 2**63-1 sets NX", r.fflags, 1);
+
+    r = fcnvt_op(f_d_lu, RM_RNE, 0xFFFFFFFFFFFFFFFFULL);  // 2**64 - 1
+    check(r.fdata == d2b(ldexp(1.0, 64)),
+          "FCVT.D.LU UINT64_MAX -> 2**64", r.fdata, d2b(ldexp(1.0, 64)));
+    check((r.fflags & 0x1) == (i2f_exact_d((uint64_t)0xFFFFFFFFFFFFFFFFULL) ? 0u : 1u),
+          "FCVT.D.LU UINT64_MAX sets NX", r.fflags, 1);
+
+    r = fcnvt_op(f_d_lu, RM_RNE, 0x1000000000000000ULL);   // 2**60
+    check(r.fdata == d2b(ldexp(1.0, 60)) && r.fflags == 0,
+          "FCVT.D.LU 2**60 exact", r.fdata, d2b(ldexp(1.0, 60)));
+
+    test_result("T21 FCNVT i2f (s/d x w/wu/l/lu): value via native-cast oracle, NX");
+}
+
+//-----------------------------------------------------------------------------
+// T22: FMV x.w/x.d/w.x/d.x -- bit-pattern moves, no conversion. FMV.X.W
+// sign-extends bit 31 on RV64, FMV.X.D is identity, FMV.W.X NaN-boxes the
+// 32-bit GPR view, FMV.D.X is 64-bit identity. Valid routing: x.* -> xvld
+// only, w.*/d.x -> fvld only.
+//-----------------------------------------------------------------------------
+static void test_fspu_fmv(void) {
+    uint32_t f_mv_xw = bitv(FUNC_SPU_MV) | bitv(FUNC_SPU_MV_XF);
+    uint32_t f_mv_xd = f_mv_xw | bitv(FUNC_DOUBLE);
+    uint32_t f_mv_wx = bitv(FUNC_SPU_MV);
+    uint32_t f_mv_dx = f_mv_wx | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fspu_op(f_mv_xw, box(0xC0000000u), 0);
+    check(r.xdata == 0xFFFFFFFFC0000000ULL && r.xvld && !r.fvld,
+          "FMV.X.W sign-extends bit 31 (RV64), xvld routing", r.xdata, 0xFFFFFFFFC0000000ULL);
+    check(r.fflags == 0, "FMV.X.W no flags");
+
+    r = fspu_op(f_mv_xw, box(0x40000000u), 0);
+    check(r.xdata == 0x0000000040000000ULL, "FMV.X.W positive: upper half zero",
+          r.xdata, 0x40000000ULL);
+
+    r = fspu_op(f_mv_xd, 0x8000000000000001ULL, 0);
+    check(r.xdata == 0x8000000000000001ULL && r.xvld && !r.fvld,
+          "FMV.X.D 64-bit bit-identity, xvld routing", r.xdata, 0x8000000000000001ULL);
+
+    r = fspu_op(f_mv_wx, 0x0000000012345678ULL, 0);
+    check(r.fdata == box(0x12345678u) && r.fvld && !r.xvld,
+          "FMV.W.X NaN-boxes the 32-bit GPR view, fvld routing", r.fdata, box(0x12345678u));
+
+    r = fspu_op(f_mv_wx, 0xFFFFFFFFFFFFFFFFULL, 0);
+    check(r.fdata == 0xFFFFFFFFFFFFFFFFULL, "FMV.W.X all-ones GPR -> all-ones box",
+          r.fdata, 0xFFFFFFFFFFFFFFFFULL);
+
+    r = fspu_op(f_mv_dx, 0xDEADBEEF12345678ULL, 0);
+    check(r.fdata == 0xDEADBEEF12345678ULL && r.fvld && !r.xvld,
+          "FMV.D.X 64-bit identity, fvld routing", r.fdata, 0xDEADBEEF12345678ULL);
+
+    test_result("T22 FMV x.w/x.d/w.x/d.x: bit moves, sign-extension, NaN-box, valid routing");
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     dut = new VFPU;
@@ -943,6 +1330,10 @@ int main(int argc, char **argv) {
     test_fdsu_sqrt_s_basic();
     test_fdsu_sqrt_abnormal();
     test_fdsu_busy_preg();
+    test_fcnvt_f2i_64();
+    test_fcnvt_f2i_32();
+    test_fcnvt_i2f();
+    test_fspu_fmv();
 
     printf("[fpu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

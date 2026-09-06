@@ -873,4 +873,74 @@ parameter FUNC_MAU_MUL     = 19;  // set for ALL FIVE FMAU-class instructions
 parameter FUNC_FDSU_DIV    = 5;   // fdiv.s/fdiv.d  (reuses FUNC_MAU_FUSED)
 parameter FUNC_FDSU_SQRT   = 7;   // fsqrt.s/fsqrt.d (reuses FUNC_MAU_SUB)
 
+// M5 Task 7: FMV.{X.W,W.X,X.D,D.X} (FSPU group) and FCVT int<->fp
+// (FCNVT group) op-select bits. Every one of FUNC_WIDTH=20's bits is
+// already claimed (0-19, see the map above) -- rv12's own FUNC_SPU_MV*/
+// FUNC_CVT_* numbering (../rv12/rtl/rvproc_pkg.sv) is NOT ported
+// verbatim here (unlike every prior FUNC_* addition, which did port
+// rv12's numbers unchanged) because rv12's numbers collide with bits
+// rv906's OWN dispatch lines (idu_fpu_ex1_f*_sel, IDU.v) already read
+// directly and unconditionally: rv12's FUNC_SPU_MV=5 would make
+// idu_fpu_ex1_fdsu_sel spuriously co-fire on every FMV (fdsu_sel ORs
+// FUNC_FDSU_DIV=5 itself, unconditionally).
+//
+// The bits below were chosen by enumerating exactly which bits each of
+// the five idu_fpu_ex1_f*_sel lines (IDU.v, SECTION EU DISPATCH) OR
+// directly and unconditionally -- fadd_sel:{12,11,10,9,8}, fspu_sel:
+// {6,18}, fcnvt_sel:{14,13}, fmau_sel:{19}, fdsu_sel:{5,7} -- and the
+// two shared-format bits FUNC_DOUBLE(16)/FUNC_B_SINGLE(15), which are
+// read UNGATED by every unit regardless of which one dispatched. Every
+// OTHER bit (0,1,2,3,4,17) is read ONLY behind an AND with its own
+// group's dispatch bit (FUNC_SPU_SGN=6 gates 0/1/2; FUNC_CMP=10 gates
+// 3/4; FUNC_MAU_MUL=19's fused/plain split context gates 17 via
+// op_mau_neg, which only feeds FMAU's own result -- discarded by
+// SECTION 13's one-hot result mux whenever fmau_sel=0). Because the
+// five dispatch groups are mutually exclusive by construction (IDU
+// issues at most one EU per cycle, and within EU_FP only one of
+// fadd_sel/fspu_sel/fcnvt_sel/fmau_sel/fdsu_sel is ever 1), reusing any
+// of {0,1,2,3,4,17} as a NEW bit for a DIFFERENT group is safe by the
+// same "AND-gated, discarded-via-mux" argument already established for
+// FUNC_CMP_LT==FUNC_SPU_SGN_N(1) and FUNC_MAU_FUSED==FUNC_FDSU_DIV(5) --
+// PROVIDED the reused bit is never ALSO turned into a bare, ungated
+// OR-trigger inside a _sel line itself. FUNC_SPU_MV(17) is exactly
+// this trap: it reuses FUNC_MAU_NEG's bit position, and FUNC_MAU_NEG
+// IS genuinely set to 1 by fnmadd.{s,d}/fnmsub.{s,d} (M5 Task 5,
+// FMAU), so a bare `|| FUNC_SPU_MV` OR-term in idu_fpu_ex1_fspu_sel
+// would spuriously co-fire fspu_sel alongside fmau_sel for those four
+// instructions and (SECTION 13's fspu>fmau priority order) corrupt
+// their result. FUNC_SPU_MV therefore stays purely AND-gated, exactly
+// like op_mau_neg's own read of the same bit position: FSPU dispatch
+// for FMV.* rides the FMV decode arms ALSO setting FUNC_SPU_SGN(6)
+// (already an existing, safe fspu_sel OR-term -- FMV never sets
+// SGN_J/N/X(0/1/2), so this doesn't spuriously trigger sgnj/sgnjn/
+// sgnjx either), and FUNC_SPU_MV/FUNC_SPU_MV_XF are consumed only
+// AND-gated behind it (spu_op_mv_fx/spu_op_mv_xf, FPU.v). FUNC_CVT_INT
+// at 4 below is different: it IS used as a bare OR-trigger in
+// idu_fpu_ex1_fcnvt_sel, but that is safe because bit 4 (FUNC_CMP_FNE)
+// is NEVER SET by any decode arm prior to this task (grep-confirmed),
+// so no existing instruction could have driven it to 1.
+//
+// FMV.{X.W,X.D} sign-extend/passthrough (fp->int, xvld) and FMV.{W.X,
+// D.X} NaN-box/passthrough (int->fp, fvld) both dispatch via
+// idu_fpu_ex1_fspu_sel through the shared FUNC_SPU_SGN(6) trigger (see
+// above) -- NOT through FUNC_SPU_MV itself. Width (32 vs 64) reuses the
+// shared FUNC_DOUBLE nibble, same as every other FPU group -- no
+// separate width bit needed.
+parameter FUNC_SPU_MV      = 17;  // direction sub-mode (AND-gated only): fmv.{x.w,w.x,x.d,d.x} (reuses FUNC_MAU_NEG)
+parameter FUNC_SPU_MV_XF   = 3;   // direction: 1=fp->int (fmv.x.w/x.d), 0=int->fp (fmv.w.x/d.x) (reuses FUNC_CMP_FORD)
+
+// FCVT.{w,wu,l,lu}.{s,d} (fp->int, xvld) and FCVT.{s,d}.{w,wu,l,lu}
+// (int->fp, fvld) both dispatch via idu_fpu_ex1_fcnvt_sel (extended
+// below with `|| FUNC_CVT_INT`), per this package's own
+// pre-announcement above ("FCNVT format group (f2i/i2f: Task 7)").
+// The FP-side format (single/double) reuses FUNC_DOUBLE, exactly like
+// the f2f pair above (FUNC_CVT_WIDDEN/_NARROW are both 0 for every
+// int-convert instruction, which collapses FPU.v's existing
+// cvt_src_l64/cvt_dest_l64 f2f-format terms down to bare FUNC_DOUBLE --
+// verified algebraically, no new format bit needed).
+parameter FUNC_CVT_INT       = 4;  // trigger: fcvt.{w,wu,l,lu}.{s,d} / fcvt.{s,d}.{w,wu,l,lu} (reuses FUNC_CMP_FNE)
+parameter FUNC_CVT_F2I        = 2; // direction: 1=fp->int, 0=int->fp (reuses FUNC_SPU_SGN_X)
+parameter FUNC_CVT_UNSIGNED   = 1; // 1=wu/lu (unsigned), 0=w/l (signed) (reuses FUNC_SPU_SGN_N)
+parameter FUNC_CVT_WIDE64     = 0; // 1=l/lu (64b int side), 0=w/wu (32b int side) (reuses FUNC_SPU_SGN_J)
+
 endpackage
