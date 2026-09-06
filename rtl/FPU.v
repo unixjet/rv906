@@ -80,6 +80,11 @@ module FPU (
     // gating, for a plain fmul). IDU.v already exports this data port
     // (M5 Task 2); the _sel wire is new this task.
     input  wire                        idu_fpu_ex1_fmau_sel,
+    // M5 Task 6: FDSU (fdiv.{s,d}/fsqrt.{s,d}) dispatch select. Mirrors
+    // IU.v's idu_iu_ex1_div_sel exactly (IDU.v gates it with
+    // `!fpu_idu_fdsu_full` the same way DIV is gated with
+    // `!iu_idu_div_full`) -- see `fpu_idu_fdsu_full` below.
+    input  wire                        idu_fpu_ex1_fdsu_sel,
     input  wire [FUNC_WIDTH-1:0]       idu_fpu_ex1_func,
     input  wire [2:0]                  idu_fpu_ex1_rm,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc0_data,
@@ -103,7 +108,16 @@ module FPU (
     output wire [4:0]                  fpu_rtu_ex1_falu_fflags,
     output wire                        fpu_rtu_ex1_falu_fvld,
     output wire                        fpu_rtu_ex1_falu_xvld,
-    output wire [GPR_IDX_WIDTH-1:0]    fpu_rtu_ex1_falu_preg
+    output wire [GPR_IDX_WIDTH-1:0]    fpu_rtu_ex1_falu_preg,
+
+    //=========================================================================
+    // FPU -> IDU : FDSU busy/full. Mirrors IU.v's `iu_idu_div_full` (IU.v:
+    // 1331-1332) but WITHOUT the `!wb_grant` term -- RTU.v:961-963/974
+    // confirms FPU's wbf0 writeback has no arbiter ("FALU is the only wbf0
+    // producer today"; `wbf0_vld_r <= fpu_rtu_ex1_falu_fvld` unconditional),
+    // so there is no writeback-grant-wait state to fold in here.
+    //=========================================================================
+    output wire                        fpu_idu_fdsu_full
 );
 
     //=========================================================================
@@ -927,6 +941,232 @@ module FPU (
                                                   : mau_packed[4:0];
 
     //=========================================================================
+    // SECTION 14: FDSU -- DIVIDE/SQRT (fdiv.{s,d}, fsqrt.{s,d}). Structural
+    // template: IU.v's SECTION DIV (IU.v:1084-1332), simplified per M5
+    // design doc D1 (single-issue busy/stall FSM) minus the DIV_WFWB
+    // grant-wait state -- RTU.v:961-963/974 confirms FPU's wbf0 writeback
+    // has no arbiter ("FALU is the only wbf0 producer today";
+    // `wbf0_vld_r <= fpu_rtu_ex1_falu_fvld` unconditional), so CMPLT always
+    // returns straight to IDLE.
+    //
+    // Round count is a FIXED constant per format (donor aq_fdsu_scalar_
+    // ctrl.v:417-423: double=29 rounds; single is CORRECTED to 14 here vs.
+    // the donor comment's stale "15" -- verified against the donor's own
+    // iteration-count arithmetic, not just the comment, in an earlier task).
+    //=========================================================================
+    localparam FDSU_IDLE = 2'b00, FDSU_BUSY = 2'b01, FDSU_CMPLT = 2'b10;
+
+    wire fds_op_div  = idu_fpu_ex1_func[FUNC_FDSU_DIV];
+    wire fds_op_sqrt = idu_fpu_ex1_func[FUNC_FDSU_SQRT];
+
+    // -- FDIV special cases (IEEE 754), off the LIVE SECTION 3 classify
+    // wires -- resolves same cycle as dispatch, exactly like DIV's own
+    // abnormal fast path.
+    wire fdiv_is_nan         = a_is_snan || a_is_qnan || b_is_snan || b_is_qnan
+                              || (a_is_inf && b_is_inf) || (a_is_zero && b_is_zero);
+    wire fdiv_nv             = a_is_snan || b_is_snan || (a_is_inf && b_is_inf)
+                              || (a_is_zero && b_is_zero);
+    wire fdiv_is_inf_result  = !fdiv_is_nan && (a_is_inf || b_is_zero);
+    wire fdiv_dz             = !fdiv_is_nan && !a_is_inf && b_is_zero;
+    wire fdiv_is_zero_result = !fdiv_is_nan && !fdiv_is_inf_result && (a_is_zero || b_is_inf);
+    wire fdiv_sign           = a_s ^ b_s;
+    wire fdiv_abnormal       = fdiv_is_nan || fdiv_is_inf_result || fdiv_is_zero_result;
+
+    // -- FSQRT special cases. rs2/fsrc1 is unused (RISC-V spec); sqrt reads
+    // only fsrc0/a.
+    wire fsqrt_is_nan            = a_is_snan || a_is_qnan;
+    wire fsqrt_nv                = a_is_snan || (a_s && !a_is_zero);
+    wire fsqrt_result_is_a       = a_is_zero;
+    wire fsqrt_result_is_neg_nan = a_s && !a_is_zero && !a_is_snan && !a_is_qnan;
+    wire fsqrt_result_is_inf     = !a_s && a_is_inf;
+    wire fsqrt_abnormal          = fsqrt_is_nan || fsqrt_result_is_a
+                                  || fsqrt_result_is_neg_nan || fsqrt_result_is_inf;
+
+    wire fds_abnormal_res_vld = (fds_op_div && fdiv_abnormal) || (fds_op_sqrt && fsqrt_abnormal);
+    wire fds_nv = (fds_op_div && fdiv_nv) || (fds_op_sqrt && fsqrt_nv);
+    wire fds_dz = fds_op_div && fdiv_dz;
+
+    wire [63:0] fds_qnan_data = f_double ? {1'b0, 11'h7ff, 1'b1, 51'b0}
+                                          : {32'hffffffff, 1'b0, 8'hff, 1'b1, 22'b0};
+    wire        fds_inf_sign  = fds_op_div ? fdiv_sign : 1'b0;
+    wire [63:0] fds_inf_data  = f_double ? {fds_inf_sign, 11'h7ff, 52'b0}
+                                          : {32'hffffffff, fds_inf_sign, 8'hff, 23'b0};
+    wire [63:0] fds_zero_data = f_double ? {fdiv_sign, 63'b0} : {32'hffffffff, fdiv_sign, 31'b0};
+
+    wire [63:0] fds_abnormal_data =
+          (fds_op_div && fdiv_is_nan)                                ? fds_qnan_data
+        : (fds_op_div && fdiv_is_inf_result)                         ? fds_inf_data
+        : (fds_op_div && fdiv_is_zero_result)                        ? fds_zero_data
+        : (fds_op_sqrt && (fsqrt_is_nan || fsqrt_result_is_neg_nan)) ? fds_qnan_data
+        : (fds_op_sqrt && fsqrt_result_is_a)                         ? idu_fpu_ex1_fsrc0_data
+        : (fds_op_sqrt && fsqrt_result_is_inf)                       ? fds_inf_data
+        :                                                              64'b0;
+    wire [4:0] fds_abnormal_flags = {fds_nv, fds_dz, 3'b000};
+
+    wire [5:0] fds_round_count = f_double ? 6'd29 : 6'd14;
+
+    // -- FSM --
+    reg [1:0] fdsu_state;
+    reg [5:0] fdsu_iter_left;
+
+    wire fdsu_new_dispatch = idu_fpu_ex1_fdsu_sel && (fdsu_state == FDSU_IDLE);
+    wire fdsu_iter_start   = fdsu_new_dispatch && !fds_abnormal_res_vld;
+    wire fdsu_ex1_res_vld  = fdsu_new_dispatch && fds_abnormal_res_vld;
+
+    wire [1:0] fdsu_next_state =
+          (fdsu_state == FDSU_IDLE) ? (fdsu_iter_start ? FDSU_BUSY : FDSU_IDLE)
+        : (fdsu_state == FDSU_BUSY) ? ((fdsu_iter_left <= 6'd1) ? FDSU_CMPLT : FDSU_BUSY)
+        :                             FDSU_IDLE;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            fdsu_state <= FDSU_IDLE;
+        else
+            fdsu_state <= fdsu_next_state;
+    end
+
+    wire fdsu_cmplt_now = (fdsu_state == FDSU_CMPLT) || (fdsu_state == FDSU_IDLE && fdsu_ex1_res_vld);
+
+    // -- Dispatch-time operand/control latch (mirrors IU.v's div_dividend_
+    // flop/div_preg_reg discipline exactly -- the live idu_fpu_ex1_* bus is
+    // not guaranteed stable for the whole multi-cycle busy period).
+    reg [52:0] fdsu_a_sig_flop, fdsu_b_sig_flop;
+    reg [11:0] fdsu_a_eeff_flop, fdsu_b_eeff_flop;
+    reg        fdsu_a_s_flop, fdsu_b_s_flop;
+    reg        fdsu_double_flop;
+    reg        fdsu_op_div_flop;
+    reg [2:0]  fdsu_rm_flop;
+    reg [GPR_IDX_WIDTH-1:0] fdsu_preg_flop;
+
+    always @(posedge clk) begin
+        if (fdsu_iter_start) begin
+            fdsu_a_sig_flop   <= a_sig53;
+            fdsu_b_sig_flop   <= b_sig53;
+            fdsu_a_eeff_flop  <= a_eeff;
+            fdsu_b_eeff_flop  <= b_eeff;
+            fdsu_a_s_flop     <= a_s;
+            fdsu_b_s_flop     <= b_s;
+            fdsu_double_flop  <= f_double;
+            fdsu_op_div_flop  <= fds_op_div;
+            fdsu_rm_flop      <= idu_fpu_ex1_rm;
+            fdsu_iter_left    <= fds_round_count;
+        end
+        else if (fdsu_state == FDSU_BUSY)
+            fdsu_iter_left <= fdsu_iter_left - 6'd1;
+    end
+
+    always @(posedge clk) begin
+        if (fdsu_new_dispatch)
+            fdsu_preg_flop <= idu_fpu_ex1_dst0_reg;
+    end
+
+    // -- Real-compute helper functions --
+    // 53-bit leading-zero count. The real-compute path is only entered for
+    // finite nonzero operands, and SECTION 3's a_sig53/b_sig53 construction
+    // forces bit52 set for any NORMAL operand, so a nonzero LZC only
+    // actually occurs for a SUBNORMAL operand.
+    function [7:0] lzc53;
+        input [52:0] v;
+        integer i;
+        reg    found;
+        begin
+            lzc53 = 8'd53;
+            found = 1'b0;
+            for (i = 52; i >= 0; i = i - 1)
+                if (v[i] && !found) begin
+                    found = 1'b1;
+                    lzc53 = 8'd52 - i[7:0];
+                end
+        end
+    endfunction
+
+    // Bit-by-bit restoring integer square root, 120-bit input -> 60-bit
+    // output. Behavioral only -- mirrors this codebase's existing precedent
+    // of plain `/`/`%` for IU.v's DIV (no digit-recurrence array ported).
+    function [59:0] fdsu_isqrt120;
+        input [119:0] x;
+        integer i;
+        reg [119:0] rem, root_acc, try;
+        begin
+            rem      = x;
+            root_acc = 120'b0;
+            for (i = 59; i >= 0; i = i - 1) begin
+                try = root_acc | ({119'b0, 1'b1} << i);
+                if ((try * try) <= rem)
+                    root_acc = try;
+            end
+            fdsu_isqrt120 = root_acc[59:0];
+        end
+    endfunction
+
+    // -- FDIV real-compute datapath (both operands finite nonzero) --
+    wire [7:0]  fdsu_a_lza = lzc53(fdsu_a_sig_flop);
+    wire [7:0]  fdsu_b_lza = lzc53(fdsu_b_sig_flop);
+    wire [52:0] fdsu_a_norm = fdsu_a_sig_flop << fdsu_a_lza;
+    wire [52:0] fdsu_b_norm = fdsu_b_sig_flop << fdsu_b_lza;
+    wire [10:0] fdsu_bias   = fdsu_double_flop ? BIAS_D : BIAS_S;
+    wire signed [13:0] fdsu_e_a = $signed({2'b0, fdsu_a_eeff_flop})
+                                 - $signed({6'b0, fdsu_a_lza}) - $signed({3'b0, fdsu_bias});
+    wire signed [13:0] fdsu_e_b = $signed({2'b0, fdsu_b_eeff_flop})
+                                 - $signed({6'b0, fdsu_b_lza}) - $signed({3'b0, fdsu_bias});
+
+    // Wide division: both operands normalized to [2^52,2^53), so the ratio
+    // lies in (0.5,2) -- at most a 1-bit leading-position ambiguity.
+    wire [111:0] fdiv_wide_dividend  = {fdsu_a_norm, 59'b0};
+    wire [111:0] fdiv_wide_divisor   = {59'b0, fdsu_b_norm};
+    wire [111:0] fdiv_wide_quotient  = fdiv_wide_dividend / fdiv_wide_divisor;
+    wire [111:0] fdiv_wide_remainder = fdiv_wide_dividend % fdiv_wide_divisor;
+    wire         fdiv_lead59 = fdiv_wide_quotient[59];
+
+    // Two FIXED-width constant slices selected by a runtime mux (Verilog
+    // disallows a variable-width bit-select) -- both align the true
+    // leading bit to LOCAL position 55 of a PW=57 field.
+    wire [PW-1:0] fdiv_pack_p = fdiv_lead59 ? {1'b0, fdiv_wide_quotient[59:4]}
+                                            : {1'b0, fdiv_wide_quotient[58:3]};
+    wire fdiv_dropped_st = fdiv_lead59 ? (|fdiv_wide_quotient[3:0]) : (|fdiv_wide_quotient[2:0]);
+    wire fdiv_sticky     = fdiv_dropped_st || (fdiv_wide_remainder != 112'b0);
+
+    // value = wide_quotient * 2^(e_a-e_b-59) exactly; normalizing to LOCAL
+    // bit55 needs shift_amt=4 (lead59) or 3 (lead58) -- the lead58 case
+    // needs an extra -1 on the exponent fed to fp_pack to compensate
+    // (verified algebraically against fp_pack's own "leading bit at
+    // P[55], e_in is the biased FIELD exponent as if it were already
+    // there" convention).
+    wire signed [13:0] fdiv_pack_e14 = $signed({3'b0, fdsu_bias}) + fdsu_e_a - fdsu_e_b
+                                      - (fdiv_lead59 ? 14'sd0 : 14'sd1);
+    wire fdiv_pack_sign = fdsu_a_s_flop ^ fdsu_b_s_flop;
+
+    // -- FSQRT real-compute datapath (operand finite, positive, nonzero) --
+    wire fsqrt_ea_odd = fdsu_e_a[0];
+    wire [53:0] fsqrt_adj_mant = fsqrt_ea_odd ? {fdsu_a_norm, 1'b0} : {1'b0, fdsu_a_norm};
+    wire signed [13:0] fsqrt_adj_ea  = fsqrt_ea_odd ? (fdsu_e_a - 14'sd1) : fdsu_e_a;
+    wire signed [13:0] fsqrt_half_ea = fsqrt_adj_ea >>> 1;
+    wire [119:0] fsqrt_scaled  = {fsqrt_adj_mant, 66'b0};
+    wire [59:0]  fsqrt_root    = fdsu_isqrt120(fsqrt_scaled);
+    wire [119:0] fsqrt_root_sq = fsqrt_root * fsqrt_root;
+    wire         fsqrt_exact   = (fsqrt_scaled == fsqrt_root_sq);
+    wire [PW-1:0] fsqrt_pack_p = {1'b0, fsqrt_root[59:4]};
+    wire fsqrt_sticky = (|fsqrt_root[3:0]) || !fsqrt_exact;
+    wire signed [13:0] fsqrt_pack_e14 = $signed({3'b0, fdsu_bias}) + fsqrt_half_ea;
+    wire fsqrt_pack_sign = 1'b0;
+
+    // -- Combine per op, pack, mux with the abnormal-path result --
+    wire        fdsu_real_sign   = fdsu_op_div_flop ? fdiv_pack_sign : fsqrt_pack_sign;
+    wire signed [12:0] fdsu_real_pack_e = fdsu_op_div_flop ? fdiv_pack_e14[12:0] : fsqrt_pack_e14[12:0];
+    wire [PW-1:0] fdsu_real_pack_p = fdsu_op_div_flop ? fdiv_pack_p : fsqrt_pack_p;
+    wire        fdsu_real_pack_st  = fdsu_op_div_flop ? fdiv_sticky : fsqrt_sticky;
+
+    wire [PACK_W-1:0] fdsu_packed = fp_pack(fdsu_real_sign, fdsu_real_pack_e, fdsu_real_pack_p,
+                                            fdsu_real_pack_st, fdsu_rm_flop, fdsu_double_flop);
+    wire [63:0] fdsu_real_data  = fdsu_packed[PACK_W-1:5];
+    wire [4:0]  fdsu_real_flags = fdsu_packed[4:0];
+
+    wire [63:0] fdsu_ex1_result = (fdsu_state == FDSU_IDLE) ? fds_abnormal_data : fdsu_real_data;
+    wire [4:0]  fdsu_ex1_flags  = (fdsu_state == FDSU_IDLE) ? fds_abnormal_flags : fdsu_real_flags;
+
+    assign fpu_idu_fdsu_full = (fdsu_state == FDSU_BUSY);
+
+    //=========================================================================
     // SECTION 13: THE EU RESULT MUX (D1: one-hot OR-mux, IU.v ALU-section
     // style -- no EX3 register, the four selects are mutually exclusive by
     // construction since IDU issues at most one EU per cycle)
@@ -935,6 +1175,7 @@ module FPU (
                                     : idu_fpu_ex1_fspu_sel  ? fspu_ex1_result
                                     : idu_fpu_ex1_fcnvt_sel ? fcnvt_ex1_result
                                     : idu_fpu_ex1_fmau_sel  ? fmau_ex1_result
+                                    : fdsu_cmplt_now        ? fdsu_ex1_result
                                                              : 64'b0;
 
     assign fpu_rtu_ex1_falu_xdata  = idu_fpu_ex1_fadd_sel  ? fadd_mfvr_data
@@ -944,16 +1185,24 @@ module FPU (
     assign fpu_rtu_ex1_falu_fflags = idu_fpu_ex1_fadd_sel  ? fadd_ex2_flags
                                     : idu_fpu_ex1_fcnvt_sel ? fcnvt_ex1_flags
                                     : idu_fpu_ex1_fmau_sel  ? fmau_ex1_flags
+                                    : fdsu_cmplt_now        ? fdsu_ex1_flags
                                                              : 5'b0;
 
     // fvld: an FP-register-destination result -- add/sub/min/max/sgnj*/f2f/
-    // fma, but NOT a compare (that's xvld) and NOT fclass (also xvld).
-    // FMAU never targets an integer destination (RISC-V spec), so it only
-    // ever contributes to fvld/fdata, never xvld/xdata.
+    // fma/fdiv/fsqrt, but NOT a compare (that's xvld) and NOT fclass (also
+    // xvld). FMAU/FDSU never target an integer destination (RISC-V spec),
+    // so they only ever contribute to fvld/fdata, never xvld/xdata. FDSU's
+    // term is gated on `fdsu_cmplt_now` (FSM state), NOT on
+    // `idu_fpu_ex1_fdsu_sel` (the dispatch-select signal), because that
+    // signal may still legitimately be asserted on the CMPLT cycle itself
+    // (full is deasserted then) for a reason unrelated to gating this
+    // writeback -- exactly like DIV's own independence of iu_rtu_div_wb_vld
+    // from idu_iu_ex1_div_sel.
     assign fpu_rtu_ex1_falu_fvld   = (idu_fpu_ex1_fadd_sel  && !op_cmp)
                                     || (idu_fpu_ex1_fspu_sel  && !spu_op_class)
                                     || idu_fpu_ex1_fcnvt_sel
-                                    || idu_fpu_ex1_fmau_sel;
+                                    || idu_fpu_ex1_fmau_sel
+                                    || fdsu_cmplt_now;
 
     // xvld: an integer-register-destination result -- compare or fclass.
     assign fpu_rtu_ex1_falu_xvld   = (idu_fpu_ex1_fadd_sel && op_cmp)
@@ -961,11 +1210,13 @@ module FPU (
 
     // M5 Task 4b: pure pass-through, shared by both the fdata (FRF) and
     // xdata (GPR) answer shapes -- RTU picks which regfile to write from
-    // fvld/xvld, not from this tag.
-    assign fpu_rtu_ex1_falu_preg   = idu_fpu_ex1_dst0_reg;
-
-    // D1: clk/rst_n are frozen into the port list for FMAU/FDSU (later M5
-    // tasks) but this task's FALU body is purely combinational.
-    wire _unused_ok = &{1'b0, clk, rst_n};
+    // fvld/xvld, not from this tag. FDSU's iter path holds the pipe busy
+    // for several cycles after dispatch, so at FDSU_CMPLT the live
+    // idu_fpu_ex1_dst0_reg may already name a later instruction -- use the
+    // dispatch-time latch there (mirrors IU.v's div_preg_reg fix). The
+    // fast (abnormal) path resolves in the same cycle as dispatch, where
+    // the live bus is still this op's own, so it falls through untouched.
+    assign fpu_rtu_ex1_falu_preg   = (fdsu_cmplt_now && fdsu_state != FDSU_IDLE)
+                                    ? fdsu_preg_flop : idu_fpu_ex1_dst0_reg;
 
 endmodule

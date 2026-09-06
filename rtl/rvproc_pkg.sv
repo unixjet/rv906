@@ -858,4 +858,19 @@ parameter FUNC_MAU_NEG     = 17;
 // the last free FUNC_WIDTH=20 slot (0-18 all allocated above/elsewhere).
 parameter FUNC_MAU_MUL     = 19;  // set for ALL FIVE FMAU-class instructions
 
+// M5 Task 6: FPU.v FDSU (div/sqrt) op-select bits. Reuses FUNC_MAU_FUSED/
+// FUNC_MAU_SUB above for FDSU's own two mutually-exclusive members.
+// NOTE: FUNC_MAX(9)/FUNC_MIN(8) were considered first and rejected --
+// idu_fpu_ex1_fadd_sel ORs those two bits directly (IDU.v), so reusing them
+// here would make fadd_sel spuriously fire alongside fdsu_sel on every
+// fdiv/fsqrt. FUNC_MAU_FUSED/_SUB are safe instead: idu_fpu_ex1_fmau_sel
+// tests ONLY FUNC_MAU_MUL(19), never bits 5/7 directly, and no other _sel
+// line touches them either -- true bit-reuse-across-mutually-exclusive-
+// dispatch, the same convention as FUNC_CMP_LT/FUNC_SPU_SGN_N sharing bit 1.
+// Format (single/double) reuses the shared FUNC_DOUBLE nibble like FADD/
+// FSPU (no FUNC_B_SINGLE needed -- FDSU never reads a second, differing
+// format the way FCNVT's cross-format convert does).
+parameter FUNC_FDSU_DIV    = 5;   // fdiv.s/fdiv.d  (reuses FUNC_MAU_FUSED)
+parameter FUNC_FDSU_SQRT   = 7;   // fsqrt.s/fsqrt.d (reuses FUNC_MAU_SUB)
+
 endpackage

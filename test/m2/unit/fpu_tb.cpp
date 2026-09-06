@@ -65,6 +65,8 @@ static const unsigned FUNC_CVT_NARROW = 13;
 static const unsigned FUNC_MAU_FUSED  = 5;
 static const unsigned FUNC_MAU_SUB    = 7;
 static const unsigned FUNC_MAU_NEG    = 17;
+static const unsigned FUNC_FDSU_DIV   = 5;
+static const unsigned FUNC_FDSU_SQRT  = 7;
 
 static inline uint32_t bitv(unsigned n) { return 1u << n; }
 
@@ -108,6 +110,7 @@ static void tie_idle_inputs(void) {
     dut->idu_fpu_ex1_fspu_sel   = 0;
     dut->idu_fpu_ex1_fcnvt_sel  = 0;
     dut->idu_fpu_ex1_fmau_sel   = 0;
+    dut->idu_fpu_ex1_fdsu_sel   = 0;
     dut->idu_fpu_ex1_func       = 0;
     dut->idu_fpu_ex1_rm         = 0;
     dut->idu_fpu_ex1_fsrc0_data = 0;
@@ -180,6 +183,26 @@ static bool fma_exact_s(float a, float b, float c) {
     return (double)(float)e == e;
 }
 
+// Same widening-trick idea for FDIV/FSQRT (host division/sqrt is also
+// IEEE-754 RNE, so it's the value oracle directly -- these only answer
+// "is the RNE result exact for these specific operands").
+static bool div_exact_d(double a, double b) {
+    long double e = (long double)a / (long double)b;
+    return (long double)(double)e == e;
+}
+static bool div_exact_s(float a, float b) {
+    double e = (double)a / (double)b;
+    return (double)(float)e == e;
+}
+static bool sqrt_exact_d(double a) {
+    long double e = sqrtl((long double)a);
+    return (long double)(double)e == e;
+}
+static bool sqrt_exact_s(float a) {
+    double e = sqrt((double)a);
+    return (double)(float)e == e;
+}
+
 //-----------------------------------------------------------------------------
 // Dispatch helpers -- purely combinational, EX1-only (FPU.v D1): set inputs,
 // eval(), read the result the same cycle, then tick() once.
@@ -247,6 +270,40 @@ static FpuResult fmau_op(uint32_t func, unsigned rm, uint64_t fsrc0, uint64_t fs
     dut->idu_fpu_ex1_fsrc2_data = fsrc2;
     dut->eval();
     FpuResult r = read_result();
+    tick();
+    return r;
+}
+
+//-----------------------------------------------------------------------------
+// FDSU dispatch helper -- multi-cycle (M5 Task 6 busy/stall FSM, mirrors
+// IU.v's div_op in iu_tb.cpp). Unlike DIV, FDSU has no writeback-grant wait
+// state (RTU.v:961-963/974: FPU's wbf0 writeback is unconditional), so
+// `fpu_rtu_ex1_falu_fvld` alone directly encodes true completion (both the
+// same-cycle abnormal fast path and the multi-cycle real-compute path) --
+// no two-stage loop like DIV's cmplt-then-wb_vld is needed. After the loop
+// exits, `idu_fpu_ex1_fdsu_sel` is deasserted and one more tick() is taken
+// before returning, so the FSM's CMPLT->IDLE cycle doesn't spuriously
+// re-trigger a fresh dispatch off the still-asserted select (no IDU exists
+// in this bench to naturally drop it).
+//-----------------------------------------------------------------------------
+static FpuResult fdsu_op(uint32_t func, unsigned rm, uint64_t fsrc0, uint64_t fsrc1,
+                          uint32_t dst0_reg = 0) {
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fdsu_sel   = 1;
+    dut->idu_fpu_ex1_func       = func;
+    dut->idu_fpu_ex1_rm         = rm;
+    dut->idu_fpu_ex1_fsrc0_data = fsrc0;
+    dut->idu_fpu_ex1_fsrc1_data = fsrc1;
+    dut->idu_fpu_ex1_dst0_reg   = dst0_reg;
+    dut->eval();
+
+    while (!dut->fpu_rtu_ex1_falu_fvld) {
+        tick();
+        dut->eval();
+    }
+    FpuResult r = read_result();
+
+    dut->idu_fpu_ex1_fdsu_sel = 0;
     tick();
     return r;
 }
@@ -683,6 +740,186 @@ static void test_fmau_mul(void) {
     test_result("T11 FMAU plain fmul.s/d: value + NX flag, addend don't-care");
 }
 
+//-----------------------------------------------------------------------------
+// T12: FDIV.D basic -- value + NX flag, via fdsu_op's multi-cycle loop.
+//-----------------------------------------------------------------------------
+static void test_fdsu_div_d_basic(void) {
+    uint32_t f_div_d = bitv(FUNC_FDSU_DIV) | bitv(FUNC_DOUBLE);
+
+    double a = 8.0, b = 2.0;
+    FpuResult r = fdsu_op(f_div_d, RM_RNE, d2b(a), d2b(b));
+    check(r.fdata == d2b(a / b) && r.fflags == 0,
+          "FDIV.D 8.0/2.0 == 4.0 exact", r.fdata, d2b(a / b));
+
+    a = 1.0; b = 3.0;
+    r = fdsu_op(f_div_d, RM_RNE, d2b(a), d2b(b));
+    check(r.fdata == d2b(a / b), "FDIV.D 1.0/3.0 value", r.fdata, d2b(a / b));
+    check((r.fflags & 0x1) == (div_exact_d(a, b) ? 0u : 1u), "FDIV.D 1.0/3.0 sets NX");
+
+    test_result("T12 FDIV.D: value + NX flag, real-compute path");
+}
+
+//-----------------------------------------------------------------------------
+// T13: FDIV.S basic + NaN-box check.
+//-----------------------------------------------------------------------------
+static void test_fdsu_div_s_basic(void) {
+    uint32_t f_div_s = bitv(FUNC_FDSU_DIV) | bitv(FUNC_B_SINGLE);
+
+    float fa = 8.0f, fb = 2.0f;
+    FpuResult r = fdsu_op(f_div_s, RM_RNE, box(f2b(fa)), box(f2b(fb)));
+    check(r.fdata == box(f2b(fa / fb)) && r.fflags == 0,
+          "FDIV.S 8.0/2.0 == 4.0 exact, boxed", r.fdata, box(f2b(fa / fb)));
+
+    fa = 1.0f; fb = 3.0f;
+    r = fdsu_op(f_div_s, RM_RNE, box(f2b(fa)), box(f2b(fb)));
+    check(r.fdata == box(f2b(fa / fb)), "FDIV.S 1.0/3.0 value (boxed)", r.fdata, box(f2b(fa / fb)));
+    check((r.fflags & 0x1) == (div_exact_s(fa, fb) ? 0u : 1u), "FDIV.S 1.0/3.0 sets NX");
+
+    test_result("T13 FDIV.S: value + NX flag + NaN-box check");
+}
+
+//-----------------------------------------------------------------------------
+// T14: FDIV abnormal cases (IEEE 754, FPU.v SECTION 14 fdiv_* wires).
+//-----------------------------------------------------------------------------
+static void test_fdsu_div_abnormal(void) {
+    uint32_t f_div_d = bitv(FUNC_FDSU_DIV) | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fdsu_op(f_div_d, RM_RNE, PZERO_D, PZERO_D);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FDIV.D 0.0/0.0 -> qNaN, NV set");
+
+    r = fdsu_op(f_div_d, RM_RNE, PINF_D, PINF_D);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FDIV.D inf/inf -> qNaN, NV set");
+
+    r = fdsu_op(f_div_d, RM_RNE, d2b(5.0), PZERO_D);
+    check(r.fdata == PINF_D && (r.fflags & 0x8), "FDIV.D 5.0/+0.0 -> +Inf, DZ set");
+
+    r = fdsu_op(f_div_d, RM_RNE, d2b(-5.0), PZERO_D);
+    check(r.fdata == NINF_D && (r.fflags & 0x8), "FDIV.D -5.0/+0.0 -> -Inf, DZ set");
+
+    r = fdsu_op(f_div_d, RM_RNE, d2b(5.0), PINF_D);
+    check(r.fdata == PZERO_D && r.fflags == 0, "FDIV.D 5.0/+inf -> +0.0, no flags");
+
+    r = fdsu_op(f_div_d, RM_RNE, SNAN_D, d2b(1.0));
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FDIV.D sNaN/1.0 -> qNaN, NV set");
+
+    r = fdsu_op(f_div_d, RM_RNE, QNAN_D, d2b(1.0));
+    check(r.fdata == QNAN_D && r.fflags == 0, "FDIV.D qNaN/1.0 -> qNaN, no NV");
+
+    test_result("T14 FDIV abnormal: 0/0, inf/inf, x/0 DZ, finite/inf, sNaN/qNaN in");
+}
+
+//-----------------------------------------------------------------------------
+// T15: FSQRT.D basic -- value + NX flag.
+//-----------------------------------------------------------------------------
+static void test_fdsu_sqrt_d_basic(void) {
+    uint32_t f_sqrt_d = bitv(FUNC_FDSU_SQRT) | bitv(FUNC_DOUBLE);
+
+    double a = 4.0;
+    FpuResult r = fdsu_op(f_sqrt_d, RM_RNE, d2b(a), 0);
+    check(r.fdata == d2b(sqrt(a)) && r.fflags == 0,
+          "FSQRT.D sqrt(4.0) == 2.0 exact", r.fdata, d2b(sqrt(a)));
+
+    a = 2.0;
+    r = fdsu_op(f_sqrt_d, RM_RNE, d2b(a), 0);
+    check(r.fdata == d2b(sqrt(a)), "FSQRT.D sqrt(2.0) value", r.fdata, d2b(sqrt(a)));
+    check((r.fflags & 0x1) == (sqrt_exact_d(a) ? 0u : 1u), "FSQRT.D sqrt(2.0) sets NX");
+
+    test_result("T15 FSQRT.D: value + NX flag, real-compute path");
+}
+
+//-----------------------------------------------------------------------------
+// T16: FSQRT.S basic + NaN-box check.
+//-----------------------------------------------------------------------------
+static void test_fdsu_sqrt_s_basic(void) {
+    uint32_t f_sqrt_s = bitv(FUNC_FDSU_SQRT) | bitv(FUNC_B_SINGLE);
+
+    float fa = 4.0f;
+    FpuResult r = fdsu_op(f_sqrt_s, RM_RNE, box(f2b(fa)), 0);
+    check(r.fdata == box(f2b(sqrtf(fa))) && r.fflags == 0,
+          "FSQRT.S sqrt(4.0) == 2.0 exact, boxed", r.fdata, box(f2b(sqrtf(fa))));
+
+    fa = 2.0f;
+    r = fdsu_op(f_sqrt_s, RM_RNE, box(f2b(fa)), 0);
+    check(r.fdata == box(f2b(sqrtf(fa))), "FSQRT.S sqrt(2.0) value (boxed)", r.fdata, box(f2b(sqrtf(fa))));
+    check((r.fflags & 0x1) == (sqrt_exact_s(fa) ? 0u : 1u), "FSQRT.S sqrt(2.0) sets NX");
+
+    test_result("T16 FSQRT.S: value + NX flag + NaN-box check");
+}
+
+//-----------------------------------------------------------------------------
+// T17: FSQRT abnormal cases (IEEE 754, FPU.v SECTION 14 fsqrt_* wires).
+//-----------------------------------------------------------------------------
+static void test_fdsu_sqrt_abnormal(void) {
+    uint32_t f_sqrt_d = bitv(FUNC_FDSU_SQRT) | bitv(FUNC_DOUBLE);
+
+    FpuResult r = fdsu_op(f_sqrt_d, RM_RNE, d2b(-4.0), 0);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FSQRT.D sqrt(-4.0) -> qNaN, NV set");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, SNAN_D, 0);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FSQRT.D sqrt(sNaN) -> qNaN, NV set");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, QNAN_D, 0);
+    check(r.fdata == QNAN_D && r.fflags == 0, "FSQRT.D sqrt(qNaN) -> qNaN, no NV");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, PZERO_D, 0);
+    check(r.fdata == PZERO_D && r.fflags == 0, "FSQRT.D sqrt(+0.0) -> +0.0, no flags");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, NZERO_D, 0);
+    check(r.fdata == NZERO_D && r.fflags == 0, "FSQRT.D sqrt(-0.0) -> -0.0, no flags");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, PINF_D, 0);
+    check(r.fdata == PINF_D && r.fflags == 0, "FSQRT.D sqrt(+inf) -> +inf, no flags");
+
+    r = fdsu_op(f_sqrt_d, RM_RNE, NINF_D, 0);
+    check(r.fdata == QNAN_D && (r.fflags & 0x10), "FSQRT.D sqrt(-inf) -> qNaN, NV set");
+
+    test_result("T17 FSQRT abnormal: negative, +-0, +-inf, sNaN/qNaN in");
+}
+
+//-----------------------------------------------------------------------------
+// T18: FDSU busy/full signal timing + preg passthrough via fdsu_preg_flop
+// during the real-compute path (FPU.v: fpu_idu_fdsu_full asserted exactly
+// while fdsu_state==FDSU_BUSY; fpu_rtu_ex1_falu_preg switches to the
+// dispatch-time-latched fdsu_preg_flop once fdsu_cmplt_now fires).
+//-----------------------------------------------------------------------------
+static void test_fdsu_busy_preg(void) {
+    uint32_t f_div_d = bitv(FUNC_FDSU_DIV) | bitv(FUNC_DOUBLE);
+
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_fdsu_sel   = 1;
+    dut->idu_fpu_ex1_func       = f_div_d;
+    dut->idu_fpu_ex1_rm         = RM_RNE;
+    dut->idu_fpu_ex1_fsrc0_data = d2b(1.0);
+    dut->idu_fpu_ex1_fsrc1_data = d2b(3.0);
+    dut->idu_fpu_ex1_dst0_reg   = 9;
+    dut->eval();
+    check(!dut->fpu_rtu_ex1_falu_fvld, "FDIV.D real-compute not vld on dispatch cycle");
+    check(!dut->fpu_idu_fdsu_full, "FDIV.D full not yet asserted on dispatch cycle");
+
+    tick();
+    dut->eval();
+    check(dut->fpu_idu_fdsu_full == 1, "FDIV.D full asserted the cycle after dispatch");
+
+    while (dut->fpu_idu_fdsu_full) {
+        tick();
+        dut->eval();
+    }
+    check(dut->fpu_rtu_ex1_falu_fvld == 1, "FDIV.D fvld asserted once full deasserts (CMPLT)");
+    check(dut->fpu_rtu_ex1_falu_preg == 9,
+          "FDIV.D preg == dispatch-time dst0_reg via fdsu_preg_flop at CMPLT",
+          dut->fpu_rtu_ex1_falu_preg, 9);
+    check(dut->fpu_rtu_ex1_falu_fdata == d2b(1.0 / 3.0),
+          "FDIV.D real-compute value 1.0/3.0 at CMPLT", dut->fpu_rtu_ex1_falu_fdata, d2b(1.0 / 3.0));
+
+    dut->idu_fpu_ex1_fdsu_sel = 0;
+    tick();
+    dut->eval();
+    check(!dut->fpu_idu_fdsu_full, "FDIV.D full stays deasserted after CMPLT->IDLE");
+    check(!dut->fpu_rtu_ex1_falu_fvld, "FDIV.D fvld drops after sel deasserted, CMPLT->IDLE");
+
+    test_result("T18 FDSU busy/full timing + preg passthrough via fdsu_preg_flop");
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     dut = new VFPU;
@@ -699,6 +936,13 @@ int main(int argc, char **argv) {
     test_fmau_s_basic();
     test_fmau_mul();
     test_dst0_reg_preg_passthrough();
+    test_fdsu_div_d_basic();
+    test_fdsu_div_s_basic();
+    test_fdsu_div_abnormal();
+    test_fdsu_sqrt_d_basic();
+    test_fdsu_sqrt_s_basic();
+    test_fdsu_sqrt_abnormal();
+    test_fdsu_busy_preg();
 
     printf("[fpu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

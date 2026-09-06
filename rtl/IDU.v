@@ -264,6 +264,13 @@ module IDU (
     // FUSED=0 with SUB/NEG don't-care), so IDU sets one dedicated bit
     // uniformly across all five FMAU-class instructions instead.
     output wire                     idu_fpu_ex1_fmau_sel,
+    // M5 Task 6: FDSU (div/sqrt) dispatch select. Identified by
+    // FUNC_FDSU_DIV | FUNC_FDSU_SQRT (rvproc_pkg.sv), same OR-group shape
+    // as idu_fpu_ex1_fadd_sel's ADD/SUB/CMP/MAX/MIN. Additionally gated on
+    // !fpu_idu_fdsu_full (FPU.v's busy-flop output) -- same shape as
+    // idu_iu_ex1_div_sel's own !iu_idu_div_full term (IU.v SECTION DIV is
+    // this signal's structural precedent, design doc D1).
+    output wire                     idu_fpu_ex1_fdsu_sel,
     output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
     output wire [2:0]               idu_fpu_ex1_rm,
     // M5 Task 4b: destination register tag (rd), same pass-through shape as
@@ -316,6 +323,12 @@ module IDU (
     input  wire                     iu_idu_div_full,
     input  wire                     iu_idu_bju_full,
     input  wire                     iu_idu_bju_global_full,
+
+    //=========================================================================
+    // FPU -> IDU : FDSU busy/full (M5 Task 6, mirrors iu_idu_div_full's
+    // shape exactly -- design doc D1's structural precedent).
+    //=========================================================================
+    input  wire                     fpu_idu_fdsu_full,
 
     //=========================================================================
     // LSU -> IDU : the single EX1 issue-gate stall signal (contract 8;
@@ -1007,6 +1020,28 @@ module IDU (
             end
             15'b0001001_???_10100: begin  // fmul.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MAU_MUL] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            // M5 Task 6: fdiv/fsqrt (OP-FP, funct5=00011/01011). rs2 is
+            // fdiv's real second source register for the div arms and
+            // fsqrt's fixed-00000 mode field for the sqrt arms -- neither
+            // matters here since the 15-bit casez key is {funct7,funct3,
+            // opcode} only (rs2, inst[24:20], was never part of the key --
+            // see the casez declaration above), so fdiv's rs2 flows to
+            // idu_fpu_ex1_fsrc1_data exactly like fadd's real rs2 does,
+            // with no wildcarding risk.
+            15'b0001100_???_10100: begin  // fdiv.s
+                d32_eu = EU_FP; d32_func[FUNC_FDSU_DIV] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0001101_???_10100: begin  // fdiv.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_FDSU_DIV] = 1'b1;
+                d32_illegal = 1'b1;
+            end
+            15'b0101100_???_10100: begin  // fsqrt.s
+                d32_eu = EU_FP; d32_func[FUNC_FDSU_SQRT] = 1'b1; d32_illegal = 1'b1;
+            end
+            15'b0101101_???_10100: begin  // fsqrt.d
+                d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_FDSU_SQRT] = 1'b1;
                 d32_illegal = 1'b1;
             end
             // M5 Task 5: R4-type FMA family (MADD/MSUB/NMSUB/NMADD major
@@ -1758,7 +1793,13 @@ module IDU (
                           || (ex1_eu_r[EU_MULT_SEL] && iu_idu_mult_full)
                           || (ex1_eu_r[EU_DIV_SEL]  && iu_idu_div_full)
                           || (ex1_eu_r[EU_LSU_SEL]  && lsu_idu_full)
-                          || (ex1_eu_r[EU_CP0_SEL]  && cp0_idu_fencei_full);
+                          || (ex1_eu_r[EU_CP0_SEL]  && cp0_idu_fencei_full)
+                          // M5 Task 6: holds the FDSU op resident in EX1
+                          // while FPU.v's busy-flop churns, same shape as
+                          // the EU_DIV_SEL term above (design doc D1).
+                          || (ex1_eu_r[EU_FP_SEL]
+                              && (ex1_func_r[FUNC_FDSU_DIV] || ex1_func_r[FUNC_FDSU_SQRT])
+                              && fpu_idu_fdsu_full);
     wire ctrl_ex1_issue_stall    = ex1_vld_r && iu_idu_mult_issue_stall;
     // A store's store-data operand (src2) is deliberately exempted from the
     // dispatch-time RAW stall when its producer is a still-in-flight LSU op
@@ -1903,6 +1944,15 @@ module IDU (
     // since plain fmul sets FUSED=0 with SUB/NEG don't-care).
     assign idu_fpu_ex1_fmau_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && ex1_func_r[FUNC_MAU_MUL];
+    // M5 Task 6: FDSU dispatch select, mirrors idu_iu_ex1_div_sel's own
+    // !iu_idu_div_full term (design doc D1's structural precedent) --
+    // without it this would keep pulsing while the held EX1 op waits out
+    // FPU.v's busy-flop FSM (ctrl_ex1_eu_full above is what actually holds
+    // the op resident in EX1; this term stops it from re-dispatching every
+    // one of those held cycles).
+    assign idu_fpu_ex1_fdsu_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
+                                  && (ex1_func_r[FUNC_FDSU_DIV] || ex1_func_r[FUNC_FDSU_SQRT])
+                                  && !fpu_idu_fdsu_full;
     assign idu_fpu_ex1_func      = ex1_func_r;
     assign idu_fpu_ex1_rm        = ex1_rm_r;
     assign idu_fpu_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};

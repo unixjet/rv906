@@ -397,6 +397,8 @@ module RVProc #(
     wire                     idu_fpu_ex1_fspu_sel;
     wire                     idu_fpu_ex1_fcnvt_sel;
     wire                     idu_fpu_ex1_fmau_sel;  // M5 Task 5
+    wire                     idu_fpu_ex1_fdsu_sel;  // M5 Task 6
+    wire                     fpu_idu_fdsu_full;     // M5 Task 6
     wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
     wire [2:0]               idu_fpu_ex1_rm;
     // M5 Task 4b: FPU destination-register pass-through (IDU decode ->
@@ -900,6 +902,8 @@ module RVProc #(
         .idu_fpu_ex1_fspu_sel    (idu_fpu_ex1_fspu_sel),
         .idu_fpu_ex1_fcnvt_sel   (idu_fpu_ex1_fcnvt_sel),
         .idu_fpu_ex1_fmau_sel    (idu_fpu_ex1_fmau_sel),
+        .idu_fpu_ex1_fdsu_sel    (idu_fpu_ex1_fdsu_sel),
+        .fpu_idu_fdsu_full       (fpu_idu_fdsu_full),
         .idu_fpu_ex1_func        (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm          (idu_fpu_ex1_rm),
         .idu_fpu_ex1_dst0_reg    (idu_fpu_ex1_dst0_reg),
@@ -1070,6 +1074,7 @@ module RVProc #(
         .idu_fpu_ex1_fspu_sel      (idu_fpu_ex1_fspu_sel),
         .idu_fpu_ex1_fcnvt_sel     (idu_fpu_ex1_fcnvt_sel),
         .idu_fpu_ex1_fmau_sel      (idu_fpu_ex1_fmau_sel),
+        .idu_fpu_ex1_fdsu_sel      (idu_fpu_ex1_fdsu_sel),
         .idu_fpu_ex1_func          (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm            (idu_fpu_ex1_rm),
         .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
@@ -1082,7 +1087,8 @@ module RVProc #(
         .fpu_rtu_ex1_falu_fflags   (fpu_rtu_ex1_falu_fflags),
         .fpu_rtu_ex1_falu_fvld     (fpu_rtu_ex1_falu_fvld),
         .fpu_rtu_ex1_falu_xvld     (fpu_rtu_ex1_falu_xvld),
-        .fpu_rtu_ex1_falu_preg     (fpu_rtu_ex1_falu_preg)
+        .fpu_rtu_ex1_falu_preg     (fpu_rtu_ex1_falu_preg),
+        .fpu_idu_fdsu_full         (fpu_idu_fdsu_full)
     );
 
     //=========================================================================
