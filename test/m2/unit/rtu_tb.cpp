@@ -118,6 +118,7 @@ static void tie_idle_inputs(void) {
     // FALU (M5 Task 4b: EX1-group rbus arbiter's 3rd leg + registered wbf0)
     dut->fpu_rtu_ex1_falu_fdata = 0;
     dut->fpu_rtu_ex1_falu_xdata = 0;
+    dut->fpu_rtu_ex1_falu_fflags = 0;   // M5 Task 8: no accrued flags
     dut->fpu_rtu_ex1_falu_fvld  = 0;
     dut->fpu_rtu_ex1_falu_xvld  = 0;
     dut->fpu_rtu_ex1_falu_preg  = 0;
@@ -869,6 +870,53 @@ static void test_wbf0_register(void) {
     test_result("T19 wbf0 registered writeback (M5 Task 4b): one-cycle delay, independent of xvld leg");
 }
 
+//-----------------------------------------------------------------------------
+// T20: M5 Task 8 -- the FPU joins the one-hot completion bus. An FP op
+// completing in EX1 (fvld OR xvld, FPU.v SECTION 13 -- both pulse only on
+// the cycle the result mux actually outputs, incl. FDSU's completion cycle)
+// must: (a) assert the pcgen trigger rtu_iu_ex1_cmplt the SAME cycle with
+// inst_len==1 (FP ops are always 32-bit; RVC has no F/D encodings),
+// (b) register into the EX1->EX2 retire packet -> rtu_cp0_inst_retire ONE
+// cycle later, and (c) carry the EX1-cycle flags onto the new
+// rtu_cp0_fflags/rtu_cp0_fs_dirty_updt outputs CSR.v consumes for the D7
+// sticky OR-in + mstatus.FS dirty.
+//-----------------------------------------------------------------------------
+static void test_fpu_cmplt_retire_heartbeat(void) {
+    // fvld leg (FRF-destined result).
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_fvld   = 1;
+    dut->fpu_rtu_ex1_falu_fflags = 0b01010;   // NX|DZ
+    dut->eval();
+    check(dut->rtu_iu_ex1_cmplt == 1, "FPU cmplt: pcgen trigger asserted same cycle as fvld");
+    check(dut->rtu_iu_ex1_inst_len == 1, "FPU cmplt: inst_len==1 (32-bit; no FP in RVC)");
+    check(!RTUP(dut)->dbg_onehot_violation, "FPU cmplt: single source, one-hot clean");
+    tick();
+    check(dut->rtu_cp0_inst_retire == 1,
+          "FPU cmplt: rtu_cp0_inst_retire fires ONE cycle later (EX2 retire packet)");
+    check(dut->rtu_cp0_fflags == 0b01010,
+          "FPU cmplt: rtu_cp0_fflags carries the EX1-cycle flags", dut->rtu_cp0_fflags, 0b01010);
+    check(dut->rtu_cp0_fs_dirty_updt == 1,
+          "FPU cmplt: rtu_cp0_fs_dirty_updt fires on retire (EX2)");
+    tie_idle_inputs();
+    tick();
+    check(dut->rtu_cp0_inst_retire == 0 && dut->rtu_cp0_fs_dirty_updt == 0,
+          "FPU cmplt: the retire pulse is one-cycle, clears when idle");
+
+    // xvld leg (GPR-destined fcmp/fclass) drives the same retire path.
+    tie_idle_inputs();
+    dut->fpu_rtu_ex1_falu_xvld   = 1;
+    dut->fpu_rtu_ex1_falu_fflags = 0b00100;   // OF
+    dut->eval();
+    check(dut->rtu_iu_ex1_cmplt == 1, "FPU cmplt: xvld alone also triggers pcgen");
+    check(dut->rtu_iu_ex1_inst_len == 1, "FPU cmplt: xvld completer also 32-bit");
+    tick();
+    check(dut->rtu_cp0_fs_dirty_updt == 1,
+          "FPU cmplt: xvld retire also pulses rtu_cp0_fs_dirty_updt");
+    check(dut->rtu_cp0_fflags == 0b00100,
+          "FPU cmplt: xvld retire also carries its flags", dut->rtu_cp0_fflags, 0b00100);
+    test_result("T20 FPU cmplt leg (M5 Task 8): fvld/xvld -> retire heartbeat + fflags/FS-dirty to CSR");
+}
+
 //=============================================================================
 // main
 //=============================================================================
@@ -899,6 +947,7 @@ int main(int argc, char **argv) {
     test_fwd_collision_mutation();
     test_falu_xvld_arbiter_leg();
     test_wbf0_register();
+    test_fpu_cmplt_retire_heartbeat();
 
     printf("[rtu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

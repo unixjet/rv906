@@ -154,6 +154,14 @@ module CSR #(
     // minstret's auto-increment (this file's header "KNOWN, DELIBERATE GAP"
     // note is discharged here; RTU.v exposes ex2_retire_vld, wired by RVProc).
     input  wire                     rtu_cp0_inst_retire,
+    // M5 Task 8 (D7): the retiring FP op's accrued flags + the
+    // FP-instruction-retire pulse, both EX2-registered in RTU.v (donor-
+    // named: aq_rtu_wb.v:268-269 feeds `rtu_cp0_fflags[_updt]`,
+    // aq_rtu_rbus.v:514-516 feeds `rtu_cp0_fs_dirty_updt`; consumed here
+    // exactly as the donor consumes them in aq_cp0_float_csr.v:234-238 and
+    // aq_cp0_trap_csr.v:562-569).
+    input  wire [4:0]               rtu_cp0_fflags,
+    input  wire                     rtu_cp0_fs_dirty_updt,
 
     //=========================================================================
     // CSR -> IFU/ICache/BPU : MHCR fan-out, replacing FetchSink's harness
@@ -1211,9 +1219,11 @@ module CSR #(
     // aq_cp0_regs.v:1101-1104) and the dirty-on-FP-CSR-write transition
     // (`fs_dirty_upd` below, consumed by SECTION MSTATUS's fs_field always
     // block; donor aq_cp0_trap_csr.v:562-569) are both wired here. The
-    // FP-instruction-retire OR-term (donor's `rtu_cp0_fs_dirty_updt`) is
-    // added at Task 4/8 once FP opcodes exist; today only an explicit CSR
-    // write can dirty FS.
+    // FP-instruction-retire terms -- `rtu_cp0_fflags` sticky-OR'd into
+    // fflags on retire (D7, donor aq_cp0_float_csr.v:234-238) and
+    // `rtu_cp0_fs_dirty_updt` OR'ed into `fs_dirty_upd` (the donor's own
+    // term in the same expression, aq_cp0_trap_csr.v:562) -- are wired
+    // since M5 Task 8.
     //=========================================================================
     reg [4:0] fflags_reg;
     reg [2:0] frm_reg;
@@ -1228,6 +1238,17 @@ module CSR #(
             fflags_reg <= csr_wdata[4:0];
         else if (fflags_local_en)
             fflags_reg <= csr_wdata[4:0];
+        // M5 Task 8 (D7): sticky OR-in of the retiring FP op's flags
+        // (donor aq_cp0_float_csr.v:234-238, `rtu_cp0_fflags_updt` arm).
+        // PRIORITY, per D7's explicit-instruction: this arm is LAST in the
+        // if-elsif chain, so an explicit csrw/csrs/csrc to fflags/fcsr in
+        // the SAME cycle as an FP-op retire wins over the accrual (the
+        // write is observed on top of, not clobbered by, it). In rv906's
+        // in-order single-issue pipe the two events almost never share a
+        // cycle anyway (the retire lands one cycle after the write's EX1),
+        // but the priority is documented in the RTL regardless.
+        else if (rtu_cp0_fs_dirty_updt)
+            fflags_reg <= fflags_reg | rtu_cp0_fflags;
     end
 
     always @(posedge clk or negedge rst_n) begin
@@ -1243,10 +1264,14 @@ module CSR #(
     wire [63:0] frm_value    = {61'b0, frm_reg};
     wire [63:0] fcsr_value   = {56'b0, frm_reg, fflags_reg};
 
-    // Clean/Initial -> Dirty on any FP-CSR write (donor fs_dirty_upd,
-    // aq_cp0_trap_csr.v:562-569); Off(00) and already-Dirty(11) are excluded
-    // exactly as the donor excludes them.
-    wire fs_dirty_upd = (fflags_local_en || frm_local_en || fcsr_local_en)
+    // Clean/Initial -> Dirty on ANY FP state change: an explicit FP-CSR
+    // write OR an FP-instruction retire (M5 Task 8 -- donor
+    // aq_cp0_trap_csr.v:562-569's fs_dirty_upd OR's
+    // rtu_cp0_fs_dirty_updt together with the local_en terms exactly this
+    // way). Off(00) and already-Dirty(11) are excluded exactly as the
+    // donor excludes them.
+    wire fs_dirty_upd = (fflags_local_en || frm_local_en || fcsr_local_en
+                       || rtu_cp0_fs_dirty_updt)
                      && (fs_field == 2'b01 || fs_field == 2'b10);
 
     //=========================================================================

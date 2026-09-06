@@ -50,6 +50,16 @@ static const uint32_t CSR_MIMPID    = 0xF13;
 static const uint32_t CSR_MHARTID   = 0xF14;
 static const uint32_t CSR_MXSTATUS  = 0x7C0;
 static const uint32_t CSR_MHCR      = 0x7C1;
+// M5 Task 1 (rvproc_pkg.sv:327-329) -- the FP CSR file.
+static const uint32_t CSR_FFLAGS    = 0x001;
+static const uint32_t CSR_FRM       = 0x002;
+static const uint32_t CSR_FCSR      = 0x003;
+
+// mstatus field bit positions used by the M5 FP tests (CSR.v layout):
+// [63]SD, [14:13]FS (00=Off,01=Clean,10=Initial,11=Dirty), [12:11]MPP.
+static const int MSTATUS_SD    = 63;
+static const int MSTATUS_FS_LO = 13;   // LSB of the 2-bit FS field [14:13]
+static const uint64_t MSTATUS_MPP_M = (3ULL << 11);   // keep MPP=M across mstatus writes
 
 // MHCR bit positions (rvproc_pkg.sv)
 static const int MHCR_IE_BIT   = 0;
@@ -101,6 +111,8 @@ static void tie_idle_inputs(void) {
     dut->rtu_yy_xx_flush        = 0;
     dut->rtu_cp0_epc            = 0;
     dut->rtu_cp0_tval           = 0;
+    dut->rtu_cp0_fflags         = 0;   // M5 Task 8: no FP-op accrual pending
+    dut->rtu_cp0_fs_dirty_updt  = 0;   // M5 Task 8: no FP-instruction retire
     dut->ifu_cp0_icache_inv_done= 0;
     dut->lsu_cp0_stb_empty      = 1;   // LSU quiescent so FENCE/FENCE.I complete
     dut->lsu_cp0_clean_done     = 0;
@@ -245,6 +257,20 @@ static DispatchResult tick_no_dispatch(void) {
     r.chgflw   = dut->cp0_rtu_ex1_chgflw != 0;
     tick();
     return r;
+}
+
+// M5 Task 8: stand in for RTU's EX2-registered FP-retire pulse (RTU.v's
+// ex2_fpu_retire/ex2_fpu_fflags, wired to these donor-named pins in
+// RVProc.v; donor aq_rtu_wb.v:268-269). One cycle: assert, commit the flop,
+// deassert. Used to simulate "an FP op retired this cycle" without a real
+// FPU in this bench's scope.
+static void fp_retire(uint32_t flags) {
+    dut->rtu_cp0_fflags        = flags & 0x1F;
+    dut->rtu_cp0_fs_dirty_updt = 1;
+    dut->eval();
+    tick();
+    dut->rtu_cp0_fs_dirty_updt = 0;
+    dut->rtu_cp0_fflags        = 0;
 }
 
 //=============================================================================
@@ -900,6 +926,168 @@ static void test_flush_suppresses_dispatch(void) {
 }
 
 //=============================================================================
+// M5 Task 1 (untested until now): fflags/frm/fcsr storage + FS Clean/
+// Initial -> Dirty on explicit FP-CSR write.
+// M5 Task 8 (D7): sticky OR-in accrual at FP-op retire + FS dirty on
+// FP-instruction retire alone + explicit-write-wins priority.
+//
+// NOTE ON ORDERING: T24a MUST run first (from a clean reset) -- it is the
+// OFF-path sanity check and must observe the FP state with the new
+// rtu_cp0_* inputs never driven. Every later T24* test sets up its own
+// mstatus.FS precondition, so their relative order is free.
+//=============================================================================
+
+static void test_fp_offpath_quiescent(void) {
+    // From reset, FS==Off(00), so the first legal FP-CSR touch is an
+    // mstatus write moving FS to Clean(01) (mstatus itself is not FP-gated).
+    // No rtu_cp0_* drive, no FP-CSR write: everything stays at reset.
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);   // FS=01, MPP=M
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 1,
+          "offpath: FS=Clean(01) written via mstatus");
+    for (int i = 0; i < 10; i++) tick_no_dispatch();
+    check(csr_read(CSR_FFLAGS) == 0, "offpath: fflags still 0 (no accrual pulse ever driven)");
+    check(csr_read(CSR_FRM) == 0, "offpath: frm still 0");
+    check(csr_read(CSR_FCSR) == 0, "offpath: fcsr still 0");
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 1,
+          "offpath: FS still Clean(01) -- no FP retire fired, no auto-dirty");
+    check((csr_read(CSR_MSTATUS) >> MSTATUS_SD) == 0,
+          "offpath: SD (mstatus[63]) still 0");
+    test_result("T24a M5 OFF-path: new rtu_cp0_* inputs at 0 leave fflags/frm/fcsr/FS at reset");
+}
+
+static void test_fcsr_rw_storage(void) {
+    // FS=Initial(10) so FP-CSR access is legal (FS==Off is illegal, T24c).
+    csr_write(CSR_MSTATUS, (2ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 2,
+          "setup: FS=Initial(10) written");
+
+    DispatchResult r = dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0x1, /*dst=*/1);
+    check(!r.expt_vld, "fflags csrrw: legal while FS!=Off (no illegal-instruction trap)");
+    check(csr_read(CSR_FFLAGS) == 0x1, "fflags: 0x1 (NX) stored verbatim",
+          csr_read(CSR_FFLAGS), 0x1);
+
+    dispatch(CP0_FUNC_CSRRW, CSR_FRM, 0x3, /*dst=*/0);   // RMM
+    check(csr_read(CSR_FRM) == 0x3, "frm: 0x3 (RMM) stored", csr_read(CSR_FRM), 0x3);
+
+    // An fcsr write updates BOTH fields at once (donor
+    // aq_cp0_float_csr.v: fcsr_local_en arm in each register's always block).
+    // fcsr = {frm[7:5], fflags[4:0]}: frm=RDN(2), fflags=NX(1) -> (2<<5)|1.
+    dispatch(CP0_FUNC_CSRRW, CSR_FCSR, (0x2ULL << 5) | 0x1, /*dst=*/0);
+    check(csr_read(CSR_FFLAGS) == 0x1, "fcsr write: fflags[4:0] updated (0x1)");
+    check(csr_read(CSR_FRM) == 0x2, "fcsr write: frm[7:5] updated (RDN=2)");
+    check(csr_read(CSR_FCSR) == 0x41, "fcsr readback == {frm,fflags} == 0x41",
+          csr_read(CSR_FCSR), 0x41);
+    test_result("T24b fflags/frm/fcsr: basic R/W storage; fcsr write updates both fields");
+}
+
+static void test_fs_dirty_on_csr_write(void) {
+    // Clean -> Dirty on an explicit FP-CSR write (donor fs_dirty_upd,
+    // aq_cp0_trap_csr.v:562-569) + SD aggregation into mstatus[63].
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);   // FS=Clean(01)
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 1, "setup: FS=Clean(01)");
+    dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0x0, /*dst=*/0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: Clean(01)->Dirty(11) on explicit fflags write");
+    check((csr_read(CSR_MSTATUS) >> MSTATUS_SD) == 1,
+          "sd: mstatus[63]==1 once FS is Dirty");
+
+    // An frm write dirties too.
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);   // back to Clean
+    dispatch(CP0_FUNC_CSRRW, CSR_FRM, 0x0, /*dst=*/0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: Clean->Dirty on frm write");
+
+    // FS==Off: any FP-CSR access is illegal (M5 Task 1 gating, donor
+    // aq_cp0_regs.v:1101-1104) and must neither reach storage nor dirty FS.
+    csr_write(CSR_MSTATUS, MSTATUS_MPP_M);                            // FS=Off(00)
+    DispatchResult r = dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0x4, /*dst=*/0);
+    check(r.expt_vld && r.expt_vec == 2,
+          "fs off: fflags write traps illegal instruction (vec 2)", r.expt_vec, 2);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 0,
+          "fs off: FS stays Off(00)");
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);  // Clean, un-gate reads
+    check(csr_read(CSR_FFLAGS) == 0x0,
+          "fs off: the illegal write never reached storage (fflags still 0)");
+    test_result("T24c mstatus.FS: Clean->Dirty on FP-CSR write, SD aggregates, FS-off access illegal");
+}
+
+static void test_fflags_accrual_sticky(void) {
+    // D7: on FP-op retire, fflags <= fflags | retired_fflags (sticky OR,
+    // donor aq_cp0_float_csr.v:234-238). Two back-to-back accruals with
+    // disjoint flag patterns must ACCUMULATE, not overwrite.
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);  // FS=Clean(01)
+    dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0x0, /*dst=*/0);            // known start: 0
+    check(csr_read(CSR_FFLAGS) == 0, "accrual setup: fflags cleared to 0");
+
+    fp_retire(0b01000);   // FP op #1 retires with NX
+    check(csr_read(CSR_FFLAGS) == 0b01000,
+          "accrual 1: fflags == 0 (pre) | 0x8 (retired) == 0x8",
+          csr_read(CSR_FFLAGS), 0b01000);
+
+    fp_retire(0b00100);   // FP op #2 retires with OF, back-to-back
+    check(csr_read(CSR_FFLAGS) == 0b01100,
+          "accrual 2: 0x8 | 0x4 -- sticky OR accumulates (not overwrite)",
+          csr_read(CSR_FFLAGS), 0b01100);
+    test_result("T24d fflags accrual: sticky OR-in at retire (two back-to-back FP retires)");
+}
+
+static void test_fs_dirty_on_fp_retire(void) {
+    // The "FS dirty wiring" half: an FP-instruction retire ALONE (no
+    // fflags/frm/fcsr write at all) drives Clean/Initial -> Dirty,
+    // including the SD aggregation.
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);  // FS=Clean(01)
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 1, "setup: FS=Clean(01)");
+    fp_retire(0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: Clean(01)->Dirty(11) on FP-instruction retire alone (no CSR write)");
+    check((csr_read(CSR_MSTATUS) >> MSTATUS_SD) == 1,
+          "sd: mstatus[63]==1 after the retire dirties FS");
+
+    // Initial(10) transitions too.
+    csr_write(CSR_MSTATUS, (2ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);  // FS=Initial(10)
+    fp_retire(0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: Initial(10)->Dirty(11) on retire too");
+
+    // Already-Dirty(11) stays Dirty; Off(00) is NEVER auto-dirtied
+    // (donor's fs==2'b11 / fs==2'b00 exclusion, aq_cp0_trap_csr.v:562-569).
+    fp_retire(0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: already-Dirty(11) stays Dirty on further retires");
+    csr_write(CSR_MSTATUS, MSTATUS_MPP_M);                          // FS=Off(00)
+    fp_retire(0);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 0,
+          "fs: Off(00) excluded -- a retire cannot auto-dirty it");
+    // (Architecturally an FP op cannot complete while FS==Off -- every FP
+    // opcode traps illegal first -- but the RTL exclusion matches the
+    // donor and is pinned here.)
+    test_result("T24e mstatus.FS: FP-instruction retire alone drives Clean/Initial->Dirty, Off excluded");
+}
+
+static void test_fflags_explicit_write_wins(void) {
+    // D7 priority: an explicit csrw to fflags in the SAME cycle as a
+    // retiring FP op's accrual must WIN (the fflags always block's
+    // if-elsif order puts the accrual arm last).
+    csr_write(CSR_MSTATUS, (1ULL << MSTATUS_FS_LO) | MSTATUS_MPP_M);  // FS=Clean(01)
+    dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0b01010, /*dst=*/0);        // pre: 0x5
+    check(csr_read(CSR_FFLAGS) == 0b01010, "setup: fflags pre-armed at 0x5");
+
+    // Same cycle: explicit csrrw fflags=0x2 AND a retire carrying 0x4.
+    dut->rtu_cp0_fflags        = 0b00100;
+    dut->rtu_cp0_fs_dirty_updt = 1;
+    dispatch(CP0_FUNC_CSRRW, CSR_FFLAGS, 0b00010, /*dst=*/0);
+    dut->rtu_cp0_fs_dirty_updt = 0;
+    dut->rtu_cp0_fflags        = 0;
+
+    check(csr_read(CSR_FFLAGS) == 0b00010,
+          "explicit write wins: result == written 0x2, NOT (0x5|0x4)=0x7 (accrual arm lost)",
+          csr_read(CSR_FFLAGS), 0b00010);
+    check(((csr_read(CSR_MSTATUS) >> MSTATUS_FS_LO) & 3) == 3,
+          "fs: dirty either way (the explicit write OR the retire both qualify)");
+    test_result("T24f fflags D7 priority: explicit same-cycle csrw beats the accrual OR-in");
+}
+
+//=============================================================================
 // Mutation-check discipline note (plan task 2.2): the mutation itself is
 // applied by hand to rtl/CSR.v (NOT left as code here), the bench re-run to
 // confirm a FAIL, then the mutation reverted before committing -- the same
@@ -919,6 +1107,9 @@ int main(int argc, char **argv) {
     reset_dut();
 
     test_reset_state();
+    // M5 Task 8: OFF-path sanity check -- must run before any test that
+    // drives the new rtu_cp0_* pins or touches the FP CSR state.
+    test_fp_offpath_quiescent();
     test_misa_and_ids_readonly();
     test_csrrw_rmw();
     test_csrrs_rmw();
@@ -946,6 +1137,13 @@ int main(int argc, char **argv) {
     test_mcycle_free_running();
     test_minstret_rw_no_spurious_increment();
     test_flush_suppresses_dispatch();
+
+    // M5 Task 1/8: FP CSR storage + FS dirty tracking + fflags accrual.
+    test_fcsr_rw_storage();
+    test_fs_dirty_on_csr_write();
+    test_fflags_accrual_sticky();
+    test_fs_dirty_on_fp_retire();
+    test_fflags_explicit_write_wins();
 
     printf("[csr_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

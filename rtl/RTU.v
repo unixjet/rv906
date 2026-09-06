@@ -296,6 +296,9 @@ module RTU (
     //=========================================================================
     input  wire [63:0]              fpu_rtu_ex1_falu_fdata,
     input  wire [63:0]              fpu_rtu_ex1_falu_xdata,
+    // M5 Task 8: the retiring FP op's accrued flags (donor-named family
+    // aq_rtu_wb.v:268-269), sampled into the EX2 retire packet below.
+    input  wire [4:0]               fpu_rtu_ex1_falu_fflags,
     input  wire                     fpu_rtu_ex1_falu_fvld,
     input  wire                     fpu_rtu_ex1_falu_xvld,
     input  wire [GPR_IDX_WIDTH-1:0] fpu_rtu_ex1_falu_preg,
@@ -317,6 +320,15 @@ module RTU (
     // high across residency (header note), acceptable for M4 (no test checks
     // exact per-DIV counts).
     output wire                     rtu_cp0_inst_retire,
+    // M5 Task 8 (D7): the retiring FP op's accrued flags, and the
+    // FP-instruction-retire pulse that dirties mstatus.FS in CSR.v. Both
+    // EX2-registered (SECTION EX1->EX2 RETIRE REGISTER below) and donor-
+    // named: aq_rtu_wb.v:268-269 (`rtu_cp0_fflags[_updt]` off the VPU's
+    // writeback) and aq_rtu_rbus.v:514-516 (`rtu_cp0_fs_dirty_updt` off
+    // `vpu_rtu_ex1_fp_dirty && vpu_rtu_ex1_cmplt`). rv906 has no VPU; the
+    // FPU cluster's fvld/xvld completion qualifier stands in for both.
+    output wire [4:0]               rtu_cp0_fflags,
+    output wire                     rtu_cp0_fs_dirty_updt,
 
     //=========================================================================
     // RTU -> IFU : redirect target + FE-kill pulse. Reused UNCHANGED from
@@ -379,8 +391,9 @@ module RTU (
 
     //=========================================================================
     // SECTION ONE-HOT COMPLETION BUS (task 4.1, RTU note S2 -- aq_rtu_dp.v
-    // :318-326) -- `{alu,mul,bju,div,lsu,cp0,vec}_cmplt_dp`, vec tied 0 (no
-    // VPU in M2), OR'd into the single un-skidded EX1->EX2 retire enable.
+    // :318-326) -- `{alu,mul,bju,div,lsu,cp0,vec,fpu}_cmplt_dp`, vec tied 0
+    // (no VPU: D3, no vector extension), OR'd into the single un-skidded
+    // EX1->EX2 retire enable.
     //=========================================================================
     wire ex1_alu_cmplt_dp = iu_rtu_ex1_alu_cmplt_dp;
     wire ex1_mul_cmplt_dp = iu_rtu_ex1_mul_cmplt_dp;
@@ -388,11 +401,20 @@ module RTU (
     wire ex1_div_cmplt_dp = iu_rtu_ex1_div_cmplt_dp;
     wire ex1_lsu_cmplt_dp = lsu_rtu_ex1_cmplt_dp;
     wire ex1_cp0_cmplt_dp = cp0_rtu_ex1_cmplt_dp;
-    wire ex1_vec_cmplt_dp = 1'b0;   // no VPU in M2
+    wire ex1_vec_cmplt_dp = 1'b0;   // no VPU (D3: no vector extension)
+    // M5 Task 8: the FPU's completion leg. fvld (FRF-destined result) OR
+    // xvld (GPR-destined result) is exactly "an FP op completed in EX1 this
+    // cycle": FPU.v SECTION 13 asserts both only on the cycle its result
+    // mux actually outputs the answer, including FDSU's multi-cycle case
+    // (fdsu_cmplt_now, the real completion cycle, not dispatch). No donor
+    // precedent for a separate scalar-FP leg -- the donor rides FP on its
+    // vec (VPU) leg (aq_rtu_dp.v:307,325); rv906 has no VPU and a separate
+    // FPU cluster (D1), so this is the new 8th leg.
+    wire ex1_fpu_cmplt_dp = fpu_rtu_ex1_falu_fvld || fpu_rtu_ex1_falu_xvld;
 
-    wire [6:0] dp_cmplt_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_dp,
+    wire [7:0] dp_cmplt_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_dp,
                                    ex1_div_cmplt_dp, ex1_lsu_cmplt_dp, ex1_cp0_cmplt_dp,
-                                   ex1_vec_cmplt_dp};
+                                   ex1_vec_cmplt_dp, ex1_fpu_cmplt_dp};
     wire dp_ex1_cmplt_dp = |dp_cmplt_source;
 
     //=========================================================================
@@ -401,15 +423,18 @@ module RTU (
     // (aq_rtu_dp.v:344-379,537; aq_rtu_ctrl.v:148-156,240) muxes the
     // completing EU's inst_len/inst_split off this same one-hot vector and
     // ORs the completion terms for the pcgen trigger. Bit order matches the
-    // concatenation above: {alu,mul,bju,div,lsu,cp0,vec} = bits {6..0}.
+    // concatenation above: {alu,mul,bju,div,lsu,cp0,vec,fpu} = bits {7..0}
+    // (M5 Task 8 widened the vector to 8 bits; the existing seven legs keep
+    // their old positions, FPU takes the new LSB).
     //=========================================================================
-    localparam [6:0] CBUS_ALU_SEL = 7'b1000000;
-    localparam [6:0] CBUS_MUL_SEL = 7'b0100000;
-    localparam [6:0] CBUS_BJU_SEL = 7'b0010000;
-    localparam [6:0] CBUS_DIV_SEL = 7'b0001000;
-    localparam [6:0] CBUS_LSU_SEL = 7'b0000100;
-    localparam [6:0] CBUS_CP0_SEL = 7'b0000010;
-    localparam [6:0] CBUS_VEC_SEL = 7'b0000001;
+    localparam [7:0] CBUS_ALU_SEL = 8'b10000000;
+    localparam [7:0] CBUS_MUL_SEL = 8'b01000000;
+    localparam [7:0] CBUS_BJU_SEL = 8'b00100000;
+    localparam [7:0] CBUS_DIV_SEL = 8'b00010000;
+    localparam [7:0] CBUS_LSU_SEL = 8'b00001000;
+    localparam [7:0] CBUS_CP0_SEL = 8'b00000100;
+    localparam [7:0] CBUS_VEC_SEL = 8'b00000010;
+    localparam [7:0] CBUS_FPU_SEL = 8'b00000001;
 
     // The donor's pcgen trigger is NOT the retire completion: aq_rtu_ctrl.v
     // :151-157 builds a SEPARATE `ctrl_ex1_cmplt_for_pcgen` whose LSU arm is
@@ -427,16 +452,22 @@ module RTU (
     // the pass value. Task 9.7 fix: OR the early for-pcgen arm here.
     wire ex1_lsu_cmplt_for_pcgen = lsu_rtu_ex1_cmplt_for_pcgen;
     wire ex1_bju_cmplt_for_pcgen = iu_rtu_ex1_bju_cmplt_for_pcgen;
+    // M5 Task 8: FPU has no early/late split -- fvld/xvld fire on the same
+    // EX1 cycle as the result (single-cycle units; FDSU's iterative span is
+    // resolved by its own fdsu_cmplt_now), so its for-pcgen arm is its `_dp`
+    // flavor itself, exactly like the ALU's.
     wire dp_ex1_cmplt_for_pcgen  = ex1_alu_cmplt_dp  || ex1_mul_cmplt_dp
                                   || ex1_bju_cmplt_for_pcgen || ex1_div_cmplt_dp
                                   || ex1_lsu_cmplt_for_pcgen || ex1_cp0_cmplt_dp
-                                  || ex1_vec_cmplt_dp;
+                                  || ex1_vec_cmplt_dp || ex1_fpu_cmplt_dp;
     assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_for_pcgen;
 
     // rtu_iu_ex1_inst_len = the COMPLETING instruction's length, muxed by
     // the completing EU (donor aq_rtu_dp.v:350-379). ALU/BJU/LSU/CP0 carry
     // real RVC-aware lengths; MULT/DIV/VEC are 32-bit-only in M2 (no 16-bit
-    // form in the RVC decoder) so they fall to the 1'b1 default.
+    // form in the RVC decoder) and FPU is always 32-bit (the RVC extension
+    // contains no F/D encodings) so they all resolve to the 1'b1 (32-bit)
+    // value -- FPU via its own CBUS_FPU_SEL arm, the rest via the default.
     //
     // The select vector MUST be the same early/late flavor as the pcgen
     // TRIGGER (dp_ex1_cmplt_for_pcgen) above, not the retire-late
@@ -453,9 +484,9 @@ module RTU (
     // HBDBG showed the LSU fully idle while IFU relooped forever on one
     // PC, hit=1/pf=0 every fetch -- i.e. the front end, not the LSU, had
     // desynced).
-    wire [6:0] pcgen_len_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_for_pcgen,
+    wire [7:0] pcgen_len_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_for_pcgen,
                                     ex1_div_cmplt_dp, ex1_lsu_cmplt_for_pcgen, ex1_cp0_cmplt_dp,
-                                    ex1_vec_cmplt_dp};
+                                    ex1_vec_cmplt_dp, ex1_fpu_cmplt_dp};
     reg rtu_iu_ex1_inst_len_r;
     always @* begin
         case (pcgen_len_source)
@@ -463,6 +494,7 @@ module RTU (
             CBUS_BJU_SEL: rtu_iu_ex1_inst_len_r = iu_rtu_ex1_bju_inst_len;
             CBUS_LSU_SEL: rtu_iu_ex1_inst_len_r = lsu_rtu_ex1_inst_len;
             CBUS_CP0_SEL: rtu_iu_ex1_inst_len_r = cp0_rtu_ex1_inst_len;
+            CBUS_FPU_SEL: rtu_iu_ex1_inst_len_r = 1'b1;   // FPU: 32-bit (M5 Task 8)
             default:      rtu_iu_ex1_inst_len_r = 1'b1;   // MULT/DIV/VEC: 32-bit
         endcase
     end
@@ -497,7 +529,7 @@ module RTU (
     // it directly, per the task's explicit instruction.
     //=========================================================================
     wire dbg_onehot_violation /* verilator public */;
-    assign dbg_onehot_violation = |(dp_cmplt_source & (dp_cmplt_source - 7'd1));
+    assign dbg_onehot_violation = |(dp_cmplt_source & (dp_cmplt_source - 8'd1));
 
     //=========================================================================
     // SECTION RBUS ARBITER (task 4.1, RTU note S3 -- aq_rtu_rbus.v) -- EX1
@@ -665,6 +697,17 @@ module RTU (
     reg [4:0]  ex2_expt_vec;
     reg [63:0] ex2_tval;
     reg        ex2_inst_chgflw;
+    // M5 Task 8: the retiring instruction's FP-ness + its accrued flags,
+    // riding the SAME unconditional register stage as the rest of the
+    // retire packet. `ex2_fpu_retire` (the donor's `rtu_cp0_fs_dirty_updt`)
+    // is the FP-instruction-retire pulse CSR.v needs to dirty mstatus.FS;
+    // `ex2_fpu_fflags` (the donor's `rtu_cp0_fflags`) is the value OR'ed
+    // into fflags on that same retire cycle (D7 sticky accrual). Latching
+    // both off the same EX1-cycle qualifiers keeps the two CSR-side effects
+    // exactly paired, and unconditional latching matches every other field
+    // here (see the section header: consumers qualify on the vld bit).
+    reg        ex2_fpu_retire;
+    reg [4:0]  ex2_fpu_fflags;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -675,6 +718,8 @@ module RTU (
             ex2_expt_vec    <= 5'd0;
             ex2_tval        <= 64'd0;
             ex2_inst_chgflw <= 1'b0;
+            ex2_fpu_retire  <= 1'b0;
+            ex2_fpu_fflags  <= 5'd0;
         end else begin
             ex2_retire_vld  <= dp_ex1_cmplt_dp;
             ex2_cur_pc      <= iu_rtu_ex1_cur_pc;
@@ -683,6 +728,8 @@ module RTU (
             ex2_expt_vec    <= ex1_expt_vec;
             ex2_tval        <= ex1_tval;
             ex2_inst_chgflw <= ex1_inst_chgflw;
+            ex2_fpu_retire  <= ex1_fpu_cmplt_dp;
+            ex2_fpu_fflags  <= fpu_rtu_ex1_falu_fflags;
         end
     end
 
@@ -1002,6 +1049,12 @@ module RTU (
     assign rtu_cp0_epc  = retire_trap_epc;
     assign rtu_cp0_tval = retire_trap_tval;
     assign rtu_cp0_inst_retire = ex2_retire_vld;
+
+    // M5 Task 8 (D7): off the EX2 retire packet above -- CSR.v OR's
+    // rtu_cp0_fflags into fflags and takes rtu_cp0_fs_dirty_updt as its
+    // FP-instruction-retire FS-dirty source (SECTION FP CSR STATE there).
+    assign rtu_cp0_fflags        = ex2_fpu_fflags;
+    assign rtu_cp0_fs_dirty_updt = ex2_fpu_retire;
 
     assign rtu_ifu_chgflw_vld = retire_chgflw_vld;
     assign rtu_ifu_chgflw_pc  = retire_chgflw_pc;

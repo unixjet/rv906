@@ -530,6 +530,9 @@ module RVProc #(
     wire [PC_WIDTH-1:0]      rtu_cp0_epc;
     wire [63:0]              rtu_cp0_tval;
     wire                     rtu_cp0_inst_retire;   // M4 Task 1: minstret inc
+    // M5 Task 8: FP-op retire -> CSR fflags sticky OR-in + mstatus.FS dirty
+    wire [4:0]               rtu_cp0_fflags;
+    wire                     rtu_cp0_fs_dirty_updt;
 
     //=========================================================================
     // RTU <-> IDU : the exclusive bypass network (fwd0/1/2 + wb0/1, IDU
@@ -1306,6 +1309,7 @@ module RVProc #(
 
         .fpu_rtu_ex1_falu_fdata  (fpu_rtu_ex1_falu_fdata),
         .fpu_rtu_ex1_falu_xdata  (fpu_rtu_ex1_falu_xdata),
+        .fpu_rtu_ex1_falu_fflags (fpu_rtu_ex1_falu_fflags),
         .fpu_rtu_ex1_falu_fvld   (fpu_rtu_ex1_falu_fvld),
         .fpu_rtu_ex1_falu_xvld   (fpu_rtu_ex1_falu_xvld),
         .fpu_rtu_ex1_falu_preg   (fpu_rtu_ex1_falu_preg),
@@ -1319,6 +1323,8 @@ module RVProc #(
         .rtu_cp0_epc             (rtu_cp0_epc),
         .rtu_cp0_tval            (rtu_cp0_tval),
         .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
+        .rtu_cp0_fflags          (rtu_cp0_fflags),
+        .rtu_cp0_fs_dirty_updt   (rtu_cp0_fs_dirty_updt),
 
         .rtu_ifu_chgflw_vld      (rtu_ifu_chgflw_vld),
         .rtu_ifu_chgflw_pc       (rtu_ifu_chgflw_pc),
@@ -1404,6 +1410,8 @@ module RVProc #(
         .rtu_cp0_epc             (rtu_cp0_epc),
         .rtu_cp0_tval            (rtu_cp0_tval),
         .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
+        .rtu_cp0_fflags          (rtu_cp0_fflags),
+        .rtu_cp0_fs_dirty_updt   (rtu_cp0_fs_dirty_updt),
 
         .cp0_ifu_icache_en       (cp0_ifu_icache_en),
         .cp0_ifu_iwpe            (cp0_ifu_iwpe),
