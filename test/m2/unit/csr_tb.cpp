@@ -308,8 +308,8 @@ static void test_reset_state(void) {
 
 static void test_misa_and_ids_readonly(void) {
     uint64_t misa_before = csr_read(CSR_MISA);
-    check(misa_before == 0x8000000000001104ULL,
-          "misa: MXL=64,I|M|C == 0x8000000000001104", misa_before, 0x8000000000001104ULL);
+    check(misa_before == 0x800000000000112CULL,
+          "misa: MXL=64,I|M|C|F|D == 0x800000000000112C (F/D set by THE SWAP, M5 Task 9)", misa_before, 0x800000000000112CULL);
     csr_write(CSR_MISA, 0xFFFFFFFFFFFFFFFFULL);
     check(csr_read(CSR_MISA) == misa_before, "misa: write is ignored (RO)");
 

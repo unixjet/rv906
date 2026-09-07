@@ -564,8 +564,8 @@ module RTU (
     // dispatch, same discipline as the donor's 2-leg merge
     // (aq_rtu_rbus.v:372-407); the FALU leg has no donor precedent (FP is a
     // new EU not present in the donor's rbus scheme as adapted here) and is
-    // provably dead pre-Task-9 (misa.F/D=0 keeps d32_illegal=1 for every
-    // OP-FP arm, so ex1_eu_r[EU_FP_SEL] can never be true).
+    // live as of THE SWAP (M5 Task 9): legal FP encodings dispatch to EU_FP,
+    // so ex1_eu_r[EU_FP_SEL] can now be true and the FALU leg can win.
     wire [2:0] ex1_wb_src_vld = {fpu_rtu_ex1_falu_xvld, ex1_fwd_vld, cp0_rtu_ex1_wb_vld};
     reg  [GPR_IDX_WIDTH-1:0] ex1_wb_preg;
     reg  [63:0]              ex1_wb_data;

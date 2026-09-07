@@ -123,8 +123,8 @@ ELFS        = $(RV64UI_ELFS) $(RV64UM_ELFS) $(RV64UC_ELFS) $(RV64UA_ELFS)
 # THE -march STRING IS THE ONLY THING THAT DIFFERS BETWEEN THE TWO GROUPS:
 #
 #   MARCH      rv64im_zicsr_zifencei    -- the 67 UPSTREAM tests
-#     NOT upstream's rv64g: rv906 is RV64IMC + Zicsr only (misa =
-#     0x8000000000101104 -- I, M, C), there is no A/F/D hardware, and the
+#     NOT upstream's rv64g: rv906 is RV64IMC + Zicsr (+ F/D since the M5
+#     swap; misa now reports I|M|C|F|D = 0x800000000000112C), and the
 #     tests themselves are pure I/M sources. zifencei is required because
 #     rv64ui-p-fence_i executes `fence.i`, which since binutils' split of the
 #     base ISA is no longer part of plain `i`. `c` is left OUT so that the

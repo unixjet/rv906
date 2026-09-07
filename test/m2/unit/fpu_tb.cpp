@@ -11,9 +11,9 @@
 // float only, no int<->float) -- plus Task 5's FMAU (fmul/fmadd/fmsub/
 // fnmadd/fnmsub, single-cycle EX1 handshake per M5 design doc D1). This is
 // a white-box bench of FPU.v's own documented contract (see FPU.v's header
-// D1/D-TASK3-1/2/3), not a RISC-V compliance suite -- rv64uf/ud coverage
-// lands once IDU decode routes to this module (Task 4/5) and the ISA swap
-// flips misa.F/D (Task 9).
+// D1/D-TASK3-1/2/3), not a RISC-V compliance suite -- IDU decode already
+// routes to this module and the ISA swap has flipped misa.F/D (Task 9), so
+// full rv64uf/ud coverage lands with the test/m5 infra (Task 10/11).
 //
 // ORACLE: the host x86-64 FPU's native `double`/`float` arithmetic IS an
 // IEEE-754 binary64/binary32 implementation defaulting to round-to-nearest-

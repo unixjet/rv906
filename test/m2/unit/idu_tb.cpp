@@ -238,6 +238,16 @@ static uint32_t flw_(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm,
 static uint32_t fld_(uint32_t rd, uint32_t rs1, int32_t imm) { return enc_i(imm, rs1, 0x3, rd, OP_LOAD_FP); }
 static uint32_t fsw_(uint32_t rs2, uint32_t rs1, int32_t imm) { return enc_s(imm, rs2, rs1, 0x2, OP_STORE_FP); }
 static uint32_t fsd_(uint32_t rs2, uint32_t rs1, int32_t imm) { return enc_s(imm, rs2, rs1, 0x3, OP_STORE_FP); }
+// M5 Task 5/6/7: remaining OP-FP families (FMAU/FDSU/fcvt-int/fmv). funct7
+// values pinned to IDU.v's decode arms; FMA major opcode is 10000 (R4).
+static uint32_t fmul_s(uint32_t rm)   { return enc_r(0x08, 2, 1, rm, 5, OP_FP); } // 0001000
+static uint32_t fdiv_s(uint32_t rm)   { return enc_r(0x0C, 2, 1, rm, 5, OP_FP); } // 0001100
+static uint32_t fsqrt_s(void)         { return enc_r(0x2C, 2, 1, 0x0, 5, OP_FP); } // 0101100
+static uint32_t fmadd_s(void)         { return enc_r(0x08, 2, 1, 0x0, 5, 0x43u); } // rs3=2,fmt=0,op=10000(+2'b11)
+static uint32_t fcvt_w_s(void)        { return enc_r(0x60, 0, 1, 0x0, 5, OP_FP); } // 1100000 (f2i)
+static uint32_t fcvt_s_w(uint32_t rm) { return enc_r(0x68, 0, 1, rm, 5, OP_FP); }  // 1101000 (i2f)
+static uint32_t fmv_x_w(void)         { return enc_r(0x70, 0, 1, 0x0, 5, OP_FP); } // 1110000
+static uint32_t fmv_w_x(void)         { return enc_r(0x78, 0, 1, 0x0, 5, OP_FP); } // 1111000
 static uint32_t vec_add(void) { return enc_r(0x00, 1, 2, 0x7, 5, OP_VEC); }
 static uint32_t custom0(void) { return enc_r(0x00, 1, 2, 0x1, 5, OP_CUSTOM0); }
 
@@ -432,7 +442,9 @@ static void test_decode_32bit_fence_ecall(void) {
 static void test_illegal_closed_list(void) {
     reset_dut();
     present(fp_add()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1, "FP op-fp: illegal");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_cp0_ex1_sel == 0
+          && dut->idu_fpu_ex1_fadd_sel == 1,
+          "FP fadd.s: now legal, dispatches to EU_FP (THE SWAP, M5 Task 9)");
 
     present(vec_add()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "vector op: illegal");
@@ -472,7 +484,7 @@ static void test_illegal_closed_list(void) {
     // reserved-encoding malformed ecall (rs1 != 0)
     present(enc_i(0, 5, 0x0, 0, OP_SYSTEM)); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "ecall with rs1!=0: illegal (malformed)");
-    test_result("T10 illegal decode closed list: FP/vector/custom/dret trap; sfence/sret/wfi legal (M4), AMO legal (M3)");
+    test_result("T10 illegal decode closed list: vector/custom/dret trap (FP now legal, M5 swap); sfence/sret/wfi legal (M4), AMO legal (M3)");
 }
 
 // ---- M4 Task 6: IFU->IDU fetch-fault channel forces EU_CP0 dispatch ----
@@ -499,40 +511,42 @@ static void test_fetch_fault_forces_cp0(void) {
     test_result("T10b fetch-fault channel: ifu_idu_id_fault_{pgflt,accflt} force EU_CP0 dispatch and latch through EX1");
 }
 
-// ---- M5 Task 4a: OP-FP compare/classify decode arms. Hardwired illegal
-// (misa.F/D=0 pre-swap) means dis_eu_final forces EU_CP0 dispatch for all
-// of these -- fadd_sel/fspu_sel/fcnvt_sel (gated on ex1_eu_r[EU_FP_SEL])
-// must stay 0 even though the func bits decode correctly (ex1_func_r is
-// NOT illegal-gated, unlike ex1_eu_r -- see IDU.v dis_eu_final). ----
+// ---- M5 Task 4a: OP-FP compare/classify decode arms. Live as of THE SWAP
+// (M5 Task 9): these now decode legal (d32_illegal=0) and dispatch to
+// EU_FP, so the func bits drive fadd_sel (compare arms) / fspu_sel
+// (fclass) -- gated on ex1_eu_r[EU_FP_SEL], which now sets. ex1_func_r is
+// not illegal-gated, so the func bits were always correct; what the swap
+// flips is ex1_eu_r (see IDU.v dis_eu_final). ----
 static void test_fp_cmp_class_decode(void) {
     reset_dut();
     present(feq_s()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1,
-          "feq.s: illegal pre-swap, dispatches to CP0");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_cp0_ex1_sel == 0
+          && dut->idu_fpu_ex1_fadd_sel == 1,
+          "feq.s: legal, dispatches to EU_FP (fadd_sel fires) -- THE SWAP");
     check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CMP_FEQ_BIT) & 1) == 1,
-          "feq.s: FUNC_CMP+FUNC_CMP_FEQ bits set despite illegal gating");
-    check(dut->idu_fpu_ex1_fadd_sel == 0 && dut->idu_fpu_ex1_fspu_sel == 0,
-          "feq.s: fadd_sel/fspu_sel stay 0 (ex1_eu_r forced to EU_CP0, not EU_FP)");
+          "feq.s: FUNC_CMP+FUNC_CMP_FEQ bits set");
+    check(dut->idu_fpu_ex1_fspu_sel == 0,
+          "feq.s: fspu_sel stays 0 (FUNC_CMP is an fadd_sel-group op, not fspu)");
     check(dut->idu_cp0_ex1_dst0_reg == 5, "feq.s: dst0_reg == rd (GPR dest, xvld-class default path)");
 
     reset_dut();
     present(flt_s()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "flt.s: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fadd_sel == 1, "flt.s: legal, dispatches to EU_FP (THE SWAP)");
     check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LT_BIT) & 1) == 1,
           "flt.s: FUNC_CMP+FUNC_CMP_LT bits set");
 
     reset_dut();
     present(fle_s()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "fle.s: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fadd_sel == 1, "fle.s: legal, dispatches to EU_FP (THE SWAP)");
     check(((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CMP_LE_BIT) & 1) == 1,
           "fle.s: FUNC_CMP+FUNC_CMP_LE bits set");
 
     reset_dut();
     present(feq_d()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "feq.d: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fadd_sel == 1, "feq.d: legal, dispatches to EU_FP (THE SWAP)");
     check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CMP_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CMP_FEQ_BIT) & 1) == 1,
@@ -554,11 +568,11 @@ static void test_fp_cmp_class_decode(void) {
 
     reset_dut();
     present(fclass_s()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "fclass.s: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0, "fclass.s: legal (THE SWAP)");
     check(((dut->idu_fpu_ex1_func >> FUNC_CLASS_BIT) & 1) == 1,
           "fclass.s: FUNC_CLASS bit set");
-    check(dut->idu_fpu_ex1_fspu_sel == 0,
-          "fclass.s: fspu_sel stays 0 despite FUNC_CLASS set (ex1_eu_r forced to EU_CP0)");
+    check(dut->idu_fpu_ex1_fspu_sel == 1,
+          "fclass.s: fspu_sel fires (FUNC_CLASS, EU_FP live -- THE SWAP)");
     check(dut->idu_cp0_ex1_dst0_reg == 5, "fclass.s: dst0_reg == rd (GPR dest, xvld-class default path)");
 
     reset_dut();
@@ -566,29 +580,28 @@ static void test_fp_cmp_class_decode(void) {
     check(((dut->idu_fpu_ex1_func >> FUNC_DOUBLE_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CLASS_BIT) & 1) == 1,
           "fclass.d: FUNC_DOUBLE+FUNC_CLASS bits set");
-    test_result("T10c OP-FP compare/classify decode (M5 Task 4a): func bits correct, dead-wired pre-Task-9");
+    test_result("T10c OP-FP compare/classify decode (M5 Task 4a): func bits correct + dispatch to EU_FP (M5 Task 9 swap)");
 }
 
 // ---- M5 Task 4b: OP-FP add/sub/minmax/sgnj-family/f2f-convert decode arms
-// (IDU.v:883-948). Same dead-wired-pre-Task-9 reasoning as T10c: FUNC bits
-// decode correctly (ex1_func_r is not illegal-gated) but fadd_sel/fspu_sel/
-// fcnvt_sel (gated on ex1_eu_r[EU_FP_SEL]) must stay 0 since misa.F/D=0
-// forces d32_illegal=1 -> dis_eu_final routes to EU_CP0, not EU_FP. Also
-// covers the real idu_fpu_ex1_rm/idu_fpu_ex1_dst0_reg plumbing (RTU.v/
-// RVProc.v wiring added alongside this decode). ----
+// (IDU.v part b). Live as of THE SWAP (M5 Task 9): these now decode legal
+// and dispatch to EU_FP, so fadd_sel (add/sub/minmax) / fspu_sel (sgnj) /
+// fcnvt_sel (f2f-convert) fire per their func-bit groups (gated on
+// ex1_eu_r[EU_FP_SEL]). Also covers the real idu_fpu_ex1_rm/idu_fpu_ex1_
+// dst0_reg plumbing (RTU.v/RVProc.v wiring). ----
 static void test_fp_arith_sgnj_cvt_decode(void) {
     reset_dut();
     present(fadd_s(0x5)); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_sel == 1 && dut->idu_cp0_ex1_illegal == 1,
-          "fadd.s: illegal pre-swap, dispatches to CP0");
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_cp0_ex1_sel == 0
+          && dut->idu_fpu_ex1_fadd_sel == 1,
+          "fadd.s: legal, dispatches to EU_FP (fadd_sel fires) -- THE SWAP");
     check(((dut->idu_fpu_ex1_func >> FUNC_ADD_BIT) & 1) == 1,
           "fadd.s: FUNC_ADD bit set");
     check(dut->idu_fpu_ex1_rm == 0x5, "fadd.s: idu_fpu_ex1_rm == funct3 (rm field)",
           dut->idu_fpu_ex1_rm, 0x5);
     check(dut->idu_fpu_ex1_dst0_reg == 5, "fadd.s: idu_fpu_ex1_dst0_reg == rd (FRF dest tag)");
-    check(dut->idu_fpu_ex1_fadd_sel == 0 && dut->idu_fpu_ex1_fspu_sel == 0
-          && dut->idu_fpu_ex1_fcnvt_sel == 0,
-          "fadd.s: fadd/fspu/fcnvt_sel all stay 0 (ex1_eu_r forced to EU_CP0, not EU_FP)");
+    check(dut->idu_fpu_ex1_fspu_sel == 0 && dut->idu_fpu_ex1_fcnvt_sel == 0,
+          "fadd.s: fspu/fcnvt_sel stay 0 (FUNC_ADD is an fadd_sel-group op)");
 
     reset_dut();
     present(fadd_d(0x0)); tick(); present(0, false);
@@ -679,23 +692,24 @@ static void test_fp_arith_sgnj_cvt_decode(void) {
     check(((dut->idu_fpu_ex1_func >> FUNC_B_SINGLE_BIT) & 1) == 1
           && ((dut->idu_fpu_ex1_func >> FUNC_CVT_WIDDEN_BIT) & 1) == 1,
           "fcvt.d.s: FUNC_B_SINGLE+FUNC_CVT_WIDDEN bits set (single->double)");
-    test_result("T10d OP-FP add/sub/minmax/sgnj/f2f-convert decode (M5 Task 4b): func bits + rm + FRF dst0_reg correct, dead-wired pre-Task-9");
+    test_result("T10d OP-FP add/sub/minmax/sgnj/f2f-convert decode (M5 Task 4b): func bits + rm + FRF dst0_reg correct + dispatch to EU_FP (M5 Task 9 swap)");
 }
 
 // ---- M5 Task 4c: LOAD-FP/STORE-FP decode (D8: reuses EU_LSU, dst0_frf/
 // src2_frf mark the FRF side instead of the GPR dst0_vld/src2_vld path).
-// Still illegal-gated pre-swap like the other OP-FP arms. ----
+// Live as of THE SWAP (M5 Task 9): these now dispatch to EU_LSU (lsu_sel
+// fires) exactly like the integer loads/stores. ----
 static void test_fp_ldst_decode(void) {
     reset_dut();
     write_gpr(1, 0x2000);
     present(flw_(5, 1, 8)); tick(); present(0, false);
-    check(dut->idu_lsu_ex1_sel == 0, "flw: lsu_sel does NOT fire yet -- illegal-gated (dis_eu_final forces EU_CP0 on d32_illegal=1), matches the OP-FP dead-wired-pre-Task-9 pattern");
+    check(dut->idu_lsu_ex1_sel == 1, "flw: lsu_sel fires (legal EU_LSU op) -- THE SWAP");
     check(dut->idu_lsu_ex1_func == LSU_FUNC_FLW, "flw: func == LSU_FUNC_FLW");
     check(dut->idu_lsu_ex1_src0_data == 0x2000, "flw: src0=x1(base)");
     check(dut->idu_lsu_ex1_src1_data == 8, "flw: src1=imm(offset)=8");
     check(dut->idu_lsu_ex1_dst0_reg == 5, "flw: dst0_reg==rd (FRF index, shares the bus)");
     check(dut->idu_lsu_ex1_dst0_frf == 1, "flw: dst0_frf==1 (D8 selector, not a GPR dest)");
-    check(dut->idu_cp0_ex1_illegal == 1, "flw: illegal pre-swap (misa.F/D=0, D11)");
+    check(dut->idu_cp0_ex1_illegal == 0, "flw: legal (THE SWAP, D11)");
 
     reset_dut();
     write_gpr(1, 0x3000);
@@ -703,7 +717,7 @@ static void test_fp_ldst_decode(void) {
     check(dut->idu_lsu_ex1_func == LSU_FUNC_FLD, "fld: func == LSU_FUNC_FLD");
     check(dut->idu_lsu_ex1_dst0_reg == 6, "fld: dst0_reg==rd");
     check(dut->idu_lsu_ex1_dst0_frf == 1, "fld: dst0_frf==1");
-    check(dut->idu_cp0_ex1_illegal == 1, "fld: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0, "fld: legal (THE SWAP)");
 
     reset_dut();
     write_gpr(1, 0x4000);
@@ -715,7 +729,7 @@ static void test_fp_ldst_decode(void) {
     check(dut->idu_lsu_ex1_src2_data == 0x40091EB851EB851FULL,
           "fsw: src2=f2 (FRF store-data, NOT a GPR read despite sharing rs2 field encoding)",
           dut->idu_lsu_ex1_src2_data, 0x40091EB851EB851FULL);
-    check(dut->idu_cp0_ex1_illegal == 1, "fsw: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0, "fsw: legal (THE SWAP)");
 
     reset_dut();
     write_gpr(1, 0x5000);
@@ -724,7 +738,7 @@ static void test_fp_ldst_decode(void) {
     check(dut->idu_lsu_ex1_func == LSU_FUNC_FSD, "fsd: func == LSU_FUNC_FSD");
     check(dut->idu_lsu_ex1_src2_data == 0xCAFEBABEDEADBEEFULL,
           "fsd: src2=f3 (FRF store-data)", dut->idu_lsu_ex1_src2_data, 0xCAFEBABEDEADBEEFULL);
-    check(dut->idu_cp0_ex1_illegal == 1, "fsd: illegal pre-swap");
+    check(dut->idu_cp0_ex1_illegal == 0, "fsd: legal (THE SWAP)");
 
     // A GPR write to the SAME numeric index as the FRF source register must
     // NOT leak into the FSW/FSD store-data slot -- confirms src2_frf really
@@ -738,7 +752,56 @@ static void test_fp_ldst_decode(void) {
           "fsd: src2 reads f4, not the numerically-aliased x4 GPR value",
           dut->idu_lsu_ex1_src2_data, 0x1122334455667788ULL);
 
-    test_result("T10e LOAD-FP/STORE-FP decode (M5 Task 4c): D8 EU_LSU reuse, dst0_frf/src2_frf route correctly, dead-wired pre-Task-9");
+    test_result("T10e LOAD-FP/STORE-FP decode (M5 Task 4c): D8 EU_LSU reuse, dst0_frf/src2_frf route correctly, dispatch to EU_LSU (M5 Task 9 swap)");
+}
+
+// ---- M5 Task 9: remaining OP-FP families (FMAU/FDSU/fcvt-int/fmv, added in
+// Tasks 5/6/7) now decode legal and dispatch to their FPU sub-block selects.
+// These arms had no idu_tb decode coverage before the swap (verified only at
+// the FPU.v datapath level via fpu_tb); this pins that the illegal gate
+// flipped for them too, closing the decode-level loop on every FP family. ----
+static void test_fp_swap_fmau_fdsu_cvt_mv_decode(void) {
+    reset_dut();
+    present(fmul_s(0x0)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fmau_sel == 1,
+          "fmul.s: legal, fmau_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fdiv_s(0x0)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fdsu_sel == 1,
+          "fdiv.s: legal, fdsu_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fsqrt_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fdsu_sel == 1,
+          "fsqrt.s: legal, fdsu_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fmadd_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fmau_sel == 1,
+          "fmadd.s: legal, fmau_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fcvt_w_s()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fcnvt_sel == 1,
+          "fcvt.w.s (f2i): legal, fcnvt_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fcvt_s_w(0x0)); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fcnvt_sel == 1,
+          "fcvt.s.w (i2f): legal, fcnvt_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fmv_x_w()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fspu_sel == 1,
+          "fmv.x.w: legal, fspu_sel fires (THE SWAP)");
+
+    reset_dut();
+    present(fmv_w_x()); tick(); present(0, false);
+    check(dut->idu_cp0_ex1_illegal == 0 && dut->idu_fpu_ex1_fspu_sel == 1,
+          "fmv.w.x: legal, fspu_sel fires (THE SWAP)");
+
+    test_result("T10f remaining OP-FP families (FMAU/FDSU/cvt-int/fmv) decode legal + dispatch (M5 Task 9 swap)");
 }
 
 // ---- 5.5: RVC pairs decode to the same EU/FUNC/*_vld shape as 32-bit twin ----
@@ -790,11 +853,11 @@ static void test_rvc_pairs(void) {
 static void test_rvc_illegal(void) {
     reset_dut();
     present(c_fld()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "c.fld: illegal (no FP in M2)");
+    check(dut->idu_cp0_ex1_illegal == 1, "c.fld: illegal (RVC FP out of scope -- only 32-bit F/D FP is legal post-swap)");
 
     present(c_addi4spn_bad()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "c.addi4spn nzuimm=0: illegal (reserved encoding)");
-    test_result("T12 RVC illegal cases: c.fld (no FP) + reserved-zero encodings");
+    test_result("T12 RVC illegal cases: c.fld (RVC FP out of scope) + reserved-zero encodings");
 }
 
 // ---- 5.5: WBT RAW/WAW except-clause matrix (each of the 5, individually
@@ -1121,6 +1184,7 @@ int main(int argc, char **argv) {
     test_fp_cmp_class_decode();
     test_fp_arith_sgnj_cvt_decode();
     test_fp_ldst_decode();
+    test_fp_swap_fmau_fdsu_cvt_mv_decode();
     test_rvc_pairs();
     test_rvc_illegal();
 

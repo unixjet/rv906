@@ -388,11 +388,11 @@ module RVProc #(
     wire [63:0]              idu_fpu_ex1_fsrc0_data;
     wire [63:0]              idu_fpu_ex1_fsrc1_data;
     wire [63:0]              idu_fpu_ex1_fsrc2_data;
-    // M5 Task 4a: real dispatch-select/func/rm outputs. Structurally wired
-    // now but dead pre-Task-9 -- dis_eu_final (IDU.v) forces EU_CP0 whenever
-    // d32_illegal=1, and every Task 4a FP decode arm hardwires illegal=1, so
-    // ex1_eu_r[EU_FP_SEL] never sets until Task 9 replaces that hardwire
-    // with a real misa.F/D-gated expression.
+    // M5 Task 4a: real dispatch-select/func/rm outputs. Live as of THE
+    // SWAP (M5 Task 9): the FP decode arms no longer hardwire
+    // d32_illegal=1, so ex1_eu_r[EU_FP_SEL] now sets for legal FP
+    // encodings (dis_eu_final (IDU.v) still forces EU_CP0 for
+    // genuinely-illegal encodings).
     wire                     idu_fpu_ex1_fadd_sel;
     wire                     idu_fpu_ex1_fspu_sel;
     wire                     idu_fpu_ex1_fcnvt_sel;
@@ -1062,10 +1062,10 @@ module RVProc #(
     //=========================================================================
     // FPU instance: FALU sub-block only (Task 3). IDU decode now drives the
     // real `_fadd_sel`/`_fspu_sel`/`_fcnvt_sel`/`_func`/`_rm` outputs (Task
-    // 4a: FEQ/FLT/FLE/FCLASS decode arms), but they are structurally dead
-    // until Task 9 -- IDU.v's `dis_eu_final` forces EU_CP0 whenever
-    // d32_illegal=1, and every Task 4a arm hardwires illegal=1, so
-    // ex1_eu_r[EU_FP_SEL] never sets pre-swap. `idu_fpu_ex1_fsrc0/1_data`
+    // 4a: FEQ/FLT/FLE/FCLASS decode arms); live as of THE SWAP (M5 Task 9),
+    // IDU routes legal FP encodings to EU_FP so these selects now fire
+    // (dis_eu_final still forces EU_CP0 for genuinely-illegal encodings).
+    // `idu_fpu_ex1_fsrc0/1_data`
     // are the real M5 Task 2 FRF read-port outputs. `fpu_rtu_ex1_falu_*`
     // outputs have no consumer yet (RTU wiring lands with Task 4b).
     //=========================================================================
