@@ -85,10 +85,13 @@ rv906's single-issue in-order pipe. What **does** transfer as reference:
 - `rv12/rtl/FPUDiv.v` SRT digit-recurrence arithmetic core (the math
   itself, not its dual-pipe write-back-steal handshake).
 - `rv12/rtl/LSU.v` NaN-boxing-at-write-back-formatter pattern for FLW.
-- `rv12/test/m5/build/*.elf` test list: `{fadd,fclass,fcmp,fcvt,fcvt_w,
-  fdiv,fmadd,fmin,ldst,move,recoding,structural}` × `{p,v}` ×
-  `{rv64uf,rv64ud}` = 48 ELFs — the exact upstream riscv-tests target
-  set, reusable verbatim.
+- `rv12/test/m5/build/*.elf` test list: 11 rv64uf names
+  (`{fadd,fclass,fcmp,fcvt,fcvt_w,fdiv,fmadd,fmin,ldst,move,recoding}`)
+  + 12 rv64ud names (the same 11 plus `structural`, double-only) ×
+  `{p,v}` = 46 ELFs (verified against upstream `isa/rv64uf/Makefrag`
+  and `isa/rv64ud/Makefrag` at Task 10; `structural` does not apply to
+  rv64uf) — the exact upstream riscv-tests target set, reusable
+  verbatim.
 - rv12's design doc gotchas (architecture-independent): NaN-box on every
   producer AND check on every single-precision consumer (no asymmetry);
   full IEEE gradual underflow with tininess-after-rounding, no
@@ -235,10 +238,12 @@ new FP-opcode acceptance goes live end-to-end.
 
 **D12 — Test infra**: new `test/m5/` mirroring `test/m4/`'s shape
 (Makefile with explicit p/v lists, env override only if FP tests need
-one beyond the existing `test/m2/env`), reusing rv12's 48-ELF list
-verbatim as the upstream riscv-tests target set (`{fadd,fclass,fcmp,
-fcvt,fcvt_w,fdiv,fmadd,fmin,ldst,move,recoding,structural}` ×
-`{rv64uf,rv64ud}` × `{p,v}`).
+one beyond the existing `test/m2/env`), reusing rv12's 46-ELF list
+verbatim as the upstream riscv-tests target set: 11 rv64uf names
+(`{fadd,fclass,fcmp,fcvt,fcvt_w,fdiv,fmadd,fmin,ldst,move,recoding}`)
++ 12 rv64ud names (the same 11 plus `structural`, double-only) ×
+`{p,v}` = 46 (Task 10 corrected this from an earlier miscount of 48
+that applied `structural` to rv64uf too).
 
 ## Task decomposition
 
@@ -260,7 +265,7 @@ Every RTL task ends with the standard gates: `make verisim` clean,
 | 7 | Int↔FP convert + FMV | FCVT.{W,WU,L,LU}.{S,D}, FCVT.{S,D}.{W,WU,L,LU}, FMV.{X.W,W.X,X.D,D.X}, FCVT.S.D/FCVT.D.S | fpu_tb convert rows |
 | 8 | fflags accrual + FS dirty wiring | Retire-time sticky OR-in (D7), FS-off illegal gating now reachable but still inert (misa.F/D=0 keeps everything illegal pre-swap) | csr_tb accrual rows |
 | 9 | THE SWAP | `misa.F`/`misa.D` 0→1; this is the ONE commit where FP-opcode acceptance goes live | G1 OFF-path identity re-check |
-| 10 | test/m5 infra | Makefile (p/v lists, 48 ELFs per D12), directed unit coverage as needed | build only |
+| 10 | test/m5 infra | Makefile (p/v lists, 46 ELFs per D12), directed unit coverage as needed | build only |
 | 11 | Acceptance + close-out | rv64uf-p/rv64ud-p/rv64uf-v/rv64ud-v suites, full M2-M4 battery re-run, docs (07-lsu.md or new 09-fpu.md, 08-verification.md §8.16, this doc's Status→COMPLETE) | all gates |
 
 ## Deviation ledger
@@ -299,7 +304,7 @@ Every RTL task ends with the standard gates: `make verisim` clean,
    `misa.F`/`misa.D` = 0 gates every new FP opcode as illegal until the
    swap task.
 2. **ON path:** after the swap, `rv64uf-p`/`rv64ud-p`/`rv64uf-v`/
-   `rv64ud-v` (48 ELFs per D12) pass.
+   `rv64ud-v` (46 ELFs per D12) pass.
 
 **Standard gates every task:** `make verisim` clean; `make -C
 test/m2/unit run` → UNIT-SUITE-PASS; `bash test/m2/run_all.sh` → 86/87;
