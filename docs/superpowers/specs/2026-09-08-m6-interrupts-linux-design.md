@@ -143,19 +143,32 @@ M4 left two explicit M6 obligations in its deviation ledger:
   Path (b) hand-rolled stub is infeasible (stock kernel is
   CONFIG_RISCV_SBI=y — a stub ECALL-dies); path (c) fw_dynamic offers
   zero single-hart benefit.
-- **Harness deltas (small, enumerated):** `dtb_addr` 0x87000000 →
-  0x82200000 (RVProcTest.cpp:274, one line — fw_jump passes the fixed
-  0x82200000 to the kernel AND uses it as its own DTB);
+- **Harness deltas (small, enumerated — verified in-tree):**
+  `dtb_addr` 0x87000000 → 0x82200000 (RVProcTest.cpp:274, one line —
+  fw_jump passes the fixed 0x82200000 to the kernel AND uses it as its
+  own DTB; the constant was verified by disassembling the shipped
+  fw_jump.elf: `fw_next_arg1` = 0x411<<21, `_jump_addr` = 0x80200000,
+  `fw_next_mode` = 1/S, entry = 0x80000000);
   `a0 = hartid` poke missing (dut.cpp:59-61 pokes only PC/SP/a1);
-  FDT `riscv,isa` "rv64imac" → "rv64imafdc_zicsr_zifencei" (kernel
-  CONFIG_RISCV_ISA_ZBB=y must NOT be advertised — alternatives trap);
-  timebase reconciliation (D-M6-4).
+  FDT `riscv,isa` "rv64imac" → "rv64imafdc_zicsr_zifencei"
+  (RVProcTest.cpp:295; kernel .config has SVPBMT/ZBB/ZICBOM — all
+  hwcap-gated optimizations, safe to omit: alternatives skip, no
+  trap); timebase 1250000 → 1000000 (:287, D-M6-4);
+  **FDT has NO `/chosen` node at all (Agent 3 was wrong about
+  stdout-path):** without it the 8250 console and earlycon never
+  attach and the banner never reaches stdout — Task 5 adds
+  `chosen { stdout-path="/uart@10001000"; bootargs="console=ttyS0
+  earlycon"; }` (bare `earlycon` picks the SBI earlycon,
+  CONFIG_SERIAL_EARLYCON_RISCV_SBI=y; `console=ttyS0` is the
+  permanent console; the 8250 probe succeeds because LSR is
+  hardcoded 0x60 = THRE|TEMT).
 - **Boot flow:** fw_jump (M) → PMP all-memory RWX → mret to kernel
   (S) at 0x80200000 with a0=hartid, a1=0x82200000. Kernel: SBI timer
   (sbi_set_timer → OpenSBI sets mtimecmp → MTIP → M-mode OpenSBI sets
-  sip.STIP (flop CSR) → delegated S trap), earlycon via SBI/8250
-  (`stdout-path` already in the TB FDT; LSR hardcoded 0x60 so the 8250
-  probe succeeds; polled console needs no PLIC S-context).
+  sip.STIP (flop CSR) → delegated S trap), earlycon via SBI (bare
+  `earlycon` from the new `/chosen` bootargs; 8250 probe succeeds
+  because LSR is hardcoded 0x60; polled console needs no PLIC
+  S-context).
 - **OpenSBI's fdt_timer_mtimer** expects mtimecmp@base+0x4000,
   mtime@base+0xBFF8 — exactly rv906's CLINT map.
 - **Exit criterion:** external `timeout N testbench ... | grep -q
@@ -180,7 +193,7 @@ M4 left two explicit M6 obligations in its deviation ledger:
 | 2 | RTU interrupt leg live + first e2e | new CSR→RTU input port replaces `int_vld_raw = 15'd0` (RTU.v:744); the existing casez (RTU.v:747-766) becomes the live priority/cause encoder; verify tval=0-for-int in the retire chain (donor aq_rtu_retire.v:541-542); epc=next-PC (:847) and flush FSM untouched; RVProc.v wiring; **first end-to-end: directed msip self-interrupt** (cause 3\|bit63) | msip e2e PASS + full battery (int_sel=0 at reset ⇒ bit-identical OFF path) |
 | 3 | `time` CSR (0xC01) | read-mux arm ← CLINT mtime (new CSR.v input; RVProc.v wire from the existing `clint_mtime`); same mirror serves M/S/U `time`; counteren stays lenient (D-M6-5) | csr_tb time row; time-increases directed |
 | 4 | Real WFI (D-M4-7) | wfi → flush (existing FSM) + pipe hold: no fetch/issue until wake; CSR wake condition `(mip & mie) != 0` in the always-on domain (donor aq_cp0_lpmd.v wake, NO MIE/SIE/priv gate); wfi retires as no-op on wake; TW=1 && pm<M trap arm kept | rv64si-p-wfi (wfi must NOT halt: SIE=0+SSIP pending); directed wfi-wake on MTIP |
-| 5 | misa + FDT isa lockstep | misa low word 0x112C → 0x14112D (+A, +S, +U; MXL bits verified at CSR.v:955, mcsr pins MXL=2); FDT `riscv,isa` → "rv64imafdc_zicsr_zifencei" (RVProcTest.cpp:295; NO zbb); FDT timebase-frequency → 1000000 (D-M6-4); cross-check kernel `.config` `CONFIG_RISCV_ISA_*` vs implemented before boot | full battery unchanged (sweep 86/87, unit, atomics, si 7/7) |
+| 5 | misa + FDT isa lockstep | misa low word 0x112C → 0x14112D (+A, +S, +U; MXL bits verified at CSR.v:955, mcsr pins MXL=2); FDT `riscv,isa` → "rv64imafdc_zicsr_zifencei" (RVProcTest.cpp:295; NO zbb — SVPBMT/ZBB/ZICBOM are hwcap-gated optimizations, safe to omit); FDT timebase-frequency → 1000000 (D-M6-4); **new `/chosen` node: `stdout-path="/uart@10001000"` + `bootargs="console=ttyS0 earlycon"`** (without it no console attaches — banner never reaches stdout); cross-check kernel `.config` `CONFIG_RISCV_ISA_*` vs implemented before boot | full battery unchanged (sweep 86/87, unit, atomics, si 7/7) |
 | 6 | PLIC UART IRQ | C++ UART IRQ flag (uart16550.cpp:98-104) → new RVProcAXI top port → PLIC.v `int_src[7]` (UART = source 7; RVProcAXI.v:668 un-ties the bus); TB reads the model flag in `TB::step()` | directed PLIC-UART e2e (cause 11\|bit63, claim/complete @0x200004) |
 | 7 | Bare-metal interrupt suite | `test/m6/` Makefile + 8 directed tests: (1) msip, (2) mtip mtimecmp tick + time check, (3) plic-uart, (4) ssip delegation (mideleg[1] → S trap cause 1\|bit63 via stvec), (5) stip SBI-model (M-handler sets stip_f + sret → S trap cause 5\|bit63), (6) priority (MEIP+MSIP+MTIP → cause 11 first), (7) vectored tvec (mtvec[0]=1, MSIP → epc=base+12), (8) wfi-wake; link.ld tohost → 0x7FFFF000 (uncached aperture) | 8/8 via run_all.sh |
 | 8 | Linux boot | copy fw_jump.elf/Image/rootfs.cpio → `test/m6/linux/`; `dtb_addr` → 0x82200000; `a0=hartid` poke in dut.cpp; `run_linux.sh` = `timeout 21600 bin/verisim/testbench fw_jump.elf --kernel Image --initrd rootfs.cpio \| tee boot.log` + `grep -q "Linux version"`; verify FDT isa string ⊆ implemented ISA (Zbb omitted) | BOOT-PASS (banner); stretch: "Run /init" |
