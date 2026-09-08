@@ -265,10 +265,13 @@ module IDU (
     output wire                     idu_fpu_ex1_fmau_sel,
     // M5 Task 6: FDSU (div/sqrt) dispatch select. Identified by
     // FUNC_FDSU_DIV | FUNC_FDSU_SQRT (rvproc_pkg.sv), same OR-group shape
-    // as idu_fpu_ex1_fadd_sel's ADD/SUB/CMP/MAX/MIN. Additionally gated on
-    // !fpu_idu_fdsu_full (FPU.v's busy-flop output) -- same shape as
-    // idu_iu_ex1_div_sel's own !iu_idu_div_full term (IU.v SECTION DIV is
-    // this signal's structural precedent, design doc D1).
+    // as idu_fpu_ex1_fadd_sel's ADD/SUB/CMP/MAX/MIN -- AND-gated on
+    // !FUNC_MAU_MUL because FUSED(5)/SUB(7) are aliased with the FMA
+    // fused flags and every fused FMA op sets them (M5 Task 11 fix).
+    // Additionally gated on !fpu_idu_fdsu_full (FPU.v's busy-flop output)
+    // -- same shape as idu_iu_ex1_div_sel's own !iu_idu_div_full term
+    // (IU.v SECTION DIV is this signal's structural precedent, design doc
+    // D1).
     output wire                     idu_fpu_ex1_fdsu_sel,
     output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
     output wire [2:0]               idu_fpu_ex1_rm,
@@ -897,15 +900,18 @@ module IDU (
             // encodings only). rs2=00000 for fclass is NOT separately
             // checked (harmless).
             15'b1010000_010_10100: begin  // feq.s
-                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_FEQ] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_FEQ] = 1'b1;
                 d32_dst0_vld = 1'b1;
             end
             15'b1010000_001_10100: begin  // flt.s
-                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LT] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LT] = 1'b1;
                 d32_dst0_vld = 1'b1;
             end
             15'b1010000_000_10100: begin  // fle.s
-                d32_eu = EU_FP; d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LE] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_CMP] = 1'b1; d32_func[FUNC_CMP_LE] = 1'b1;
                 d32_dst0_vld = 1'b1;
             end
             15'b1010001_010_10100: begin  // feq.d
@@ -924,7 +930,8 @@ module IDU (
                 d32_dst0_vld = 1'b1;
             end
             15'b1110000_001_10100: begin  // fclass.s
-                d32_eu = EU_FP; d32_func[FUNC_CLASS] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_CLASS] = 1'b1;
                 d32_dst0_vld = 1'b1;
             end
             15'b1110001_001_10100: begin  // fclass.d
@@ -941,23 +948,38 @@ module IDU (
             // to idu_fpu_ex1_dst0_reg for the eventual FRF writeback tag.
             // Live as of THE SWAP (M5 Task 9): legal FP encodings now
             // dispatch to EU_FP (see part a's note above).
+            // M5 Task 11 BUG 4 (rv64ud-p/v-move test 40, Category A --
+            // rv906-own decode gap; the public C906 factory ships no scalar
+            // FPU, so no donor precedent): every single-precision FP arm
+            // sets FUNC_B_SINGLE -- FPU.v's NaN-box check (box_check_en =
+            // f_single, FPU.v:354; a_cnan/b_cnan -> canonical-NaN
+            // substitution) was enabled ONLY by fcvt.d.s, so single ops on
+            // a broken-box 64-bit source (fsgnj.s on a qNaN double) passed
+            // the raw low 32 bits through instead of canonicalizing.
+            // No-op for every properly-boxed value (a_cnan=0), so all
+            // previously passing ELFs are bit-identical; the double arms
+            // set FUNC_DOUBLE instead (and must NOT set B_SINGLE).
             15'b0000000_???_10100: begin  // fadd.s
-                d32_eu = EU_FP; d32_func[FUNC_ADD] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_ADD] = 1'b1;
             end
             15'b0000001_???_10100: begin  // fadd.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_ADD] = 1'b1;
             end
             15'b0000100_???_10100: begin  // fsub.s
-                d32_eu = EU_FP; d32_func[FUNC_SUB] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_SUB] = 1'b1;
             end
             15'b0000101_???_10100: begin  // fsub.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_SUB] = 1'b1;
             end
             15'b0010100_000_10100: begin  // fmin.s
-                d32_eu = EU_FP; d32_func[FUNC_MIN] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_MIN] = 1'b1;
             end
             15'b0010100_001_10100: begin  // fmax.s
-                d32_eu = EU_FP; d32_func[FUNC_MAX] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_MAX] = 1'b1;
             end
             15'b0010101_000_10100: begin  // fmin.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MIN] = 1'b1;
@@ -966,13 +988,16 @@ module IDU (
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MAX] = 1'b1;
             end
             15'b0010000_000_10100: begin  // fsgnj.s
-                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_J] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_J] = 1'b1;
             end
             15'b0010000_001_10100: begin  // fsgnjn.s
-                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_N] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_N] = 1'b1;
             end
             15'b0010000_010_10100: begin  // fsgnjx.s
-                d32_eu = EU_FP; d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_X] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_SPU_SGN] = 1'b1; d32_func[FUNC_SPU_SGN_X] = 1'b1;
             end
             15'b0010001_000_10100: begin  // fsgnj.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1;
@@ -1003,7 +1028,8 @@ module IDU (
             // as an FMAU-class op for idu_fpu_ex1_fmau_sel (SECTION EU
             // DISPATCH below).
             15'b0001000_???_10100: begin  // fmul.s
-                d32_eu = EU_FP; d32_func[FUNC_MAU_MUL] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_MAU_MUL] = 1'b1;
             end
             15'b0001001_???_10100: begin  // fmul.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_MAU_MUL] = 1'b1;
@@ -1017,13 +1043,15 @@ module IDU (
             // idu_fpu_ex1_fsrc1_data exactly like fadd's real rs2 does,
             // with no wildcarding risk.
             15'b0001100_???_10100: begin  // fdiv.s
-                d32_eu = EU_FP; d32_func[FUNC_FDSU_DIV] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_FDSU_DIV] = 1'b1;
             end
             15'b0001101_???_10100: begin  // fdiv.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_FDSU_DIV] = 1'b1;
             end
             15'b0101100_???_10100: begin  // fsqrt.s
-                d32_eu = EU_FP; d32_func[FUNC_FDSU_SQRT] = 1'b1;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
+                d32_func[FUNC_FDSU_SQRT] = 1'b1;
             end
             15'b0101101_???_10100: begin  // fsqrt.d
                 d32_eu = EU_FP; d32_func[FUNC_DOUBLE] = 1'b1; d32_func[FUNC_FDSU_SQRT] = 1'b1;
@@ -1040,7 +1068,7 @@ module IDU (
             // {NEG,SUB,FUSED} per rvproc_pkg.sv's donor-cited encoding:
             // fmadd=001, fmsub=011, fnmsub=111, fnmadd=101.
             15'b?????00???10000: begin  // fmadd.s
-                d32_eu = EU_FP;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
                 d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
             end
             15'b?????01???10000: begin  // fmadd.d
@@ -1048,7 +1076,7 @@ module IDU (
                 d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
             end
             15'b?????00???10001: begin  // fmsub.s
-                d32_eu = EU_FP;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
                 d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
                 d32_func[FUNC_MAU_SUB] = 1'b1;
             end
@@ -1058,7 +1086,7 @@ module IDU (
                 d32_func[FUNC_MAU_SUB] = 1'b1;
             end
             15'b?????00???10010: begin  // fnmsub.s
-                d32_eu = EU_FP;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
                 d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
                 d32_func[FUNC_MAU_SUB] = 1'b1; d32_func[FUNC_MAU_NEG] = 1'b1;
             end
@@ -1068,7 +1096,7 @@ module IDU (
                 d32_func[FUNC_MAU_SUB] = 1'b1; d32_func[FUNC_MAU_NEG] = 1'b1;
             end
             15'b?????00???10011: begin  // fnmadd.s
-                d32_eu = EU_FP;
+                d32_eu = EU_FP; d32_func[FUNC_B_SINGLE] = 1'b1;
                 d32_func[FUNC_MAU_MUL] = 1'b1; d32_func[FUNC_MAU_FUSED] = 1'b1;
                 d32_func[FUNC_MAU_NEG] = 1'b1;
             end
@@ -1700,6 +1728,152 @@ module IDU (
     wire [63:0] frf_src2_data = frf_read(dis_fsrc2_reg5);
 
     //=========================================================================
+    // SECTION FWBT (M5 Task 11 root-cause fix) -- FP-register write-back
+    // tracker, the FRF-side counterpart of SECTION WBT above.
+    //
+    // Donor-verified need, not an invented mechanism: the donor's vidu
+    // cluster (which bundles FP+vector) carries its OWN 32-entry busy-bit
+    // scoreboard for the FP/vector register file --
+    // refs/openc906/.../gen_rtl/vidu/rtl/aq_vidu_vid_wbt.v +
+    // aq_vidu_vid_wbt_entry.v -- structurally the same idea as
+    // aq_idu_id_wbt.v's GPR scoreboard this file already clones above.
+    // SECTION FRF's own M5 Task 2 comment ("No FRF scoreboard exists in
+    // this design, so these need no _vld-style readiness companion of
+    // their own") was a genuine clone omission, not a donor-faithful
+    // simplification: LOAD-FP/FLD share the exact same variable-latency
+    // LSU (AG/DC + the LFB deferred-completion path on a cache-line-fill
+    // race, LSU.v SECTION AMO ALU comment area) that the GPR WBT +
+    // fwd0/1/2 network exists to protect GPR consumers against, and
+    // every FRF-destined OP-FP/FMA-family/FCVT/FMV.*.x result is equally
+    // unprotected today (no fwdf0/1 bus exists on the FP side at all).
+    // Root-caused via an instrumented run (test/m5/build/rv64uf-p-fadd.elf,
+    // RV906_FRF_DBG probe, temporary/removed): `flw fa0,0(a0); flw fa1,
+    // 4(a0); flw fa2,8(a0); lw a3,12(a0); fadd.s fa3,fa0,fa1` -- fa0/fa2's
+    // FLW completions raced past fa1's (fa1 dispatched BEFORE fa2 but its
+    // wbf strobe landed AFTER fa2's, cycle 659 vs 651, both after FADD's
+    // own dispatch at cycle 652) with nothing stalling FADD's dispatch on
+    // fa1 still being in flight -- FADD read stale (zero) frf_r[11] instead
+    // of 1.0, exactly the "systemic dispatch/FRF plumbing" shape flagged
+    // up front rather than N independent per-category FALU/FMAU/FDSU bugs.
+    //
+    // Unlike the GPR side, no forwarding bus exists here, so there is no
+    // "except" fast path: every FRF producer's consumers simply wait for
+    // the busy-bit to clear. frf_read()'s same-cycle wsel merge (SECTION
+    // FRF above) still supplies the fresh value the very cycle the bit
+    // clears (mirrors gpr_read()'s identical same-cycle merge, already
+    // proven correct on the GPR side), so no data is lost -- at most one
+    // dispatch slot of throughput is given up on a tight FP producer/
+    // consumer pair. All 32 entries are real (f0 is architectural, unlike
+    // x0), generated the same busy-bit+count shape as g_wbt above (no
+    // producer-type field needed -- there is no forwarding to exempt
+    // against).
+    //
+    // dis_dst0_frf_fpu derives the FRF-destination flag for every OP-FP/
+    // FMA-family/FCVT/FMV.*.x arm from the SAME decode invariant those
+    // arms' own comments already document: every EU_FP arm either sets
+    // dis_dst0_vld=1 (GPR-destined: compare/classify, FCVT-to-int, FMV.x.*)
+    // or leaves it 0 (FRF-destined: fadd/fsub/fmin/fmax/fsgnj*/FCVT f2f/
+    // fmul/fdiv/fsqrt/the FMA family/FCVT-to-float/FMV.*.x) -- verified
+    // against every arm in the casez above, not re-derived per-mnemonic.
+    // dis_dst0_frf (LOAD-FP/FLD only) stays untouched -- it still feeds
+    // idu_lsu_ex1_dst0_frf's LSU routing tag unchanged; dis_dst0_frf_all
+    // is a NEW signal, consumed only by this scoreboard.
+    //=========================================================================
+    wire dis_dst0_frf_fpu = (dis_eu_final == EU_FP) && !dis_dst0_vld;
+    wire dis_dst0_frf_all = dis_dst0_frf || dis_dst0_frf_fpu;
+
+    reg       fwbt_wb_r  [0:31];
+    reg [1:0] fwbt_cnt_r [0:31];
+
+    wire [31:0] fwbt_wb_en = frf_wbf0_oh | frf_wbf1_oh;
+
+    // Create on any non-stalled, non-cancelled dispatch whose destination
+    // is FRF -- same create-gating shape as wbt_create0 above.
+    wire [31:0] fwbt_create0 = onehot32(dis_dst0_reg5,
+                                         dis_dst0_frf_all && ifu_idu_id_inst_vld
+                                         && !ctrl_dis_stall && !iu_idu_br_cancel);
+
+    genvar fk;
+    generate
+        for (fk = 0; fk <= 31; fk = fk + 1) begin : g_fwbt
+            wire create_en = fwbt_create0[fk];
+            wire wb_en_x   = fwbt_wb_en[fk];
+            wire cnt_is_1  = (fwbt_cnt_r[fk] == 2'd1);
+
+            always @(posedge clk or negedge rst_n) begin
+                if (!rst_n)                    fwbt_wb_r[fk] <= 1'b1;
+                else if (rtu_idu_flush_wbt)     fwbt_wb_r[fk] <= 1'b1;
+                else if (create_en)             fwbt_wb_r[fk] <= 1'b0;
+                else if (wb_en_x && cnt_is_1)   fwbt_wb_r[fk] <= 1'b1;
+            end
+
+            always @(posedge clk or negedge rst_n) begin
+                if (!rst_n)                      fwbt_cnt_r[fk] <= 2'd0;
+                else if (rtu_idu_flush_wbt)       fwbt_cnt_r[fk] <= 2'd0;
+                else if (create_en && wb_en_x)    fwbt_cnt_r[fk] <= fwbt_cnt_r[fk];
+                else if (create_en)               fwbt_cnt_r[fk] <= fwbt_cnt_r[fk] + 2'd1;
+                else if (wb_en_x)                 fwbt_cnt_r[fk] <= fwbt_cnt_r[fk] - 2'd1;
+            end
+        end
+    endgenerate
+
+    function fwbt_busy(input [4:0] regnum);
+        reg wb_en_x, cnt_is_1;
+        begin
+            wb_en_x   = fwbt_wb_en[regnum];
+            cnt_is_1  = (fwbt_cnt_r[regnum] == 2'd1);
+            fwbt_busy = !(fwbt_wb_r[regnum] || (wb_en_x && cnt_is_1));
+        end
+    endfunction
+
+    // Per-field FRF hazard gates -- NOT a blanket "any FRF-touching
+    // dispatch checks all three fsrc fields" (a first cut at this that
+    // did exactly that caused a real regression, root-caused via the
+    // debug probe: LOAD-FP/STORE-FP's dis_fsrc0_reg5/dis_fsrc2_reg5 are
+    // NOT register reads at all for those ops -- inst[19:15]/inst[31:27]
+    // are the GPR address-base register and immediate/funct bits
+    // respectively, computed "unconditionally" (SECTION FRF's own
+    // comment) purely because every FP format shares those bit
+    // positions. Gating rawf0/rawf2 on dis_dst0_frf_all (true for every
+    // LOAD-FP) made `flw fa1,4(a0)` check whether FP register f10 was
+    // busy -- and it very much was, since f10 IS fa0, the register the
+    // PRIOR `flw fa0,0(a0)` had just started loading through that exact
+    // same x10=a0 base -- a guaranteed false hit on every multi-flw
+    // sequence, not a rare coincidence. That spurious stall delayed
+    // fa1's own AG/DC entry into the LSU pipeline, which is what let it
+    // land in the load-fill-buffer behind fa2 instead of ahead of it
+    // and come back with fa2's data. Root cause was the over-broad gate,
+    // not the LFB itself -- fixed at the gate, not by touching LSU.v.
+    //
+    // fsrc0 is a genuine FP source only for EU_FP ops NOT covered by
+    // dis_gpr_fsrc0's int-sourced override (fcvt.{s,d}.{w,wu,l,lu} and
+    // fmv.{w,d}.x read rs1 from the GPR, exactly like SECTION EX1's own
+    // ex1_fsrc0_data_r mux already accounts for -- reusing that same
+    // signal here instead of re-deriving it).
+    wire rawf0_chk = (dis_eu_final == EU_FP) && !dis_gpr_fsrc0;
+    // fsrc1 is a genuine FP source for every EU_FP sub-class (real rs2
+    // operand for compare/add/sub/min/max/sgnj/mul/div/FMA; a fixed
+    // rs2=00000 selector -- i.e. f0 -- for fclass/fsqrt/the f2f/int
+    // conversions/fmv.*, so checking it there is at most a rare, no-op-
+    // valued, still-harmless over-check, unlike fsrc0/fsrc2's proven-common
+    // false hits above) plus STORE-FP's real FRF data source (dis_src2_frf).
+    wire rawf1_chk = (dis_eu_final == EU_FP) || dis_src2_frf;
+    // fsrc2 (rs3) is a genuine FP source ONLY for the R4-type FMA family
+    // (fmadd/fmsub/fnmsub/fnmadd -- FUNC_MAU_MUL&&FUNC_MAU_FUSED both set,
+    // unambiguous despite FUNC_MAU_FUSED's bit position being reused as
+    // FUNC_FDSU_DIV for fdiv, which never sets FUNC_MAU_MUL). Every other
+    // EU_FP arm's inst[31:27] is a fixed funct7-high-bits pattern, not a
+    // register index -- same false-hit shape as fsrc0's bug above, so
+    // this is gated precisely rather than left broad.
+    wire dis_is_fma = dis_func[FUNC_MAU_MUL] && dis_func[FUNC_MAU_FUSED];
+    wire rawf2_chk = (dis_eu_final == EU_FP) && dis_is_fma;
+
+    wire rawf0 = rawf0_chk && fwbt_busy(dis_fsrc0_reg5);
+    wire rawf1 = rawf1_chk && fwbt_busy(dis_fsrc1_reg5);
+    wire rawf2 = rawf2_chk && fwbt_busy(dis_fsrc2_reg5);
+    wire wawf  = dis_dst0_frf_all && fwbt_busy(dis_dst0_reg5);
+
+    //=========================================================================
     // SECTION FORWARD MUX (IDU note S6, aq_idu_id_dp.v:639-727) -- 3-way
     // one-hot compare against rtu_idu_fwd0/1/2, falls to `{64{1'bx}}` on a
     // non-hit exactly like the donor (the mutual-exclusivity invariant that
@@ -1791,7 +1965,12 @@ module IDU (
 
     wire waw0 = dis_dst0_vld && !dst0_vld_wbt && !waw0_except;
 
-    wire dis_dep_stall = raw0 || raw1 || raw2 || waw0;
+    // M5 Task 11: FRF-side hazard terms (rawf0/1/2/wawf, SECTION FWBT
+    // above) fold in here exactly like the GPR raw0/1/2/waw0 terms --
+    // same dis_dep_stall consumer (ctrl_dis_stall), same effect (hold this
+    // dispatch in ID for another cycle).
+    wire dis_dep_stall = raw0 || raw1 || raw2 || waw0
+                        || rawf0 || rawf1 || rawf2 || wawf;
 
     //=========================================================================
     // SECTION EX1 REGISTER + LATE FORWARD (IDU note S2/S6, aq_idu_id_dp.v:
@@ -1832,8 +2011,13 @@ module IDU (
                           // M5 Task 6: holds the FDSU op resident in EX1
                           // while FPU.v's busy-flop churns, same shape as
                           // the EU_DIV_SEL term above (design doc D1).
+                          // M5 Task 11 fix: same FUSED/FDSU_DIV aliasing
+                          // exclusion as idu_fpu_ex1_fdsu_sel -- without it
+                          // a fused FMA op parked in EX1 would stall the
+                          // pipe via fpu_idu_fdsu_full.
                           || (ex1_eu_r[EU_FP_SEL]
                               && (ex1_func_r[FUNC_FDSU_DIV] || ex1_func_r[FUNC_FDSU_SQRT])
+                              && !ex1_func_r[FUNC_MAU_MUL]
                               && fpu_idu_fdsu_full);
     wire ctrl_ex1_issue_stall    = ex1_vld_r && iu_idu_mult_issue_stall;
     // A store's store-data operand (src2) is deliberately exempted from the
@@ -1940,8 +2124,16 @@ module IDU (
     // substituted for frf_src0_data on exactly these two int-sourced
     // op groups. Every other FP op (dis_gpr_fsrc0=0) is bit-identical to
     // before this task.
+    // M5 Task 11 BUG 1 (Category A, rv906-own): the FUNC_SPU_MV term is
+    // AND-gated on FUNC_SPU_SGN because FUNC_SPU_MV(17) aliases FUNC_MAU_NEG
+    // (rvproc_pkg.sv:932) -- fnmsub/fnmadd genuinely set that bit position,
+    // so a bare FUNC_SPU_MV read would spuriously route the GPR read
+    // (dis_src0_data) onto the FMA addend (a) operand in place of the FRF
+    // read. The four FMV decode arms (~1124-1141) all set FUNC_SPU_SGN
+    // alongside FUNC_SPU_MV (see the comment there); no other instruction
+    // class sets the pair, so FMAU NEG ops must not select the GPR source.
     wire dis_gpr_fsrc0 = (dis_func[FUNC_CVT_INT] && !dis_func[FUNC_CVT_F2I])
-                       || (dis_func[FUNC_SPU_MV] && !dis_func[FUNC_SPU_MV_XF]);
+                       || (dis_func[FUNC_SPU_SGN] && dis_func[FUNC_SPU_MV] && !dis_func[FUNC_SPU_MV_XF]);
     reg [63:0] ex1_fsrc0_data_r, ex1_fsrc1_data_r, ex1_fsrc2_data_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -2005,8 +2197,18 @@ module IDU (
     // FPU.v's busy-flop FSM (ctrl_ex1_eu_full above is what actually holds
     // the op resident in EX1; this term stops it from re-dispatching every
     // one of those held cycles).
+    // M5 Task 11 fix: FUSED(5)/SUB(7) are aliased with FUNC_FDSU_DIV/SQRT
+    // (rvproc_pkg.sv) -- every fused FMA op sets FUNC_MAU_MUL(19) AND
+    // FUNC_MAU_FUSED(5) (decode arms above, ~1044-1077), so without the
+    // !FUNC_MAU_MUL exclusion fmadd/fmsub/fnmadd/fnmsub spuriously fire
+    // fdsu_sel and dispatch the FDSU FSM on FMA operands: 14/29 cycles
+    // later fdsu_cmplt_now raises a second (wrong) fvld/wbf0 into the FMA
+    // dst (corrupting result + fflags) and breaks the FWBT count (hang).
+    // fdiv/fsqrt never set FUNC_MAU_MUL (decode arms ~1020-1029), so the
+    // exclusion is exact.
     assign idu_fpu_ex1_fdsu_sel  = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit
                                   && (ex1_func_r[FUNC_FDSU_DIV] || ex1_func_r[FUNC_FDSU_SQRT])
+                                  && !ex1_func_r[FUNC_MAU_MUL]
                                   && !fpu_idu_fdsu_full;
     assign idu_fpu_ex1_func      = ex1_func_r;
     assign idu_fpu_ex1_rm        = ex1_rm_r;

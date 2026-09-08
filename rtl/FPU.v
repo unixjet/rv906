@@ -87,6 +87,11 @@ module FPU (
     input  wire                        idu_fpu_ex1_fdsu_sel,
     input  wire [FUNC_WIDTH-1:0]       idu_fpu_ex1_func,
     input  wire [2:0]                  idu_fpu_ex1_rm,
+    // M5 Task 11 BUG 2 (Category A, spec): frm CSR for dynamic rounding.
+    // rm=111 (DYN) is resolved to frm below (rv12/rtl/FPU.v:297/:662's own
+    // `cp0_fpu_frm` pattern) -- the port name follows CSR.v's
+    // cp0_<consumer>_<signal> convention.
+    input  wire [2:0]                  cp0_fpu_frm,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc0_data,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc1_data,
     input  wire [XLEN-1:0]             idu_fpu_ex1_fsrc2_data,
@@ -334,6 +339,17 @@ module FPU (
     wire        f_double = idu_fpu_ex1_func[FUNC_DOUBLE];
     wire        f_single = idu_fpu_ex1_func[FUNC_B_SINGLE];
 
+    // M5 Task 11 BUG 2 (Category A, spec): THE single rm resolution point
+    // (rv12/rtl/FPU.v:662's own `p6_ex1_rm` shape). RISC-V: rm=111 (DYN)
+    // resolves to the frm CSR; 101/110 stay IDU-refused (dead encodings).
+    // Every internal rm consumer below reads rm_eff -- the idu_fpu_ex1_rm
+    // PORT itself stays untouched (frozen IDU interface). Note FMA has no rm
+    // field: its funct3=111 latched through dis_rm used to hit round_up's
+    // default arm (RTZ-like) and silently mis-round every fmadd/fmsub/
+    // fnmadd/fnmsub.
+    wire [2:0]   rm_eff  = (idu_fpu_ex1_rm == 3'b111) ? cp0_fpu_frm
+                                                          : idu_fpu_ex1_rm;
+
     // D-TASK3-3: rv12's `f_scalar && f_single` collapses to `f_single` alone.
     wire        box_check_en = f_single;
 
@@ -459,7 +475,7 @@ module FPU (
     wire        e2_op_min     = op_min;
     wire        e2_cmp_flt    = cmp_flt;
     wire        e2_cmp_fle    = cmp_fle;
-    wire [2:0]  e2_rm         = idu_fpu_ex1_rm;
+    wire [2:0]  e2_rm         = rm_eff;
     wire        e2_act_add    = act_add;
     wire        e2_act_sub    = act_sub;
     wire        e2_act_s      = act_s;
@@ -790,7 +806,7 @@ module FPU (
     wire        e2_cvt_f_zero   = cvt_f_zero;
     wire [52:0] e2_cvt_f_sig    = cvt_f_sig;
     wire signed [12:0] e2_cvt_f_eunb = cvt_f_eunb;
-    wire [2:0]  e2_cvt_rm       = idu_fpu_ex1_rm;
+    wire [2:0]  e2_cvt_rm       = rm_eff;
 
     //=========================================================================
     // SECTION 11: FCNVT -- FLOAT->FLOAT
@@ -857,7 +873,7 @@ module FPU (
         end
     end
 
-    wire f2i_inc  = round_up(cvt_f_s, f2i_mag[0], f2i_g, f2i_s, idu_fpu_ex1_rm);
+    wire f2i_inc  = round_up(cvt_f_s, f2i_mag[0], f2i_g, f2i_s, rm_eff);
     wire [64:0] f2i_rmag = f2i_huge ? {65{1'b1}} : (f2i_mag + {64'b0, f2i_inc});
 
     wire f2i_nan = cvt_f_snan || cvt_f_qnan;
@@ -926,7 +942,7 @@ module FPU (
     wire [PW-1:0] i2f_p = i2f_sh[PW-1:0];
     wire        i2f_st  = (i2f_lz < 8'd8) && (|(cvt_i_mag & ~({64{1'b1}} << i2f_rsh)));
     wire signed [12:0] i2f_e = $signed({5'b0, (8'd63 - i2f_lz)}) + $signed({2'b0, (f_double ? BIAS_D : BIAS_S)});
-    wire [PACK_W-1:0] i2f_pack = fp_pack(cvt_i_neg, i2f_e, i2f_p, i2f_st, idu_fpu_ex1_rm, f_double);
+    wire [PACK_W-1:0] i2f_pack = fp_pack(cvt_i_neg, i2f_e, i2f_p, i2f_st, rm_eff, f_double);
     wire [63:0] i2f_result = (cvt_i_mag == 64'b0) ? (f_double ? 64'b0 : {32'hffffffff, 32'b0}) : i2f_pack[PACK_W-1:5];
     wire [4:0]  i2f_flags  = (cvt_i_mag == 64'b0) ? 5'b0 : i2f_pack[4:0];
 
@@ -1031,7 +1047,7 @@ module FPU (
         ? (f_double ? {1'b0, 11'h7ff, 1'b1, 51'b0} : {32'hffffffff, 1'b0, 8'hff, 1'b1, 22'b0})
         : (f_double ? {mau_inf_sign, 11'h7ff, 52'b0} : {32'hffffffff, mau_inf_sign, 8'hff, 23'b0});
     wire [4:0]  mau_special_flags = {mau_nv, 4'b0};
-    wire        mau_zero_sign = (prod_sign == add_sign) ? prod_sign : (idu_fpu_ex1_rm == 3'b010);
+    wire        mau_zero_sign = (prod_sign == add_sign) ? prod_sign : (rm_eff == 3'b010);
 
     //-- FLATTENED EX1->EX2 (D1): fm_e2_* wire ALIASES, see the section
     // banner above -- not registered.
@@ -1044,7 +1060,7 @@ module FPU (
     wire         fm_e2_add_sign      = add_sign;
     wire signed [13:0] fm_e2_top     = mau_top;
     wire [10:0]  fm_e2_bias          = mau_bias;
-    wire [2:0]   fm_e2_rm            = idu_fpu_ex1_rm;
+    wire [2:0]   fm_e2_rm            = rm_eff;
     wire         fm_e2_special       = mau_res_special;
     wire [63:0]  fm_e2_special_data  = mau_special_data;
     wire [4:0]   fm_e2_special_flags = mau_special_flags;
@@ -1238,7 +1254,10 @@ module FPU (
             fdsu_b_s_flop     <= b_s;
             fdsu_double_flop  <= f_double;
             fdsu_op_div_flop  <= fds_op_div;
-            fdsu_rm_flop      <= idu_fpu_ex1_rm;
+            // M5 Task 11 BUG 2: latch the RESOLVED rm (rm_eff), so a DYN
+            // fdiv/fsqrt holds the frm-resolved value across its multi-cycle
+            // busy period rather than re-reading the live (post-advance) bus.
+            fdsu_rm_flop      <= rm_eff;
             fdsu_iter_left    <= fds_round_count;
         end
         else if (fdsu_state == FDSU_BUSY)

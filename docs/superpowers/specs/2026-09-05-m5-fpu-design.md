@@ -1,6 +1,11 @@
 # M5: Scalar FPU (F/D) — design doc
 
-## Status: Exploration complete; decisions settled; implementation starting at Task 1
+## Status: COMPLETE — Tasks 1–11 done, 46/46 FP ELFs + full battery green (§8.16)
+
+Task 11 (acceptance + close-out) closed the milestone: the 46-ELF FP
+compliance suite (rv64uf/ud × p/v) passes 46/46 after the five-bug fix
+round (ledger in `docs/09-fpu.md`), and the M2/M3 integer battery stayed
+green (86/87 + 19/19 atomics).
 
 ## Context
 

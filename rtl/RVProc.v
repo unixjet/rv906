@@ -401,6 +401,9 @@ module RVProc #(
     wire                     fpu_idu_fdsu_full;     // M5 Task 6
     wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
     wire [2:0]               idu_fpu_ex1_rm;
+    // M5 Task 11 BUG 2: CSR frm -> FPU's dynamic-rounding resolution point
+    // (rm=111 -> frm; see FPU.v's rm_eff and CSR.v's cp0_fpu_frm).
+    wire [2:0]               cp0_fpu_frm;
     // M5 Task 4b: FPU destination-register pass-through (IDU decode ->
     // FPU -> RTU, mirrors idu_iu_ex1_dst0_reg/idu_cp0_ex1_dst0_reg).
     wire [GPR_IDX_WIDTH-1:0] idu_fpu_ex1_dst0_reg;
@@ -1080,6 +1083,7 @@ module RVProc #(
         .idu_fpu_ex1_fdsu_sel      (idu_fpu_ex1_fdsu_sel),
         .idu_fpu_ex1_func          (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm            (idu_fpu_ex1_rm),
+        .cp0_fpu_frm               (cp0_fpu_frm),
         .idu_fpu_ex1_fsrc0_data    (idu_fpu_ex1_fsrc0_data),
         .idu_fpu_ex1_fsrc1_data    (idu_fpu_ex1_fsrc1_data),
         .idu_fpu_ex1_fsrc2_data    (idu_fpu_ex1_fsrc2_data),
@@ -1412,6 +1416,9 @@ module RVProc #(
         .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
         .rtu_cp0_fflags          (rtu_cp0_fflags),
         .rtu_cp0_fs_dirty_updt   (rtu_cp0_fs_dirty_updt),
+
+        // M5 Task 11 BUG 2: frm read-out for the FPU's DYN-rm resolution.
+        .cp0_fpu_frm             (cp0_fpu_frm),
 
         .cp0_ifu_icache_en       (cp0_ifu_icache_en),
         .cp0_ifu_iwpe            (cp0_ifu_iwpe),

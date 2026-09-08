@@ -164,6 +164,14 @@ module CSR #(
     input  wire                     rtu_cp0_fs_dirty_updt,
 
     //=========================================================================
+    // CSR -> FPU (M5 Task 11 BUG 2): frm CSR read-out for dynamic rounding.
+    // RISC-V: an FP instruction's rm=111 (DYN) resolves to frm; FPU.v does
+    // the resolution at its own single rm_eff point (rv12/rtl/FPU.v:297's
+    // own `cp0_fpu_frm` consumer pattern), this port just exposes frm_reg.
+    //=========================================================================
+    output wire [2:0]               cp0_fpu_frm,
+
+    //=========================================================================
     // CSR -> IFU/ICache/BPU : MHCR fan-out, replacing FetchSink's harness
     // config bank (design doc S2.3.6's "open integration item," S8). Port
     // names/widths match ICache.v's/BPU.v's ALREADY-FROZEN-SINCE-M1 input
@@ -1263,9 +1271,33 @@ module CSR #(
             frm_reg <= csr_wdata[2:0];
     end
 
-    wire [63:0] fflags_value = {59'b0, fflags_reg};
+    // M5 Task 11 BUG 3 (rv64uf/ud-p-fcmp test 10, Category A -- rv906-own
+    // pipeline race; the public C906 factory has no scalar FPU, so there is
+    // no donor read-path precedent): a csrrw/fsflags following an FP op
+    // back-to-back executes its EX1 on the FP op's EX2-retire cycle, and
+    // reads fflags_reg BEFORE the sticky-OR accrual arm (last arm of the
+    // always block above) lands at the END of that cycle -- the read misses
+    // the just-accrued bits (fcmp test 10: feq.s(sNaN,0) accrues NV=0x10,
+    // the csrrw reads 0). Program order requires the read to observe the
+    // prior FP op's flags, so the READ VIEW forwards the in-flight retire
+    // packet (rtu_cp0_fflags qualified by rtu_cp0_fs_dirty_updt). Storage
+    // and the write-vs-accrual priority above are unchanged: an explicit
+    // csrrw still replaces (the forwarded value is already captured by the
+    // read), and the csrrs/csrrc RMW forms pick the accrued bits up through
+    // this same csr_rdata. Same fix class as rv12's live-bus fflags mux
+    // (../rv12/rtl/RTU.v:2810-2840, its own stale-registered-fflags bug).
+    wire [4:0] fflags_rd = fflags_reg
+                         | (rtu_cp0_fs_dirty_updt ? rtu_cp0_fflags : 5'b0);
+    wire [63:0] fflags_value = {59'b0, fflags_rd};
     wire [63:0] frm_value    = {61'b0, frm_reg};
-    wire [63:0] fcsr_value   = {56'b0, frm_reg, fflags_reg};
+    wire [63:0] fcsr_value   = {56'b0, frm_reg, fflags_rd};
+
+    // M5 Task 11 BUG 2: frm read-out to FPU.v's dynamic-rounding resolution
+    // (rm=111 -> frm; see the cp0_fpu_frm port comment above). Live register
+    // value, not a snapshot -- an in-order csrw frm followed by a DYN FP op
+    // must observe the new mode, and EX1 dispatch is always behind the CSR
+    // write's own completion in this pipe.
+    assign cp0_fpu_frm = frm_reg;
 
     // Clean/Initial -> Dirty on ANY FP state change: an explicit FP-CSR
     // write OR an FP-instruction retire (M5 Task 8 -- donor

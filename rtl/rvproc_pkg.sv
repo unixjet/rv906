@@ -864,8 +864,11 @@ parameter FUNC_MAU_MUL     = 19;  // set for ALL FIVE FMAU-class instructions
 // idu_fpu_ex1_fadd_sel ORs those two bits directly (IDU.v), so reusing them
 // here would make fadd_sel spuriously fire alongside fdsu_sel on every
 // fdiv/fsqrt. FUNC_MAU_FUSED/_SUB are safe instead: idu_fpu_ex1_fmau_sel
-// tests ONLY FUNC_MAU_MUL(19), never bits 5/7 directly, and no other _sel
-// line touches them either -- true bit-reuse-across-mutually-exclusive-
+// tests ONLY FUNC_MAU_MUL(19), never bits 5/7 directly; idu_fpu_ex1_fdsu_sel
+// tests bits 5/7 AND-gated on !FUNC_MAU_MUL(19) (M5 Task 11 fix -- the
+// only other instruction class that sets 5/7 is the fused FMA family, which
+// sets bit 19 unconditionally), so the two _sel lines are mutually
+// exclusive by construction -- true bit-reuse-across-mutually-exclusive-
 // dispatch, the same convention as FUNC_CMP_LT/FUNC_SPU_SGN_N sharing bit 1.
 // Format (single/double) reuses the shared FUNC_DOUBLE nibble like FADD/
 // FSPU (no FUNC_B_SINGLE needed -- FDSU never reads a second, differing

@@ -138,12 +138,63 @@ bash test/m4/run_directed.sh                          # SI+MI+MMU: PASS=30 FAIL=
   decode was live from Task 1 onward, so G1 was satisfied continuously by
   every task's gate run rather than by one flip commit.
 
----
-
-**Verification log (this session):** working tree clean after the Task
+**Verification log (M4 session):** working tree clean after the Task
 0–9 commits; the full gate chain above (unit suite, 86/87 sweep, 19/19
 atomics, 85/86 OFF-path v-suite, 30/30 directed si+mi+mmu, 85/86 ON-path
 v-suite under real Sv39 translation) was re-run and confirmed green from
 a clean rebuild, bit-identical to the pre-M4 baseline on the OFF path.
 M4 fully implemented and tested; §7.4's M4 acceptance criteria
 ("rv64si/mi + vm tests pass") are met.
+
+---
+
+## §8.16 M5 scalar FPU acceptance (§7.4 "scalar FPU (F/D)")
+
+After the FPU cluster (`rtl/FPU.v`, new; see `docs/09-fpu.md`) plus the
+IDU/RTU/CSR integration and the Task 11 bug-fix round, verify against:
+
+### Gate chain (must pass all):
+
+```bash
+# 1. Clean Verilog build
+make verisim 2>&1 | grep -icE "%error|error:"    # should be 0
+
+# 2. Unit suite (13 benches incl. fpu_tb.cpp T1–T22)
+make -C test/m2/unit run                          # UNIT-SUITE-PASS
+
+# 3. M5 FP compliance suite (46 ELFs: uf/ud x p/v x 10 test bodies + structural)
+bash test/m5/run_all.sh                           # 46/46
+
+# 4. M2/M3 integer regression (FPU-off path must be bit-identical)
+bash test/m2/run_all.sh                           # 86/87 (documented rv64ui-p-ma_data)
+
+# 5. Atomic operations
+bash /tmp/run_atomic.sh                           # PASS=19 FAIL=0
+```
+
+### Expected results:
+
+| Test suite                  | Pass | Fail | Notes                              |
+|-----------------------------|------|------|------------------------------------|
+| `make verisim`              | 0    | —    | No new Verilator warnings          |
+| Unit suite (13 benches)     | PASS | —    | fpu_tb T1–T22 incl. FMAU oracle    |
+| M5 FP suite (46 ELFs)       | 46   | 0    | uf/ud, p+v envs                    |
+| M2/M3 sweep                 | 86   | 1    | `rv64ui-p-ma_data` (pre-existing)  |
+| RV64U atomic (lrsc + 18)    | 19   | 0    | Unaffected by FPU                  |
+
+### Task 11 bug ledger (all Category A — the C906 factory ships no
+scalar FPU; fidelity is to the spec + the rv12 algorithm sections):
+
+FDSU aliasing hang (FUSED/SUB alias FUNC_FDSU_DIV/SQRT), `dis_gpr_fsrc0`
+bit-17 alias (FUNC_SPU_MV==FUNC_MAU_NEG), DYN rm→frm resolution for
+FMA, fflags same-cycle retire read race, and the 18 missing
+`FUNC_B_SINGLE` decode arms (NaN-box canonicalization) — full table in
+`docs/09-fpu.md` §Task 11 bug ledger.
+
+---
+
+**Verification log (this session):** working tree holds the uncommitted
+Task 11 fixes (IDU/FPU/CSR/RVProc/pkg + `test/m5/run_all.sh`); full gate
+chain re-run from a clean rebuild — M5 46/46, unit suite PASS, 86/87
+sweep, 19/19 atomics. M5 acceptance ("rv64uf/ud pass") met.
+
