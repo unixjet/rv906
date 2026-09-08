@@ -139,6 +139,24 @@ module CSR #(
     output wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc,
 
     //=========================================================================
+    // CSR -> RTU : M6 Task 1 interrupt claim export. The donor's own CSR->RTU
+    // interrupt port is COMBINATIONAL (aq_cp0_trap_csr.v:1395 `assign
+    // cp0_rtu_int_vld[14:0] = int_sel[14:0]`, consumed raw by aq_rtu_int.v:50
+    // `int_vld_raw = cp0_rtu_int_vld`). rv906 instead follows the REGISTERED,
+    // ACTIVE-LOW export of sibling rv12 (rtl/CSR.v:2300-2321, registered
+    // `cp0_rtu_xx_int_b` + registered vec) -- the proven clone of this exact
+    // donor network: every source here is level-based (mip pins / CSR flops
+    // persist until serviced), so a one-cycle registration costs latency
+    // without losing a claim, and it keeps the CSR->RTU boundary glitch-
+    // clean. RECORDED DEVIATION from the donor's combinational shape (M6
+    // design doc Task-1 row). DARK UNTIL M6 TASK 2: no consumer exists yet --
+    // RTU.v's int_vld_raw stays 15'd0 and RVProc.v sinks these into
+    // _unused_ok until Task 2 threads them into the live priority encoder.
+    //=========================================================================
+    output wire [14:0]              cp0_rtu_int_sel,   // donor int_sel[14:0], registered
+    output wire                     cp0_rtu_int_b,     // registered active-low == !|int_sel
+
+    //=========================================================================
     // RTU -> CSR : trap-entry capture (RTU note S7 -- mepc/mcause/mtval
     // written directly off RTU's exception-priority decision, no RTU-side
     // buffering) + the broadcast flush pulses CP0 also listens on.
@@ -687,35 +705,49 @@ module CSR #(
 
 
     //=========================================================================
-    // SECTION MTVEC / STVEC -- real flops, direct mode only (contract 7):
-    // mode bit tied 0 (accepted-but-ignored). M4 Task 1 adds stvec; the
+    // SECTION MTVEC / STVEC -- real flops. M2 kept tvec direct-mode only
+    // (mode bit tied 0, accepted-but-ignored). M4 Task 1 added stvec; the
     // trap redirect target is muxed on the POST-trap pm (donor
     // aq_cp0_trap_csr.v:1346-1359): M trap -> mtvec, delegated S trap ->
     // stvec. pm updates on the expt_vld cycle, so the mux is settled by the
     // time RTU samples cp0_rtu_trap_pc (one cycle later; the donor timing
-    // subtlety, extraction notes §B.4).
+    // subtlety, extraction notes §B.4). M6 Task 1 adds the VECTORED mode
+    // arm: mode bit 0 is stored for BOTH mtvec and stvec (donor
+    // aq_cp0_trap_csr.v:936-944, :956/:987 -- `mtvec_value =
+    // {mtvec_base, 1'b0, mtvec_mode[0]}`, only bit 0 is architecturally
+    // visible; bit 1 is stored on write then masked off at read, donor
+    // shape) and the redirect adds the donor's `intr && tvec[0] ? base +
+    // 4*cause : base` term (donor :1355-1359, verbatim below).
     //=========================================================================
     reg [PC_WIDTH-3:0] mtvec_base;   // bits [PC_WIDTH-1:2]
     reg [PC_WIDTH-3:0] stvec_base;
+    reg               mtvec_mode0;   // mode bit [0]: 0=direct, 1=vectored
+    reg               stvec_mode0;
     wire mtvec_local_en = csr_wen && (csr_addr == CSR_MTVEC);
     wire stvec_local_en = csr_wen && (csr_addr == CSR_STVEC);
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            mtvec_base <= {(PC_WIDTH-2){1'b0}};
-        else if (mtvec_local_en)
-            mtvec_base <= csr_wdata[PC_WIDTH-1:2];
+        if (!rst_n) begin
+            mtvec_base  <= {(PC_WIDTH-2){1'b0}};
+            mtvec_mode0 <= 1'b0;
+        end else if (mtvec_local_en) begin
+            mtvec_base  <= csr_wdata[PC_WIDTH-1:2];
+            mtvec_mode0 <= csr_wdata[0];
+        end
     end
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            stvec_base <= {(PC_WIDTH-2){1'b0}};
-        else if (stvec_local_en)
-            stvec_base <= csr_wdata[PC_WIDTH-1:2];
+        if (!rst_n) begin
+            stvec_base  <= {(PC_WIDTH-2){1'b0}};
+            stvec_mode0 <= 1'b0;
+        end else if (stvec_local_en) begin
+            stvec_base  <= csr_wdata[PC_WIDTH-1:2];
+            stvec_mode0 <= csr_wdata[0];
+        end
     end
 
-    wire [PC_WIDTH-1:0] mtvec_pc    = {mtvec_base, 2'b00};   // mode forced 0 (direct)
-    wire [PC_WIDTH-1:0] stvec_pc    = {stvec_base, 2'b00};
+    wire [PC_WIDTH-1:0] mtvec_pc    = {mtvec_base, 1'b0, mtvec_mode0};
+    wire [PC_WIDTH-1:0] stvec_pc    = {stvec_base, 1'b0, stvec_mode0};
     // Sign-extend for CSR reads (csrr mtvec/stvec): a kernel-space vector
     // base must read back as a canonical VA, same defect class as
     // IU.v's iu_ifu_tar_pc/ag_rs1_live/bju_wb_data.
@@ -725,7 +757,36 @@ module CSR #(
     // The trap redirect target RTU reads every cycle it takes a trap (see
     // this file's header "TASK 2 DISCOVERED GAP" note) -- muxed on the
     // current pm, which already holds the post-trap mode when RTU samples.
-    assign cp0_rtu_trap_pc = (pm_r == PRIV_M) ? mtvec_pc : stvec_pc;
+    //
+    // M6 Task 1 VECTORED arm (donor aq_cp0_trap_csr.v:1346-1359, verbatim
+    // shape): the donor selects tvec/vector/intr on the CURRENT pm and adds
+    // `4*vector` when the trap being taken is an interrupt and the selected
+    // tvec's mode bit is 1:
+    //   regs_tvec  = pm==M ? mtvec_value : stvec_value
+    //   regs_vector= pm==M ? m_vector    : s_vector
+    //   regs_intr  = pm==M ? m_intr      : s_intr
+    //   vec_int_pc = {regs_tvec[39:2], 2'b0} + {33'b0, regs_vector[4:0], 2'b0}
+    //   regs_trap_pc = regs_intr && regs_tvec[0] ? vec_int_pc
+    //                                            : {regs_tvec[39:2], 2'b0}
+    // TIMING (why this is safe here): m_intr/m_vector/s_intr/s_vector are
+    // the mcause/scause CAPTURE flops (SECTION MCAUSE), latched on the
+    // rtu_yy_xx_expt_vld cycle; pm_r flips the same edge. RTU reads
+    // cp0_rtu_trap_pc through its REGISTERED retire_trap_chgflw_vld +
+    // retire_chgflw_pc path (RTU.v:933-951) one+ cycles AFTER the trap
+    // cycle, so the cause and the post-trap pm are both settled flops when
+    // the mux is evaluated -- the donor's own "m_vector is the cause
+    // captured for THIS trap" argument (extraction notes §3). The
+    // cause-capture logic itself is untouched (mcause bit-63 arm already
+    // exists).
+    wire [PC_WIDTH-1:0] regs_tvec   = (pm_r == PRIV_M) ? mtvec_pc : stvec_pc;
+    wire [4:0]          regs_vector = (pm_r == PRIV_M) ? m_vector : s_vector;
+    wire                regs_intr   = (pm_r == PRIV_M) ? m_intr   : s_intr;
+    wire [PC_WIDTH-1:0] vec_int_pc  = {regs_tvec[PC_WIDTH-1:2], 2'b00}
+                                    + {{(PC_WIDTH-7){1'b0}}, regs_vector, 2'b00};
+    wire [PC_WIDTH-1:0] regs_trap_pc =
+          (regs_intr && regs_tvec[0]) ? vec_int_pc
+                                      : {regs_tvec[PC_WIDTH-1:2], 2'b00};
+    assign cp0_rtu_trap_pc = regs_trap_pc;
 
     //=========================================================================
     // SECTION MEPC / SEPC -- real flops, LSB forced 0 on write. Trap-entry
@@ -938,6 +999,150 @@ module CSR #(
     // sie/sip views masked by mideleg.
     wire [63:0] sie_value = mie_reg & mideleg_reg;
     wire [63:0] sip_value = mip_value & mideleg_reg;
+
+    //=========================================================================
+    // SECTION INTERRUPT CLAIM -- M6 Task 1: the donor's 15-term int_sel
+    // (aq_cp0_trap_csr.v:1269-1338), the pending-and-enabled set the RTU's
+    // priority encoder (RTU.v's casez, donor aq_rtu_int.v:53-74) reads.
+    //
+    // Per-source enable `*_en = mie_bit & mip_bit` (donor :1269-1278; our
+    // mie_reg / mip flops-or-pins are the same storage the donor feeds
+    // from). T-Head customs MCIP(16)/MHIP(18) have NO source in rv906 --
+    // the donor itself ties them 0 (:1230 `mhip = 1'b0`, :1233 `mcip =
+    // 1'b0`; mhie/mcie are constant 0 in the donor's mie block) -- and
+    // MOIP(17)'s producer is the donor's PMU overflow (hpcp_cp0_int_vld,
+    // aq_hpcp_top.v:2674), which rv906 does not model (no mhpmevent/mcntof
+    // CSRs exist here, so mie bit 17 could never be enabled anyway). All
+    // three *_en terms are tied 0 below; the 15-bit bus WIDTH is kept so
+    // RTU.v's casez matches bit-for-bit. mideleg also cannot hold bits
+    // 16/17/18 (write mask is bits {1,5,9}, CSR.v's mideleg_reg block),
+    // matching the donor's constant-0 mhie/mcie deleg terms.
+    //
+    // Privilege gating, VERBATIM donor structure (:1281-1330):
+    //  - M trio MEI/MTI/MSI (NOT delegable): `pm != M || mie_bit` (:1302-1304)
+    //  - S trio + customs, nodeleg arm: `(pm==M && mie_bit || pm==S || pm==U)
+    //    && *_en && !mideleg[s]` -- NOTE the donor's pm==S term carries NO
+    //    SIE qualifier in the nodeleg arm (:1310-1321); the SIE gate lives
+    //    ONLY in the deleg arm (:1322-1330). A pending non-delegated source
+    //    in S-mode targets M, and M's global enable (mie_bit) is the gate
+    //    that matters -- exactly the donor's equation.
+    //  - deleg arm: `(pm==S && sie_bit || pm==U) && *_en && mideleg[s]` --
+    //    U-mode is "global always on" (donor comment :1306-1309).
+    // pm_r/mie_f/sie_f are the live flops (SECTION PRIVILEGE / MSTATUS).
+    //=========================================================================
+    wire meip_en = mie_reg[11] & mip_meip;
+    wire mtip_en = mie_reg[7]  & mip_mtip;
+    wire msip_en = mie_reg[3]  & mip_msip;
+    wire seip_en = mie_reg[9]  & seip_f;
+    wire stip_en = mie_reg[5]  & stip_f;
+    wire ssip_en = mie_reg[1]  & ssip_f;
+    // T-Head customs: sources absent, tied 0 (section header above).
+    wire mhip_en = 1'b0;   // donor :1230 mhip=1'b0; mhie constant 0
+    wire moip_en = 1'b0;   // donor :1231 moip=PMU overflow; no rv906 producer
+    wire mcip_en = 1'b0;   // donor :1233 mcip=1'b0 (ECC); mcie constant 0
+
+    // M trio (donor :1302-1304).
+    wire meip_vld = (pm_r != PRIV_M || mie_f) && meip_en;
+    wire mtip_vld = (pm_r != PRIV_M || mie_f) && mtip_en;
+    wire msip_vld = (pm_r != PRIV_M || mie_f) && msip_en;
+
+    // Delegable sources: nodeleg/deleg pair (donor :1281-1301 customs,
+    // :1310-1330 S trio, verbatim shapes).
+    wire seip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && seip_en && !mideleg_reg[9];
+    wire stip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && stip_en && !mideleg_reg[5];
+    wire ssip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && ssip_en && !mideleg_reg[1];
+    wire seip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && seip_en && mideleg_reg[9];
+    wire stip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && stip_en && mideleg_reg[5];
+    wire ssip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && ssip_en && mideleg_reg[1];
+    // Customs' pair terms kept structurally (donor :1281-1301); their *_en
+    // is 0 so they can never assert, and mideleg_reg bits 16/17/18 are
+    // hardwired 0 by the write mask anyway.
+    wire mhip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && mhip_en && !mideleg_reg[18];
+    wire moip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && moip_en && !mideleg_reg[17];
+    wire mcip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
+                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+                         && mcip_en && !mideleg_reg[16];
+    wire mhip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && mhip_en && mideleg_reg[18];
+    wire moip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && moip_en && mideleg_reg[17];
+    wire mcip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+                        && mcip_en && mideleg_reg[16];
+
+    // The select vector (donor :1332-1338, VERBATIM 15-term order). Bit ->
+    // RTU.v casez arm -> cause, cross-checked one line per bit against
+    // RTU.v:748-763 (which is itself aq_rtu_int.v:53-74 verbatim):
+    //   [14] mcip nodeleg -> 15'b1??????????????  -> cause 16
+    //   [13] mhip nodeleg -> 15'b01?????????????  -> cause 18
+    //   [12] meip         -> 15'b001????????????  -> cause 11
+    //   [11] msip         -> 15'b0001???????????  -> cause 3
+    //   [10] mtip         -> 15'b00001??????????  -> cause 7
+    //   [ 9] seip nodeleg -> 15'b000001?????????  -> cause 9
+    //   [ 8] ssip nodeleg -> 15'b0000001????????  -> cause 1
+    //   [ 7] stip nodeleg -> 15'b00000001???????  -> cause 5
+    //   [ 6] moip nodeleg -> 15'b000000001??????  -> cause 17
+    //   [ 5] mcip deleg   -> 15'b0000000001?????  -> cause 16
+    //   [ 4] mhip deleg   -> 15'b00000000001????  -> cause 18
+    //   [ 3] seip deleg   -> 15'b000000000001???  -> cause 9
+    //   [ 2] ssip deleg   -> 15'b0000000000001??  -> cause 1
+    //   [ 1] stip deleg   -> 15'b00000000000001?  -> cause 5
+    //   [ 0] moip deleg   -> 15'b000000000000001  -> cause 17
+    // Every nodeleg (M-target) term outranks every deleg (S-target) term;
+    // MOIP(17) sits between the S nodeleg group and the deleg group --
+    // the donor's own ordering, carried unchanged.
+    wire [14:0] int_sel = {mcip_nodeleg_vld,   // [14]
+                           mhip_nodeleg_vld,   // [13]
+                           meip_vld,           // [12]
+                           msip_vld,           // [11]
+                           mtip_vld,           // [10]
+                           seip_nodeleg_vld,   // [ 9]
+                           ssip_nodeleg_vld,   // [ 8]
+                           stip_nodeleg_vld,   // [ 7]
+                           moip_nodeleg_vld,   // [ 6]
+                           mcip_deleg_vld,     // [ 5]
+                           mhip_deleg_vld,     // [ 4]
+                           seip_deleg_vld,     // [ 3]
+                           ssip_deleg_vld,     // [ 2]
+                           stip_deleg_vld,     // [ 1]
+                           moip_deleg_vld};    // [ 0]
+
+    //=========================================================================
+    // SECTION INTERRUPT CLAIM EXPORT -- registered, ACTIVE-LOW (rv12
+    // template rtl/CSR.v:2300-2321; the donor's own export is combinational,
+    // aq_cp0_trap_csr.v:1395 -- the registered choice is recorded at the
+    // cp0_rtu_int_sel port comment above). The registered active-low resets
+    // to 1 (idle) and int_sel computes 0 out of reset (mie_reg and all mip
+    // flops reset 0; the mip pins are driven 0 by CLINT/PLIC/testbench at
+    // reset), so the export is provably dark at reset -- the M6 OFF-path
+    // invariant that the entire pre-M6 battery stays bit-identical holds by
+    // construction.
+    //=========================================================================
+    reg        int_sel_b_r;
+    reg [14:0] int_sel_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            int_sel_b_r <= 1'b1;
+            int_sel_r   <= 15'd0;
+        end else begin
+            int_sel_b_r <= !(|int_sel);
+            int_sel_r   <= int_sel;
+        end
+    end
+    assign cp0_rtu_int_sel = int_sel_r;
+    assign cp0_rtu_int_b   = int_sel_b_r;
 
 
     //=========================================================================

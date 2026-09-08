@@ -35,13 +35,16 @@ static const uint64_t RESET_VECTOR = 0x80000000ULL;
 // CSR addresses (rvproc_pkg.sv)
 static const uint32_t CSR_MSTATUS   = 0x300;
 static const uint32_t CSR_MISA      = 0x301;
+static const uint32_t CSR_MIDELEG   = 0x303;   // M6 Task 1: claim matrix
 static const uint32_t CSR_MIE       = 0x304;
 static const uint32_t CSR_MTVEC     = 0x305;
+static const uint32_t CSR_STVEC     = 0x105;   // M6 Task 1: vectored stvec row
 static const uint32_t CSR_MSCRATCH  = 0x340;
 static const uint32_t CSR_MEPC      = 0x341;
 static const uint32_t CSR_MCAUSE    = 0x342;
 static const uint32_t CSR_MTVAL     = 0x343;
 static const uint32_t CSR_MIP       = 0x344;
+static const uint32_t CSR_SCAUSE    = 0x142;   // M6 Task 1: delegated trap check
 static const uint32_t CSR_MCYCLE    = 0xB00;
 static const uint32_t CSR_MINSTRET  = 0xB02;
 static const uint32_t CSR_MVENDORID = 0xF11;
@@ -821,16 +824,30 @@ static void test_mxstatus_mm_rw_unconsumed(void) {
 }
 
 static void test_mtvec_direct_mode_only(void) {
-    csr_write(CSR_MTVEC, 0x80005001ULL);   // attempt vectored mode (bit0=1)
+    // M6 Task 1 REWRITE: mtvec now stores mode bit 0 (donor
+    // aq_cp0_trap_csr.v:936-956 -- `mtvec_value = {base, 1'b0, mode[0]}`,
+    // only bit 0 architecturally visible; bit 1 accepted-but-masked). The
+    // M2-era "mode forced 0" contract this row used to pin is superseded;
+    // the vectored redirect itself is exercised in
+    // test_int_claim_tvec_vectored() below.
+    csr_write(CSR_MTVEC, 0x80005001ULL);   // vectored mode (bit0=1)
     uint64_t mtvec = csr_read(CSR_MTVEC);
-    check((mtvec & 0x3) == 0, "mtvec: mode bits forced 0 even though write set bit0",
-          mtvec & 0x3, 0);
+    check((mtvec & 0x1) == 1, "mtvec: mode bit 0 now STORED (donor :936-944)",
+          mtvec & 0x1, 1);
+    check((mtvec & 0x2) == 0, "mtvec: mode bit 1 stays masked at read",
+          mtvec & 0x2, 0);
     check((mtvec & ~0x3ULL) == (0x80005001ULL & ~0x3ULL),
-          "mtvec: base bits stored (accepted-but-ignored only on the mode bit)");
-    check((uint64_t)dut->cp0_rtu_trap_pc == (mtvec & PC_MASK),
-          "mtvec: cp0_rtu_trap_pc mirrors mtvec's direct-mode value",
-          dut->cp0_rtu_trap_pc, mtvec & PC_MASK);
-    test_result("T18 mtvec: direct-mode only, cp0_rtu_trap_pc tracks it");
+          "mtvec: base bits stored verbatim");
+    // Direct-mode value on the trap-PC mux: no trap is being taken here, so
+    // regs_intr (mcause capture flop) is 0 and the mux stays at plain base
+    // regardless of the mode bit.
+    check((uint64_t)dut->cp0_rtu_trap_pc == (mtvec & ~0x1ULL & PC_MASK),
+          "mtvec: cp0_rtu_trap_pc at plain base while no interrupt is being taken",
+          dut->cp0_rtu_trap_pc, mtvec & ~0x1ULL & PC_MASK);
+    // Back to direct mode for the later tests.
+    csr_write(CSR_MTVEC, 0x80005000ULL);
+    check((csr_read(CSR_MTVEC) & 0x3) == 0, "mtvec: back to direct mode");
+    test_result("T18 mtvec: mode bit 0 stored (donor :936-956), bit 1 masked, mux direct until intr");
 }
 
 static void test_mepc_lsb_forced_zero(void) {
@@ -1088,6 +1105,226 @@ static void test_fflags_explicit_write_wins(void) {
 }
 
 //=============================================================================
+// M6 Task 1: interrupt claim (int_sel[14:0]) + REGISTERED export + vectored
+// tvec. CSR.v computes the donor's 15-term claim (aq_cp0_trap_csr.v:1269-
+// 1338) and exports it registered + active-low (rv12 template -- see CSR.v's
+// cp0_rtu_int_sel port comment for the donor-vs-rv12 decision). The export
+// is one cycle behind the combinational claim, so every read here is: drive
+// the state, tick, then sample cp0_rtu_int_sel / cp0_rtu_int_b -- exactly
+// the values RTU.v consumes once Task 2 wires them.
+//
+// int_sel bit map pinned by these rows (must match RTU.v's casez arms
+// 1:1, which are aq_rtu_int.v:53-74 verbatim):
+//   [12] meip (cause 11)  [9] seip nodeleg  [7] stip nodeleg  [3] seip deleg
+//   [11] msip (cause 3)   [8] ssip nodeleg  ...                [2] ssip deleg
+//   [10] mtip (cause 7)                                        [1] stip deleg
+//=============================================================================
+
+// Enter privilege mode pm (3=M, 1=S, 0=U) from M via mstatus.MPP + mret
+// (mie/mip/mideleg/mstatus are all M-only CSRs, so every claim cell
+// configures from M first). mret pops MIE<=MPIE, so the post-drop MIE rides
+// MPIE; SIE is untouched by mret (only sret pops it) and rides the mstatus
+// write directly.
+static void enter_priv(unsigned pm, bool mie_after, bool sie_after) {
+    uint64_t mstatus = ((uint64_t)pm << 11)                 // MPP
+                     | (mie_after ? (1ULL << 7) : 0)        // MPIE -> MIE after
+                     | (sie_after ? (1ULL << 1) : 0);       // SIE (survives mret)
+    csr_write(CSR_MSTATUS, mstatus);
+    dispatch(CP0_FUNC_MRET, 0, 0, 0);
+}
+
+// Return to M the only way privilege ever widens: a non-delegated trap
+// (these rows never write medeleg, so any vec captures to M).
+static void return_to_m(void) {
+    dut->idu_cp0_ex1_sel    = 0;
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_int = 0;
+    dut->rtu_yy_xx_expt_vec = 2;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    dut->eval();
+}
+
+static uint16_t claim_sel(void)      { dut->eval(); return (uint16_t)dut->cp0_rtu_int_sel; }
+static bool     claim_active_b(void) { dut->eval(); return dut->cp0_rtu_int_b != 0; }
+
+// One claim source's geometry: mie bit, pending source (mip pin vs mip CSR
+// flop), nodeleg/deleg int_sel bit positions, and (S-trio) its mideleg bit.
+struct ClaimSrc {
+    const char *name;
+    unsigned    mie_bit;        // mie_reg bit
+    bool        pin;            // true: driven by the mtip/msip/meip pin
+    unsigned    pin_idx;        // 0=msip 1=mtip 2=meip (pin sources only)
+    unsigned    mip_bit;        // mip flop bit (flop sources only)
+    unsigned    nodeleg_bit;    // int_sel bit, nodeleg/M-target slot
+    unsigned    deleg_bit;      // int_sel bit, deleg/S-target slot
+    unsigned    mideleg_bit;    // mideleg bit (S-trio; 0 for M-trio)
+    bool        m_trio;         // M-target source (not delegable)
+};
+
+static void set_pin(const ClaimSrc &s, bool v) {
+    switch (s.pin_idx) {
+        case 0:  dut->msip = v ? 1 : 0; break;
+        case 1:  dut->mtip = v ? 1 : 0; break;
+        default: dut->meip = v ? 1 : 0; break;
+    }
+}
+
+// Drive ONE pending+enabled source and check the export for a
+// privilege / global-enable / delegation cell.
+static void claim_cell(const ClaimSrc &s, unsigned priv, bool en, bool deleg) {
+    csr_write(CSR_MIE, 1ULL << s.mie_bit);
+    if (s.pin) set_pin(s, true);
+    else       csr_write(CSR_MIP, 1ULL << s.mip_bit);
+    csr_write(CSR_MIDELEG, deleg ? (1ULL << s.mideleg_bit) : 0);
+    enter_priv(priv, en, en);
+    tick_no_dispatch();   // settle the registered export on the new pm
+
+    // Expected claim, donor aq_cp0_trap_csr.v:1269-1338 verbatim:
+    //  M trio:    pm != M || MIE               (delegation impossible)
+    //  S nodeleg: pm==M&&MIE || pm==S || pm==U  (NO SIE term -- donor quirk:
+    //             a pending non-delegated source in S targets M unconditionally)
+    //  S deleg:   pm==S&&SIE || pm==U           (never claims from M)
+    bool expect;
+    if (s.m_trio)       expect = (priv != 3) || en;
+    else if (priv == 3) expect = !deleg && en;
+    else if (priv == 1) expect = deleg ? en : true;
+    else                expect = true;   // U: both arms bare
+    unsigned expect_bit = s.m_trio ? s.nodeleg_bit
+                        : (deleg ? s.deleg_bit : s.nodeleg_bit);
+
+    char what[128];
+    uint16_t got = claim_sel();
+    uint16_t exp = expect ? (uint16_t)(1u << expect_bit) : 0;
+    snprintf(what, sizeof(what),
+             "claim %s priv=%u en=%d deleg=%d: int_sel",
+             s.name, priv, (int)en, (int)deleg);
+    check(got == exp, what, got, exp);
+    snprintf(what, sizeof(what),
+             "claim %s priv=%u en=%d deleg=%d: active-low export",
+             s.name, priv, (int)en, (int)deleg);
+    check(claim_active_b() == !expect, what, claim_active_b(), !expect);
+
+    // Teardown: back to M, clear the pending source for the next cell.
+    return_to_m();
+    if (s.pin) set_pin(s, false);
+    else       csr_write(CSR_MIP, 0);
+}
+
+static void test_int_claim_matrix(void) {
+    // Dark check with nothing pending (the M6 OFF-path invariant: whatever
+    // mie holds, no pending source means no claim, active-low stays idle).
+    check(claim_sel() == 0, "claim: int_sel dark while nothing pending",
+          claim_sel(), 0);
+    check(claim_active_b(), "claim: active-low export idle (1) while nothing pending");
+
+    static const ClaimSrc srcs[6] = {
+        // name    mie pin idx mip ndel deleg mideleg m_trio
+        {"meip",   11, true,  2,  0, 12,  0,  0, true },
+        {"msip",    3, true,  0,  0, 11,  0,  0, true },
+        {"mtip",    7, true,  1,  0, 10,  0,  0, true },
+        {"seip",    9, false, 0,  9,  9,  3,  9, false},
+        {"ssip",    1, false, 0,  1,  8,  2,  1, false},
+        {"stip",    5, false, 0,  5,  7,  1,  5, false},
+    };
+    static const unsigned privs[3] = {3, 1, 0};   // M, S, U
+
+    for (int i = 0; i < 6; i++) {
+        for (int p = 0; p < 3; p++) {
+            for (int e = 0; e < 2; e++) {
+                claim_cell(srcs[i], privs[p], e != 0, false);
+                if (!srcs[i].m_trio)
+                    claim_cell(srcs[i], privs[p], e != 0, true);
+            }
+        }
+    }
+    csr_write(CSR_MIDELEG, 0);
+    csr_write(CSR_MIE, 0);
+    csr_write(CSR_MSTATUS, (uint64_t)3 << 11);
+    test_result("T25 M6 claim matrix: 6 sources x M/S/U x deleg x global-en (int_sel + active-low)");
+}
+
+static void test_int_claim_tvec_vectored(void) {
+    const uint64_t mbase = 0x80005000ULL;
+    const uint64_t sbase = 0x80006000ULL;
+
+    // (1) M-mode vectored: mtvec[0]=1 + interrupt cause 3 -> base + 4*3
+    //     (donor aq_cp0_trap_csr.v:1355-1359).
+    csr_write(CSR_MTVEC, mbase | 1ULL);
+    dut->idu_cp0_ex1_sel    = 0;
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_int = 1;
+    dut->rtu_yy_xx_expt_vec = 3;              // MSIP cause
+    dut->rtu_cp0_epc        = 0x80007000ULL;
+    dut->rtu_cp0_tval       = 0;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    dut->eval();
+    check(dut->cp0_rtu_trap_pc == ((mbase + 12) & PC_MASK),
+          "vectored: M interrupt cause 3 -> trap_pc = mtvec_base + 12",
+          dut->cp0_rtu_trap_pc, (mbase + 12) & PC_MASK);
+
+    // (2) Same vectored mtvec, SYNCHRONOUS exception -> plain base (the
+    //     donor's redirect arm is interrupts only, :1358-1359).
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_int = 0;
+    dut->rtu_yy_xx_expt_vec = 2;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    dut->eval();
+    check(dut->cp0_rtu_trap_pc == (mbase & PC_MASK),
+          "vectored: sync exception ignores the mode bit -> plain base",
+          dut->cp0_rtu_trap_pc, mbase & PC_MASK);
+
+    // (3) Direct-mode mtvec (bit0=0) + interrupt -> plain base.
+    csr_write(CSR_MTVEC, mbase);
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_int = 1;
+    dut->rtu_yy_xx_expt_vec = 7;              // MTIP cause
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    dut->eval();
+    check(dut->cp0_rtu_trap_pc == (mbase & PC_MASK),
+          "vectored: direct-mode mtvec + interrupt -> plain base",
+          dut->cp0_rtu_trap_pc, mbase & PC_MASK);
+
+    // (4) Delegated S-mode interrupt through stvec[0]=1: mideleg[1] (SSIP)
+    //     + trap from S with int cause 1 -> stvec_base + 4.
+    csr_write(CSR_MIDELEG, 1ULL << 1);
+    csr_write(CSR_STVEC, sbase | 1ULL);
+    enter_priv(1, false, false);               // S-mode, MIE/SIE off
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_int = 1;
+    dut->rtu_yy_xx_expt_vec = 1;               // SSIP cause, delegated
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    dut->eval();
+    check(dut->cp0_yy_priv_mode == 1,
+          "vectored stvec setup: still S-mode after the delegated trap",
+          dut->cp0_yy_priv_mode, 1);
+    check(dut->cp0_rtu_trap_pc == ((sbase + 4) & PC_MASK),
+          "vectored: delegated S interrupt cause 1 -> trap_pc = stvec_base + 4",
+          dut->cp0_rtu_trap_pc, (sbase + 4) & PC_MASK);
+    uint64_t scause = csr_read(CSR_SCAUSE);
+    check(scause == ((1ULL << 63) | 1ULL),
+          "vectored: scause == int|cause 1 for the delegated trap",
+          scause, (1ULL << 63) | 1ULL);
+
+    // Teardown: back to M (the delegated trap left us in S), clean state.
+    return_to_m();
+    csr_write(CSR_MIDELEG, 0);
+    csr_write(CSR_MTVEC, 0);
+    csr_write(CSR_STVEC, 0);
+    csr_write(CSR_MSTATUS, (uint64_t)3 << 11);
+    test_result("T26 M6 vectored tvec: intr && tvec[0] -> base+4*cause (mtvec + delegated stvec)");
+}
+
+//=============================================================================
 // Mutation-check discipline note (plan task 2.2): the mutation itself is
 // applied by hand to rtl/CSR.v (NOT left as code here), the bench re-run to
 // confirm a FAIL, then the mutation reverted before committing -- the same
@@ -1144,6 +1381,10 @@ int main(int argc, char **argv) {
     test_fflags_accrual_sticky();
     test_fs_dirty_on_fp_retire();
     test_fflags_explicit_write_wins();
+
+    // M6 Task 1: interrupt claim matrix + vectored tvec.
+    test_int_claim_matrix();
+    test_int_claim_tvec_vectored();
 
     printf("[csr_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

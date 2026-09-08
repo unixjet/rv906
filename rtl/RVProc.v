@@ -524,6 +524,13 @@ module RVProc #(
     wire                     cp0_rtu_ex1_chgflw;
     wire [PC_WIDTH-1:0]      cp0_rtu_ex1_chgflw_pc;
     wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc;
+    // M6 Task 1: CSR's registered interrupt-claim export (15-bit int_sel +
+    // active-low). DARK UNTIL TASK 2: the RTU leg (replacing RTU.v's
+    // int_vld_raw = 15'd0) is deliberately NOT wired in this task -- these
+    // nets terminate in _unused_ok at the bottom of this module so the
+    // build stays lint-clean until Task 2 threads them into RTU.v.
+    wire [14:0]              cp0_rtu_int_sel;
+    wire                     cp0_rtu_int_b;
 
     wire                     rtu_yy_xx_expt_vld;
     wire                     rtu_yy_xx_expt_int;
@@ -1406,6 +1413,12 @@ module RVProc #(
 
         .cp0_rtu_trap_pc         (cp0_rtu_trap_pc),
 
+        // M6 Task 1: interrupt-claim export (registered, active-low -- the
+        // donor-vs-rv12 registration decision is recorded at CSR.v's port).
+        // Deliberately NOT connected at the RTU instance in this task.
+        .cp0_rtu_int_sel         (cp0_rtu_int_sel),
+        .cp0_rtu_int_b           (cp0_rtu_int_b),
+
         .rtu_yy_xx_expt_vld      (rtu_yy_xx_expt_vld),
         .rtu_yy_xx_expt_int      (rtu_yy_xx_expt_int),
         .rtu_yy_xx_expt_vec      (rtu_yy_xx_expt_vec),
@@ -1523,5 +1536,12 @@ module RVProc #(
 
     // Completion is reported through tohost, exactly as in M0.
     assign quitted = 1'b0;
+
+    // M6 Task 1: the CSR interrupt-claim export nets are deliberately
+    // unconsumed in this task (the RTU consumer leg is M6 Task 2 -- it
+    // replaces RTU.v's `int_vld_raw = 15'd0`). Sink them here so Verilator
+    // sees no unused-signal warning, the same `_unused_ok` pattern as
+    // IFU.v:483/ICache.v:606. Task 2 moves them out of this bucket.
+    wire _unused_ok = &{1'b0, cp0_rtu_int_sel, cp0_rtu_int_b};
 
 endmodule
