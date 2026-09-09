@@ -284,7 +284,7 @@ struct TB : public TestBench {
         FDT::Node cpus = root->create("cpus");
         cpus.setprop("#address-cells", (uint32_t)1);
         cpus.setprop("#size-cells", (uint32_t)0);
-        cpus.setprop("timebase-frequency", (uint32_t)1250000);
+        cpus.setprop("timebase-frequency", (uint32_t)1000000);
 
         FDT::Node cpu = cpus.create("cpu@0");
         cpu.setprop("device_type", "cpu");
@@ -292,7 +292,11 @@ struct TB : public TestBench {
         cpu.setprop("status", "okay");
         cpu.setprop("compatible", "riscv");
 #if CONFIG_RV64I
-        cpu.setprop("riscv,isa", "rv64imac");
+        // M6 Task 5: advertise the full implemented ISA (M3 A, M5 F/D, M4
+        // S/U) + the two implemented Z* extensions. Must stay in lockstep
+        // with CSR.v's misa_value (IMACFDSU) -- the kernel cross-checks the
+        // two. No zbb/zicbom: SVPBMT/ZBB/ZICBOM are hwcap-gated, safe to omit.
+        cpu.setprop("riscv,isa", "rv64imafdc_zicsr_zifencei");
         cpu.setprop("mmu-type", "riscv,sv39");
 #else
         cpu.setprop("riscv,isa", "rv32imac");

@@ -193,7 +193,7 @@ M4 left two explicit M6 obligations in its deviation ledger:
 | 2 | RTU interrupt leg live + first e2e | new CSR→RTU input port replaces `int_vld_raw = 15'd0` (RTU.v:744); the existing casez (RTU.v:747-766) becomes the live priority/cause encoder; verify tval=0-for-int in the retire chain (donor aq_rtu_retire.v:541-542); epc=next-PC (:847) and flush FSM untouched; RVProc.v wiring; **first end-to-end: directed msip self-interrupt** (cause 3\|bit63) | msip e2e PASS + full battery (int_sel=0 at reset ⇒ bit-identical OFF path) |
 | 3 | `time` CSR (0xC01) | read-mux arm ← CLINT mtime (new CSR.v input; RVProc.v wire from the existing `clint_mtime`); same mirror serves M/S/U `time`; counteren stays lenient (D-M6-5) | csr_tb time row; time-increases directed |
 | 4 | Real WFI (D-M4-7) | wfi → flush (existing FSM) + pipe hold: no fetch/issue until wake; CSR wake condition `(mip & mie) != 0` in the always-on domain (donor aq_cp0_lpmd.v wake, NO MIE/SIE/priv gate); wfi retires as no-op on wake; TW=1 && pm<M trap arm kept | rv64si-p-wfi (wfi must NOT halt: SIE=0+SSIP pending); directed wfi-wake on MTIP |
-| 5 | misa + FDT isa lockstep | misa low word 0x112C → 0x14112D (+A, +S, +U; MXL bits verified at CSR.v:955, mcsr pins MXL=2); FDT `riscv,isa` → "rv64imafdc_zicsr_zifencei" (RVProcTest.cpp:295; NO zbb — SVPBMT/ZBB/ZICBOM are hwcap-gated optimizations, safe to omit); FDT timebase-frequency → 1000000 (D-M6-4); **new `/chosen` node: `stdout-path="/uart@10001000"` + `bootargs="console=ttyS0 earlycon"`** (without it no console attaches — banner never reaches stdout); cross-check kernel `.config` `CONFIG_RISCV_ISA_*` vs implemented before boot | full battery unchanged (sweep 86/87, unit, atomics, si 7/7) |
+| 5 | misa + FDT isa lockstep | misa low word 0x112C → 0x14111D (IMACFDSU; D-M6-6 — the 0x14112D first drafted here has a bit4/bit5 F/G transposition); FDT `riscv,isa` → "rv64imafdc_zicsr_zifencei" (RVProcTest.cpp:295; NO zbb — SVPBMT/ZBB/ZICBOM are hwcap-gated optimizations, safe to omit); FDT timebase-frequency → 1000000 (D-M6-4); **new `/chosen` node: `stdout-path="/uart@10001000"` + `bootargs="console=ttyS0 earlycon"`** (without it no console attaches — banner never reaches stdout); cross-check kernel `.config` `CONFIG_RISCV_ISA_*` vs implemented before boot | full battery unchanged (sweep 86/87, unit, atomics, si 7/7) |
 | 6 | PLIC UART IRQ | C++ UART IRQ flag (uart16550.cpp:98-104) → new RVProcAXI top port → PLIC.v `int_src[7]` (UART = source 7; RVProcAXI.v:668 un-ties the bus); TB reads the model flag in `TB::step()` | directed PLIC-UART e2e (cause 11\|bit63, claim/complete @0x200004) |
 | 7 | Bare-metal interrupt suite | `test/m6/` Makefile + 8 directed tests: (1) msip, (2) mtip mtimecmp tick + time check, (3) plic-uart, (4) ssip delegation (mideleg[1] → S trap cause 1\|bit63 via stvec), (5) stip SBI-model (M-handler sets stip_f + sret → S trap cause 5\|bit63), (6) priority (MEIP+MSIP+MTIP → cause 11 first), (7) vectored tvec (mtvec[0]=1, MSIP → epc=base+12), (8) wfi-wake; link.ld tohost → 0x7FFFF000 (uncached aperture) | 8/8 via run_all.sh |
 | 8 | Linux boot | copy fw_jump.elf/Image/rootfs.cpio → `test/m6/linux/`; `dtb_addr` → 0x82200000; `a0=hartid` poke in dut.cpp; `run_linux.sh` = `timeout 21600 bin/verisim/testbench fw_jump.elf --kernel Image --initrd rootfs.cpio \| tee boot.log` + `grep -q "Linux version"`; verify FDT isa string ⊆ implemented ISA (Zbb omitted) | BOOT-PASS (banner); stretch: "Run /init" |
@@ -232,6 +232,15 @@ of sim — run in background early, iterate on failures in parallel).
   mcounteren/scounteren are storage-only; user cycle/time/instret
   reads always allowed. Lenient; boot-safe (a stricter machine could
   trap where rv906 won't — never the reverse).
+
+- **D-M6-6 — misa target corrected (row 5 value is wrong).** Row 5's
+  `misa → 0x14112D` (and the pre-M6 constant `0x112C`) both carry a
+  bit4/bit5 transposition: they set bit5 (the G meta-extension) and
+  omit bit4 (F). rv906 implements F (M5) and its own FDT string
+  "rv64imafdc" requires it, so the correct value is **0x14111D**
+  (IMACFDSU = I|M|A|F|D|C|S|U). Task 5 uses 0x14111D; this supersedes
+  row 5's 0x14112D. The CSR.v comment's "F(bit5)" label was the source
+  of the original error.
 
 ## Verification plan
 

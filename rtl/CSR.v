@@ -26,7 +26,7 @@
 // SCOPE NOTE (contract 7): mstatus (only MIE/MPIE real, MPP tied 2'b11 RO),
 // mtvec (direct mode only), mepc (LSB forced 0), mcause, mscratch, mtval
 // (vec allowlist {1,2,4,5,6,7,12,13,15} only), mie/mip (mip read-only wires
-// from mtip/msip/meip), misa (RO: MXL=64, I|M|C|F|D), mvendorid/marchid/mimpid/
+// from mtip/msip/meip), misa (RO: MXL=64, IMACFDSU), mvendorid/marchid/mimpid/
 // mhartid (hardwired), mcycle/minstret (two local free-running counters).
 // Everything else is ABSENT, not stubbed -- no satp/PMP/fcsr/vector-CSR/S-
 // mode ports exist on this module at all.
@@ -1151,16 +1151,18 @@ module CSR #(
     //=========================================================================
     // SECTION MISA / MVENDORID / MARCHID / MIMPID / MHARTID -- hardwired RO
     // constants (contract 7). MXL=64 ("10"), extensions I(bit8)|M(bit12)|
-    // C(bit2)|F(bit5)|D(bit3). F/D are flipped 0->1 here at THE SWAP (M5
-    // Task 9, D11) -- the ONE commit where FP-opcode acceptance goes live,
-    // mirroring the decode's own hardwired illegal-gate flip in IDU.v (no
-    // live CSR plumbing: misa is a permanently-RO hardware capability, so
-    // the two constants are flipped together and must stay in lockstep).
+    // A(bit0)|F(bit4)|D(bit3)|C(bit2)|S(bit18)|U(bit20) == IMACFDSU.
+    // M6 Task 5: corrected from the pre-M6 0x..._112C, which carried a
+    // bit4/bit5 transposition -- it set bit5 (the G meta-extension) instead
+    // of bit4 (F) while the comment mislabeled F as "bit5". 0x..._14111D
+    // matches the FDT "rv64imafdc" string and the implemented ISA (M3
+    // atomics, M5 F/D, M4 S/U priv). The M6 design doc's row-5 target
+    // 0x14112D inherited the same error and is superseded by this value.
     // mvendorid mirrors the real donor's own JEDEC-ish constant
     // (info_csr.v, LSU/CP0 note B2) purely for traceability -- values are
     // cosmetic per contract 7, not exercised by riscv-tests pass/fail.
     //=========================================================================
-    wire [63:0] misa_value      = 64'h8000_0000_0000_112C;
+    wire [63:0] misa_value      = 64'h8000_0000_0014_111D;
     wire [63:0] mvendorid_value = 64'h0000_0000_0000_05B7;
     wire [63:0] marchid_value   = 64'd0;
     wire [63:0] mimpid_value    = 64'd0;

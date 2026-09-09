@@ -313,8 +313,10 @@ static void test_reset_state(void) {
 
 static void test_misa_and_ids_readonly(void) {
     uint64_t misa_before = csr_read(CSR_MISA);
-    check(misa_before == 0x800000000000112CULL,
-          "misa: MXL=64,I|M|C|F|D == 0x800000000000112C (F/D set by THE SWAP, M5 Task 9)", misa_before, 0x800000000000112CULL);
+    // M6 Task 5 (D-M6-6): IMACFDSU = I|M|A|F|D|C|S|U. The pre-M6 0x..._112C
+    // had a bit4/bit5 F/G transposition (set G, omitted F); corrected here.
+    check(misa_before == 0x800000000014111DULL,
+          "misa: MXL=64,IMACFDSU == 0x800000000014111D (M6 Task 5; F=bit4 not bit5)", misa_before, 0x800000000014111DULL);
     csr_write(CSR_MISA, 0xFFFFFFFFFFFFFFFFULL);
     check(csr_read(CSR_MISA) == misa_before, "misa: write is ignored (RO)");
 
