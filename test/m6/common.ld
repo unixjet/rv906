@@ -22,7 +22,7 @@ SECTIONS
 {
   /* uncached aperture (below 0x80000000) -- must precede the image */
   . = 0x7FFFF000;
-  .tohost : { *(.tohost) . = 0x80; }
+  .tohost : { tohost = .; *(.tohost) . = 0x80; }
 
   . = 0x80000000;
   .text : {

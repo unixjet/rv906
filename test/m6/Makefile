@@ -35,7 +35,11 @@ OBJDUMP  = $(CROSS_COMPILE)objdump
 CFLAGS  = -march=rv64imac_zicsr -mabi=lp64 -O2 -nostdlib -g
 LDFLAGS = -T $(M6_DIR)common.ld -nostdlib
 
-TESTS = msip mtip plic_uart ssip_deleg stip_sbi priority vectored wfi_wake
+# TESTS is globbed from the .S sources present, so the suite grows
+# incrementally as each milestone adds a test (Task 2 = msip; the full
+# set lands at Task 7). `make list` and the build always match the
+# sources that exist.
+TESTS := $(basename $(notdir $(wildcard $(M6_DIR)/*.S)))
 ELFS  = $(addprefix $(BUILD_DIR)/m6-,$(addsuffix .elf,$(TESTS)))
 
 all: $(ELFS)

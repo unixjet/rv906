@@ -289,6 +289,22 @@ module RTU (
     input  wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc,
 
     //=========================================================================
+    // M6 Task 2: CSR's registered interrupt-claim export (clone donor
+    // aq_cp0_trap_csr.v:1269-1338). The claim is exported as `cp0_rtu_int_sel`
+    // [14:0] + active-low `cp0_rtu_int_b`. For the valid term, follow rv12's
+    // shape (rv12/rtl/RTU.v:2028-2031: `rob_read0_int_vld = !cp0_rtu_xx_int_b
+    // && ...`). Staleness proof (one cycle behind combinational claim): after
+    // trap at T, `retire_inst_flush_fe_set`=1 → `retire_commit_clear`=1
+    // (RTU.v:892) → `rtu_idu_commit`=0 (RTU.v:925), so every `ex1_*_cmplt_dp`
+    // source is gated by `rtu_idu_commit` (IDU.v:2160-2167,2218); thus at T,
+    // `dp_ex1_cmplt_dp`=0 → `ex2_retire_vld<=0` latched at T's edge (RTU.v:724)
+    // → at T+1, `retire_trap_vld` (requires `ex2_retire_vld`, RTU.v:851) cannot
+    // assert → stale claim never observed by retire. Spot-check confirmed at
+    // IDU.v lines 2160-2167 and 2218.
+    input  wire [14:0]              cp0_rtu_int_sel,
+    input  wire                     cp0_rtu_int_b,
+
+    //=========================================================================
     // FPU -> RTU : M5 Task 4b FALU EX1 writeback (design doc S7.3 style --
     // fvld/fdata/preg feed the new wbf0 FRF-writeback register below; xvld/
     // xdata/preg join the EX1-group rbus arbiter as a third leg alongside
@@ -735,13 +751,14 @@ module RTU (
 
     //=========================================================================
     // SECTION INTERRUPT PRIORITY ENCODER (RTU note S5 -- aq_rtu_int.v:52-81,
-    // a faithful clone of the 15-source casez cause table). Fed by an
-    // internal, permanently-0 vector -- see header's "deliberately not
-    // added" note. `retire_int_inst` is therefore provably always 0
-    // (the `|int_vld_raw` term forces it), matching task 4.1's "wired but
-    // structurally never fire" framing exactly.
+    // a faithful clone of the 15-source casez cause table). M6 Task 2: feed
+    // CSR's registered claim via cp0_rtu_int_sel[14:0] donor
+    // aq_cp0_trap_csr.v:1269-1338. `retire_int_inst = !cp0_rtu_int_b && ...`
+    // follows rv12's shape (rv12/rtl/RTU.v:2028-2031: `rob_read0_int_vld =
+    // !cp0_rtu_xx_int_b && ...`); equivalent to `|int_vld_raw` but consumes
+    // both ports as intended -- RVProc.v needs no _unused_ok at all.
     //=========================================================================
-    wire [14:0] int_vld_raw = 15'd0;
+    wire [14:0] int_vld_raw = cp0_rtu_int_sel;
 
     reg [4:0] int_vec_enc;
     always @* begin
@@ -768,7 +785,7 @@ module RTU (
     wire dtu_int_mask_tied0  = 1'b0;   // no DTU in M2
     wire int_ex2_split_tied0 = 1'b0;   // no split-instruction concept in M2
 
-    wire       retire_int_inst = (|int_vld_raw) && !dtu_int_mask_tied0 && !int_ex2_split_tied0;
+    wire       retire_int_inst = !cp0_rtu_int_b && !dtu_int_mask_tied0 && !int_ex2_split_tied0;
     wire [4:0] retire_int_vec  = int_vec_enc;
 
     //=========================================================================
@@ -779,14 +796,12 @@ module RTU (
     // (pending-breakpoint) and 4 (ebreak/debug breakpoint) are permanently 0
     // -- no DTU in M2 (ebreak itself already retires via leg 5: CSR.v
     // declares it as a plain synchronous EX1 exception, vec=3, not via a
-    // separate debug-trigger path). Leg 2 (interrupt) is permanently 0 per
-    // the section above. Leg 3 (LSU async bus error) is REAL and wired for
-    // real -- it is simply 0 today because LSU.v (Task 6) does not exist
-    // yet. M2 has no debug unit and no directed interrupt test, so legs 1/2/4
-    // are wired but structurally never fire, per task 4.1's own framing.
+    // separate debug-trigger path). Leg 2 (interrupt) is now wired for real
+    // at M6 Task 2; legs 1/4 remain structurally never-fire. M2 has no
+    // debug unit, so legs 1/4 are permanently tied off.
     //=========================================================================
     wire retire_pending_bkpt_expt = 1'b0;                      // leg 1: no DTU
-    // retire_int_inst                                          // leg 2: see above
+    // M6 Task 2: retire_int_inst above                                      // leg 2: interrupt
     wire retire_async_expt        = lsu_rtu_async_expt_vld;    // leg 3: real, LSU-sourced
     wire retire_bkpt_expt         = 1'b0;                      // leg 4: no DTU
 

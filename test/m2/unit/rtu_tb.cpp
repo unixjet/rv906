@@ -115,6 +115,9 @@ static void tie_idle_inputs(void) {
     dut->cp0_rtu_ex1_chgflw    = 0;
     dut->cp0_rtu_ex1_chgflw_pc = 0;
     dut->cp0_rtu_trap_pc       = 0x80000010ULL;   // mtvec-equivalent target, arbitrary nonzero
+    // M6 Task 2: drive CSR's registered interrupt-claim export (active-LOW: 1=no claim)
+    dut->cp0_rtu_int_sel       = 0;              // no interrupt sources claimed at reset
+    dut->cp0_rtu_int_b         = 1;              // active-low valid term tied off at idle
     // FALU (M5 Task 4b: EX1-group rbus arbiter's 3rd leg + registered wbf0)
     dut->fpu_rtu_ex1_falu_fdata = 0;
     dut->fpu_rtu_ex1_falu_xdata = 0;
