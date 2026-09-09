@@ -364,6 +364,7 @@ module RVProcAXI (
     //=========================================================================
     wire        clint_mtip;     // Machine Timer Interrupt Pending
     wire        clint_msip;     // Machine Software Interrupt Pending
+    wire [63:0] clint_mtime;    // M6 Task 3: CLINT mtime mirror -> CPU `time` CSR
     wire        plic_meip;      // Machine External Interrupt Pending
 
     // RTC tick divider (divide clk by 100 for ~1MHz RTC from 100MHz system clock)
@@ -635,6 +636,7 @@ module RVProcAXI (
         .rtc_tick       (rtc_tick),
         .mtip           (clint_mtip),
         .msip           (clint_msip),
+        .mtime_out      (clint_mtime),
         .axi_awvalid    (clint_awvalid),
         .axi_awready    (clint_awready),
         .axi_awaddr     (clint_awaddr),
@@ -886,6 +888,7 @@ module RVProcAXI (
         .mtip               (clint_mtip),
         .msip               (clint_msip),
         .meip               (plic_meip),
+        .mtime              (clint_mtime),
 
         .quitted            (quitted)
     );

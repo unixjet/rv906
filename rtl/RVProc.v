@@ -131,6 +131,7 @@ module RVProc #(
     input  wire                 mtip,               // Machine Timer Interrupt Pending
     input  wire                 msip,               // Machine Software Interrupt Pending
     input  wire                 meip,               // Machine External Interrupt Pending
+    input  wire [63:0]          mtime,              // M6 Task 3: CLINT mtime -> `time` CSR (0xC01)
 
     //=========================================================================
     // Control/Status
@@ -1481,7 +1482,8 @@ module RVProc #(
 
         .mtip                    (mtip),
         .msip                    (msip),
-        .meip                    (meip)
+        .meip                    (meip),
+        .mtime                   (mtime)
     );
 
     //=========================================================================

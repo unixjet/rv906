@@ -27,6 +27,7 @@ module CLINT #(
     // Interrupt outputs to CPU
     output wire                 mtip,       // Machine Timer Interrupt Pending
     output wire                 msip,       // Machine Software Interrupt Pending
+    output wire [63:0]          mtime_out,  // M6 Task 3: live mtime mirror for the `time` CSR (0xC01)
 
     //=========================================================================
     // AXI4-Lite Slave Interface
@@ -195,5 +196,9 @@ module CLINT #(
     //=========================================================================
     assign mtip = (mtime >= mtimecmp);
     assign msip = msip_reg;
+    // M6 Task 3: mirror the free-running mtime to the CPU's `time` CSR (0xC01).
+    // Combinational mirror of the internal register -- same value the AXI read
+    // at offset 0xBFF8 returns, so the CSR and the MMIO view never diverge.
+    assign mtime_out = mtime;
 
 endmodule

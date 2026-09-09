@@ -312,7 +312,7 @@ parameter [11:0] CSR_MIDELEG    = 12'h303;
 parameter [11:0] CSR_MCOUNTEREN = 12'h306;
 // User read-only counter aliases (Zicntr)
 parameter [11:0] CSR_CYCLE      = 12'hC00;
-parameter [11:0] CSR_TIME       = 12'hC01;   // storage deferred to M6 (D-M4-9)
+parameter [11:0] CSR_TIME       = 12'hC01;   // M6 Task 3: live (CLINT mtime mirror, D-M4-9 discharged)
 parameter [11:0] CSR_INSTRET    = 12'hC02;
 // Debug triggers (M4: zero-trigger escape hatch, D-M4-5; real triggers M7)
 parameter [11:0] CSR_TSELECT    = 12'h7A0;

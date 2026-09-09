@@ -288,7 +288,10 @@ module CSR #(
     //=========================================================================
     input  wire                     mtip,
     input  wire                     msip,
-    input  wire                     meip
+    input  wire                     meip,
+    // M6 Task 3: live CLINT mtime mirror -- read-only `time` CSR (0xC01),
+    // serves the M/S/U alias from one mirror (design doc Task 3).
+    input  wire [63:0]              mtime
 );
 
     //=========================================================================
@@ -1549,6 +1552,7 @@ module CSR #(
             CSR_MCYCLE:     csr_read_mux = mcycle_reg;
             CSR_MINSTRET:   csr_read_mux = minstret_reg;
             CSR_CYCLE:      csr_read_mux = mcycle_reg;
+            CSR_TIME:       csr_read_mux = mtime;
             CSR_INSTRET:    csr_read_mux = minstret_reg;
             CSR_TSELECT:    csr_read_mux = tselect_value;
             CSR_TDATA1:     csr_read_mux = tdata1_value;

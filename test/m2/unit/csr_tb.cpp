@@ -47,6 +47,7 @@ static const uint32_t CSR_MIP       = 0x344;
 static const uint32_t CSR_SCAUSE    = 0x142;   // M6 Task 1: delegated trap check
 static const uint32_t CSR_MCYCLE    = 0xB00;
 static const uint32_t CSR_MINSTRET  = 0xB02;
+static const uint32_t CSR_TIME      = 0xC01;   // M6 Task 3: CLINT mtime mirror
 static const uint32_t CSR_MVENDORID = 0xF11;
 static const uint32_t CSR_MARCHID   = 0xF12;
 static const uint32_t CSR_MIMPID    = 0xF13;
@@ -124,6 +125,7 @@ static void tie_idle_inputs(void) {
     dut->mtip = 0;
     dut->msip = 0;
     dut->meip = 0;
+    dut->mtime = 0;   // M6 Task 3: CLINT mtime mirror (driven per-test below)
 }
 
 static void tick(void) {
@@ -897,6 +899,31 @@ static void test_mcycle_free_running(void) {
     test_result("T20 mcycle: free-running, increments every cycle, R/W");
 }
 
+static void test_time_csr_mirror(void) {
+    // M6 Task 3: time (0xC01) is a READ-ONLY mirror of the CLINT mtime input.
+    // It is not a storage flop -- the read mux returns the live `mtime` pin,
+    // so advancing the driven input must be immediately visible.
+    dut->mtime = 0x1122334455667788ULL;
+    uint64_t t0 = csr_read(CSR_TIME);
+    check(t0 == 0x1122334455667788ULL, "time: read returns the driven mtime value",
+          t0, 0x1122334455667788ULL);
+
+    dut->mtime = 0xAABBCCDDEEFF0011ULL;
+    uint64_t t1 = csr_read(CSR_TIME);
+    check(t1 == 0xAABBCCDDEEFF0011ULL,
+          "time: read tracks a changed mtime pin (mirror, not a storage flop)",
+          t1, 0xAABBCCDDEEFF0011ULL);
+    check(t1 > t0, "time: a larger mtime reads as a larger time", t1, t0);
+
+    // time is read-only: a write form must NOT raise wb_vld storage (the
+    // generic RO-write gate, csr_addr[11:10]==2'b11, traps it as illegal).
+    dut->mtime = 0x0ULL;
+    uint64_t t2 = csr_read(CSR_TIME);
+    check(t2 == 0x0ULL, "time: read reflects the reset-to-zero mtime pin",
+          t2, 0x0ULL);
+    test_result("T27 time: read-only mirror of CLINT mtime, tracks the live pin");
+}
+
 static void test_minstret_rw_no_spurious_increment(void) {
     csr_write(CSR_MINSTRET, 0x77ULL);
     uint64_t before = csr_read(CSR_MINSTRET);
@@ -1372,6 +1399,7 @@ int main(int argc, char **argv) {
     test_mtvec_direct_mode_only();
     test_mepc_lsb_forced_zero();
     test_mcycle_free_running();
+    test_time_csr_mirror();
     test_minstret_rw_no_spurious_increment();
     test_flush_suppresses_dispatch();
 
