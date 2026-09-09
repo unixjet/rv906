@@ -119,7 +119,7 @@ bash test/m4/run_directed.sh                          # SI+MI+MMU: PASS=30 FAIL=
 | mmu_ldst_samepage                  | Load+store to the same translated page, no false miss             |
 | mmu_amo                            | AMO under Sv39 (found the double-dispatch race, see LSU §M4)      |
 | rv64si-p-dirty                     | Software A/D (no HW update); D-M4-1 store/AMO/SC-fault-on-D=0     |
-| rv64si-p-wfi / rv64mi-p-illegal    | TW/TVM/TSR trap arms; WFI flushing no-op (D-M4-7)                  |
+| rv64si-p-wfi / rv64mi-p-illegal    | TW/TVM/TSR trap arms; WFI real since M6 Task 4 (D-M4-7 discharged)  |
 | rv64mi-p-pmpaddr                   | PMP WARL/NAPOT-readback conformance (no deviation needed, N §…)   |
 | rv64mi-p-breakpoint                | No-triggers escape (real tselect/tdata1/tdata2/tcontrol, D-M4-5)  |
 | rv64mi-p-instret_overflow          | Write-suppresses-increment minstret semantics                     |
@@ -131,9 +131,11 @@ bash test/m4/run_directed.sh                          # SI+MI+MMU: PASS=30 FAIL=
 - D-M4-4/D11: single 128-entry fully-associative flop TLB (no uTLB/jTLB split).
 - D-M4-5/D12: T-Head SMIR/SMEL/SMEH/SMCIR + tlbp/tlbr/tlbwi/tlbwr dropped.
 - D-M4-6: sfence.vma over-invalidates (whole TLB for every flavor).
-- D-M4-7: WFI is a flushing no-op until M6's interrupt path exists.
+- D-M4-7: DISCHARGED at M6 Task 4 — WFI is a real hold-until-wake on
+  (mip & mie) with no MIE/SIE/priv gate (M6 doc D-M6-2).
 - D-M4-8: NA4 stays dead (donor ties it 0 too).
-- D-M4-9: `time` CSR (0xC01) deferred to M6/CLINT.
+- D-M4-9: DISCHARGED at M6 Task 3 — `time` (0xC01) is a live CLINT
+  mtime mirror.
 - D-M4-11: "THE SWAP" (Task 8) closed by construction — CSR.v's privilege
   decode was live from Task 1 onward, so G1 was satisfied continuously by
   every task's gate run rather than by one flip commit.

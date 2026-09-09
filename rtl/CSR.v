@@ -382,6 +382,25 @@ module CSR #(
                     || (is_fencei && (fencei_launch || fencei_state == FI_CLEAN
                                       || fencei_state == FI_INV));
 
+    // WFI (M6 Task 4, discharges D-M4-7; D-M6-2 shape): a legal wfi pins
+    // EX1 (cp0_idu_fencei_full term below -- no fetch/issue of the next
+    // instruction) and is held until the wake condition; on the wake cycle
+    // the hold releases and wfi retires as a plain no-op (cmplt fires that
+    // one cycle, exactly like a csr read). Wake = raw (mip & mie) != 0 with
+    // DELIBERATELY no MIE/SIE/priv gate -- donor aq_cp0_lpmd.v:107-155
+    // wakes on pending-and-enabled only; the global-enable check belongs
+    // to the trap-taken path (RTU claim via cp0_rtu_int_sel, which already
+    // carries the pm!=M||MIE gate), not to the wait-for-interrupt wake.
+    // mip_value/mie_reg (defined below) are the same live storage the
+    // claim path uses, so a wfi wakes on exactly the sources the hart
+    // would next take. No LPMD clock gate, no IFU/LSU/MMU quiesce
+    // handshake (D-M6-2): holding EX1 in an in-order single-issue pipe
+    // drains the pipe by construction; the IF buffer backpressures fetch.
+    // The TW=1 && pm<M illegal trap arm (wfi_priv_illegal below) is
+    // untouched -- an illegal wfi traps, it does not hold.
+    wire wfi_wake = (mip_value & mie_reg) != 64'd0;
+    wire wfi_hold = is_wfi && !wfi_wake;
+
     wire is_csrrw  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRW);
     wire is_csrrs  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRS);
     wire is_csrrc  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRC);
@@ -1636,11 +1655,17 @@ module CSR #(
     // fence_hold (above) holds a FENCE/FENCE.I in EX1 from LSU-quiescence
     // through the clean/invalidate walks -- cmplt_dp must NOT heartbeat
     // while held, otherwise RTU would retire the fence before its ordering
-    // guarantee is established.
-    assign cp0_rtu_ex1_cmplt_dp = ex1_active && !fence_hold && !sfence_hold;
+    // guarantee is established. wfi_hold (M6 Task 4) applies the same rule
+    // to WFI: no heartbeat while held, so RTU cannot retire the wfi (or
+    // claim the waking interrupt) before the wake condition is live; on
+    // the wake cycle cmplt fires exactly once and the RTU claim takes the
+    // interrupt at the wfi's own retire boundary (epc = wfi+4).
+    assign cp0_rtu_ex1_cmplt_dp = ex1_active && !fence_hold && !sfence_hold
+                                 && !wfi_hold;
     // Port name predates M4 (FENCE.I-only originally); it now stalls IDU
-    // dispatch for the sfence.vma sequencer too, same mechanism.
-    assign cp0_idu_fencei_full  = fence_hold || sfence_hold;
+    // dispatch for the sfence.vma sequencer too, same mechanism. M6 Task 4
+    // adds wfi_hold to the same term: while held, wfi stays pinned in EX1.
+    assign cp0_idu_fencei_full  = fence_hold || sfence_hold || wfi_hold;
     // Task 7.3: the completing CSR instruction's length. CP0 completes in
     // EX1 (single cycle), so the completing instruction IS the live EX1
     // instruction -- no latching needed.
