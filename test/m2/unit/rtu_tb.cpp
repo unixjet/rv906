@@ -92,6 +92,11 @@ static void tie_idle_inputs(void) {
     // LSU
     dut->lsu_rtu_ex1_cmplt        = 0;
     dut->lsu_rtu_ex1_cmplt_dp     = 0;
+    // M6 Task 7: the replying LSU op's own PC/next-PC. Idle default mirrors
+    // the IU display default below (0x1000/0x1004) so solo-LSU dp rows that
+    // don't care about epc see a sane value.
+    dut->lsu_rtu_ex1_cur_pc       = 0x1000;
+    dut->lsu_rtu_ex1_next_pc      = 0x1004;
     dut->lsu_rtu_wb_data          = 0;
     dut->lsu_rtu_wb_preg          = 0;
     dut->lsu_rtu_wb_vld           = 0;
@@ -386,10 +391,16 @@ static void test_mtval_allowlist(void) {
     dut->lsu_rtu_expt_vld     = 1;
     dut->lsu_rtu_expt_vec     = 2;      // illegal instruction -- IS allowlisted
     dut->lsu_rtu_tval         = 0xDEAD;
+    // M6 Task 7: solo-LSU dp -- the epc must come from the LSU's OWN
+    // replying-op pc (0x3000), NOT the decayed IU display (0x1000).
+    dut->lsu_rtu_ex1_cur_pc   = 0x3000;
+    dut->lsu_rtu_ex1_next_pc  = 0x3004;
     tick();
     check(dut->rtu_yy_xx_expt_vec == 2, "allowlist: vec==2 propagated");
     check(dut->rtu_cp0_tval == 0xDEAD, "allowlist: vec 2 IS allowlisted -- tval populated",
           dut->rtu_cp0_tval, 0xDEAD);
+    check(dut->rtu_cp0_epc == 0x3000, "solo-LSU dp: epc == replying op's pc (LSU export, not IU display)",
+          dut->rtu_cp0_epc, 0x3000);
 
     tie_idle_inputs();
     dut->lsu_rtu_ex1_cmplt_dp = 1;

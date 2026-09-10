@@ -328,6 +328,17 @@ module IU (
     output wire [15:0]              iu_lsu_ex1_cur_pc,
 
     //=========================================================================
+    // IU -> LSU : full-width EX1 instruction PC (the pcgen display), M6
+    // Task 7. The LSU latches it at AG-issue into its own replying-op pc
+    // (dc_pc_full_r / lfb_pc) so a delayed ST_REPLY/LFB-retire can report
+    // the replying op's real PC to the RTU's epc path -- the 16-bit PFB
+    // tag above is too narrow for an epc. Same source as iu_cp0_ex1_cur_pc
+    // (bju_pcgen_pc): valid for the EX1-resident op, decays when EX1 is
+    // empty, which is exactly why the LSU must latch it at issue.
+    //=========================================================================
+    output wire [PC_WIDTH-1:0]      iu_lsu_ex1_pc,
+
+    //=========================================================================
     // CP0 -> IU : BJU's reset PC seed (already exists as an M1 port on
     // RVProc.v, `cp0_xx_mrvbr` -- restore-checklist item 4, IU note S4.5).
     //=========================================================================
@@ -1338,5 +1349,8 @@ module IU (
     // M3b Task D: PFB trainer's PC tag (donor aq_lsu_ag.v:685 takes the same
     // EX1 PC the donor IU broadcasts here).
     assign iu_lsu_ex1_cur_pc = bju_pcgen_pc[15:0];
+    // M6 Task 7: full-width twin for the LSU's replying-op pc latch (see the
+    // port comment -- same source, same validity caveats as the 16-bit tag).
+    assign iu_lsu_ex1_pc     = bju_pcgen_pc;
 
 endmodule

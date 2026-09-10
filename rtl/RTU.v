@@ -246,6 +246,14 @@ module RTU (
     // Task 7.3: completing-LSU length for the pcgen inst_len mux
     // (donor aq_rtu_dp.v:367 lsu arm).
     input  wire                     lsu_rtu_ex1_inst_len,
+    // M6 Task 7: the replying LSU op's own PC/next-PC (see LSU.v). Used for
+    // ex2_cur_pc/ex2_next_pc when the LSU is the SOLE dp source this cycle
+    // (ex1_lsu_solo_dp) -- its ST_REPLY/LFB-retire lands cycles after the
+    // op left EX1, so the live iu_rtu_ex1_cur_pc/_next_pc display has
+    // decayed and would corrupt an interrupt/sync-exception epc taken at
+    // that boundary. Donor never needs this (its EX1 blocks until dp).
+    input  wire [PC_WIDTH-1:0]      lsu_rtu_ex1_cur_pc,
+    input  wire [PC_WIDTH-1:0]      lsu_rtu_ex1_next_pc,
     input  wire [63:0]              lsu_rtu_wb_data,
     input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     input  wire                     lsu_rtu_wb_vld,
@@ -668,19 +676,61 @@ module RTU (
     //=========================================================================
     // SECTION EX1->EX2 RETIRE REGISTER (task 4.1, RTU note S2 -- the single
     // un-skidded pipe register: retiring at most 1/cycle, 0/cycle on any
-    // stall, no queue, no second entry). Unlike the donor's conditional-hold
-    // `dp_ex2_*` register (aq_rtu_dp.v:434-454, gated on `dp_ex1_cmplt` to
-    // save ASIC clock-gating power), this body uses a PLAIN unconditional
-    // register for every field: functionally equivalent because every
-    // consumer below ANDs in `ex2_retire_vld` (or an is-this-field's-source-
-    // cmplt qualifier) before trusting the field's value -- the donor's own
-    // retire_trap_vld/chgflw_vld/etc. pattern -- and RTL simulation has no
-    // need to preserve an ASIC-only power optimization. `ex2_retire_vld`
-    // itself (the donor's `ctrl_ex2_cmplt`/`retire_ex2_retire_vld`,
-    // aq_rtu_ctrl.v:174-182) is ALREADY unconditional in the donor.
+    // stall, no queue, no second entry).
+    //
+    // M6 Task 7 (class-B clone fix, donor aq_rtu_dp.v:433-451): the data
+    // latches below are now GATED on `dp_ex1_cmplt_dp`, matching the
+    // donor's conditional-hold `dp_ex2_*` block (donor aq_rtu_dp.v:434-454).
+    // The M2 body had them plain unconditional on the premise that "every
+    // consumer ANDs in ex2_retire_vld, so the value on non-dp cycles is
+    // irrelevant." M3b's non-blocking LSU broke that premise: a store/
+    // load's dp (ST_REPLY/LFB-retire) lands CYCLES after the op left EX1,
+    // by which time the iu_rtu_ex1_cur_pc/_next_pc display has decayed
+    // (pcgen + default 4B increment on the empty-pipe display). An
+    // interrupt or sync exception taken at that dp boundary (trap one
+    // cycle later) then latched the decayed display as mepc -- observed as
+    // mepc=0x30/0x1303 garbage in test/m6 vectored (spin loop at 0x2a-0x2d)
+    // whenever the MSIP/MTIP claim landed on a store's delayed reply
+    // instead of a spin-loop bju/alu dp. The donor never hits this: its
+    // EX1 blocks until dp (aq_lsu_ag.v ag_self_stall), so the display at
+    // the dp_ex1_cmplt cycle is always the dp'ing op's. Gating alone is
+    // NOT sufficient in rv906 (the display is already decayed DURING the
+    // delayed dp cycle), so ex2_cur_pc/ex2_next_pc additionally source the
+    // LSU's OWN replying-op pc when the LSU is the sole dp source
+    // (ex1_lsu_solo_dp, below) -- restoring the donor's "display == the
+    // dp'ing op" invariant for the delayed-LSU-dp case via the LSU's
+    // latched copy. `ex2_retire_vld` itself stays UNCONDITIONAL, matching
+    // the donor's ctrl_ex2_cmplt (aq_rtu_ctrl.v:174-182): it is the 1-
+    // delay of the dp pulse and is the qualifier every consumer below
+    // uses. The DIV level-echo (header note: iu_rtu_ex1_div_cmplt_dp held
+    // high across its multi-cycle residency) is unaffected -- dp stays
+    // high every residency cycle, so the register re-latches the stable
+    // EX1-resident DIV display every cycle, exactly as the old body did.
     //=========================================================================
+    // M6 Task 7: when the LSU is the SOLE dp source this cycle (its
+    // delayed ST_REPLY/LFB-retire leg -- see LSU.v's lsu_rtu_ex1_*_pc),
+    // the IU's live display no longer shows the dp'ing op: EX1 has long
+    // since moved on (or is empty on a fetch stall). Use the LSU's
+    // latched replying-op pc/next_pc instead. When any NON-LSU unit also
+    // completes that cycle, that unit's op is the EX1-resident NEWEST
+    // completing instruction, the display IS its pc/next-pc, and it wins
+    // -- an interrupt taken at that boundary belongs after the newest
+    // completion (the LSU op is older).
+    wire ex1_nonslsu_cmplt = ex1_alu_cmplt_dp || ex1_mul_cmplt_dp
+                           || ex1_bju_cmplt_dp || ex1_div_cmplt_dp
+                           || ex1_cp0_cmplt_dp || ex1_fpu_cmplt_dp
+                           || ex1_vec_cmplt_dp;
+    wire ex1_lsu_solo_dp   = ex1_lsu_cmplt_dp && !ex1_nonslsu_cmplt;
+
     wire ex1_inst_chgflw = ex1_cp0_cmplt_dp && cp0_rtu_ex1_chgflw;   // mret (M2's only chgflw source)
-    wire [PC_WIDTH-1:0] ex1_next_pc = ex1_inst_chgflw ? cp0_rtu_ex1_chgflw_pc : iu_rtu_ex1_next_pc;
+    // chgflw_pc wins when set (CP0, EX1-resident -- never co-occurs with a
+    // solo-LSU dp); else the LSU's own next-pc on a solo-LSU dp; else the
+    // live display (valid for every EX1-resident completion).
+    wire [PC_WIDTH-1:0] ex1_next_pc = ex1_inst_chgflw  ? cp0_rtu_ex1_chgflw_pc
+                          : ex1_lsu_solo_dp             ? lsu_rtu_ex1_next_pc
+                          :                               iu_rtu_ex1_next_pc;
+    wire [PC_WIDTH-1:0] ex1_cur_pc  = ex1_lsu_solo_dp ? lsu_rtu_ex1_cur_pc
+                          :                           iu_rtu_ex1_cur_pc;
 
     // Exception vec/tval mux (aq_rtu_dp.v:409-415): prefer CP0 when CP0 is
     // the cmplt source, else LSU when LSU is, else neither -- avoids
@@ -714,14 +764,16 @@ module RTU (
     reg [63:0] ex2_tval;
     reg        ex2_inst_chgflw;
     // M5 Task 8: the retiring instruction's FP-ness + its accrued flags,
-    // riding the SAME unconditional register stage as the rest of the
-    // retire packet. `ex2_fpu_retire` (the donor's `rtu_cp0_fs_dirty_updt`)
-    // is the FP-instruction-retire pulse CSR.v needs to dirty mstatus.FS;
-    // `ex2_fpu_fflags` (the donor's `rtu_cp0_fflags`) is the value OR'ed
-    // into fflags on that same retire cycle (D7 sticky accrual). Latching
-    // both off the same EX1-cycle qualifiers keeps the two CSR-side effects
-    // exactly paired, and unconditional latching matches every other field
-    // here (see the section header: consumers qualify on the vld bit).
+    // riding the SAME dp-gated register stage as the rest of the retire
+    // packet (M6 Task 7; the stage was unconditional in M5). `ex2_fpu_retire`
+    // (the donor's `rtu_cp0_fs_dirty_updt`) is the FP-instruction-retire
+    // pulse CSR.v needs to dirty mstatus.FS; `ex2_fpu_fflags` (the donor's
+    // `rtu_cp0_fflags`) is the value OR'ed into fflags on that same retire
+    // cycle (D7 sticky accrual). Latching both off the same dp-cycle
+    // qualifiers keeps the two CSR-side effects exactly paired. (Both are
+    // set only ON a dp cycle, and ex2_retire_vld is the 1-delay of the same
+    // dp pulse, so each implies ex2_retire_vld on its consumption cycle --
+    // CSR's sticky-OR consumers need no further qualification.)
     reg        ex2_fpu_retire;
     reg [4:0]  ex2_fpu_fflags;
 
@@ -737,15 +789,30 @@ module RTU (
             ex2_fpu_retire  <= 1'b0;
             ex2_fpu_fflags  <= 5'd0;
         end else begin
+            // Unconditional 1-delay of the dp pulse -- the donor's own
+            // ctrl_ex2_cmplt (aq_rtu_ctrl.v:174-182).
             ex2_retire_vld  <= dp_ex1_cmplt_dp;
-            ex2_cur_pc      <= iu_rtu_ex1_cur_pc;
-            ex2_next_pc     <= ex1_next_pc;
-            ex2_inst_expt   <= ex1_inst_expt;
-            ex2_expt_vec    <= ex1_expt_vec;
-            ex2_tval        <= ex1_tval;
-            ex2_inst_chgflw <= ex1_inst_chgflw;
+            // Gated on dp_ex1_cmplt_dp, matching the donor's dp_ex2_* data
+            // block (aq_rtu_dp.v:433-451): capture the dp cycle's values
+            // ONCE and hold; never re-latch the decayed display on the
+            // non-dp cycles in between. ex2_retire_vld (above) is the 1-
+            // delay of the same pulse, so the cycle that consumes these
+            // fields always sees the dp-cycle snapshot.
+            // ex2_fpu_retire is deliberately UNGATED: it must stay a
+            // 1-cycle pulse (the 1-delay of the EX1 fvld/xvld pulse, as in
+            // M5 -- rtu_cp0_fs_dirty_updt contract, rtu_tb T20), not a
+            // hold-until-next-dp level. ex2_fpu_fflags holds, but CSR ORs
+            // it idempotently, so holding is harmless.
+            if (dp_ex1_cmplt_dp) begin
+                ex2_cur_pc      <= ex1_cur_pc;
+                ex2_next_pc     <= ex1_next_pc;
+                ex2_inst_expt   <= ex1_inst_expt;
+                ex2_expt_vec    <= ex1_expt_vec;
+                ex2_tval        <= ex1_tval;
+                ex2_inst_chgflw <= ex1_inst_chgflw;
+                ex2_fpu_fflags  <= fpu_rtu_ex1_falu_fflags;
+            end
             ex2_fpu_retire  <= ex1_fpu_cmplt_dp;
-            ex2_fpu_fflags  <= fpu_rtu_ex1_falu_fflags;
         end
     end
 

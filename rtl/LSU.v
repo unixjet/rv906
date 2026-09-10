@@ -108,6 +108,13 @@ module LSU #(
     // the DC stage as the PFB trainer's PC tag (donor iu_lsu_ex1_cur_pc,
     // aq_lsu_ag.v:196/685 -> ag_pipe_pc -> dc_ld_pc, aq_lsu_dc.v:1459).
     input  wire [15:0]              iu_lsu_ex1_cur_pc,
+    // M6 Task 7: full-width EX1 instruction PC (the IU pcgen display),
+    // latched into dc_pc_full_r at AG-issue so the LSU can report the
+    // replying op's real PC (lsu_rtu_ex1_cur_pc) when its delayed
+    // ST_REPLY/LFB-retire fires -- the 16-bit PFB tag above is too narrow
+    // for an epc, and the IU display has decayed by reply time (the
+    // non-blocking LSU no longer holds EX1 until dp, unlike the donor).
+    input  wire [PC_WIDTH-1:0]      iu_lsu_ex1_pc,
 
     //=========================================================================
     // LSU -> IDU : the single EX1 issue-gate stall signal (contract 8;
@@ -151,6 +158,16 @@ module LSU #(
     // Task 7.3: the COMPLETING LSU instruction's length, for the RTU pcgen
     // inst_len mux (donor aq_lsu_top.v:405 / aq_rtu_dp.v:367).
     output wire                     lsu_rtu_ex1_inst_len,
+    // M6 Task 7: the replying (or faulting-at-issue) op's own PC and
+    // next-PC. The RTU uses these for ex2_cur_pc/ex2_next_pc when this
+    // module is the SOLE dp source that cycle (ex1_lsu_solo_dp) -- its
+    // reply (ST_REPLY/LFB-retire) lands cycles after the op left EX1, so
+    // the IU's live display (iu_rtu_ex1_cur_pc/_next_pc) no longer shows
+    // this op. The donor never needs this: its EX1 blocks until dp
+    // (aq_lsu_ag.v ag_self_stall on tlb-miss/issue), so the display is
+    // always the dp'ing op's. Valid on every `lsu_rtu_ex1_cmplt_dp` leg.
+    output wire [PC_WIDTH-1:0]      lsu_rtu_ex1_cur_pc,
+    output wire [PC_WIDTH-1:0]      lsu_rtu_ex1_next_pc,
     output wire [63:0]              lsu_rtu_wb_data,
     output wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     output wire                     lsu_rtu_wb_vld,
@@ -622,6 +639,10 @@ module LSU #(
     // (1=32b,0=16b RVC); reported as lsu_rtu_ex1_inst_len at completion.
     reg                     dc_inst_len_r;
     reg  [15:0]             dc_pc_r;        // M3b Task D: PFB trainer PC tag
+    // M6 Task 7: full-width PC of the in-flight op, latched at the same
+    // ST_IDLE->ST_DCS issue as dc_pc_r; the PFB tag (above) is too narrow
+    // for an epc. Feeds lsu_rtu_ex1_cur_pc at ST_REPLY and the LFB create.
+    reg  [PC_WIDTH-1:0]     dc_pc_full_r;
     reg        dc_is_drain_r;
     reg [1:0]  dc_drain_idx_r;
     reg        dc_wa_r;
@@ -1083,6 +1104,7 @@ module LSU #(
             dc_dst0_frf_r   <= 1'b0;
             dc_inst_len_r   <= 1'b0;
             dc_pc_r         <= 16'd0;
+            dc_pc_full_r    <= {PC_WIDTH{1'b0}};
             dc_is_drain_r   <= 1'b0;
             dc_drain_idx_r  <= 2'd0;
             dc_wa_r         <= 1'b0;
@@ -1118,6 +1140,11 @@ module LSU #(
                         dc_dst0_frf_r   <= ag_dst0_frf_eff;
                         dc_inst_len_r   <= ag_inst_len_eff;
                         dc_pc_r         <= iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
+                        // M6 Task 7: full-width twin, same issue cycle. The
+                        // pcgen display is this op's pc at AG-accept (the 16-
+                        // bit PFB tag above already relies on the same
+                        // invariant); it decays by ST_REPLY, hence the latch.
+                        dc_pc_full_r    <= iu_lsu_ex1_pc;
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
                         dc_touched_array_r <= touches_array;
@@ -1571,6 +1598,12 @@ module LSU #(
     reg [2:0]  lfb_dw_off   [0:LFB_DEPTH-1];
     reg [DCACHE_TAG_WIDTH-1:0] lfb_tag   [0:LFB_DEPTH-1];
     reg [DCACHE_INDEX_W-1:0]   lfb_index [0:LFB_DEPTH-1];
+    // M6 Task 7: the deferred load's own PC + length, so lfb_cmplt_fire
+    // (a delayed LFB retire, long after the load left EX1) can report the
+    // retiring op's PC/next-PC to the RTU's epc path (lsu_rtu_ex1_*_pc).
+    // A prefetch entry (lfb_pf) drains silently -- its pc/len are unused.
+    reg [PC_WIDTH-1:0] lfb_pc    [0:LFB_DEPTH-1];
+    reg               lfb_len   [0:LFB_DEPTH-1];
     // M3b Task D: prefetch-allocated entries (donor lfb.v's lfb_pf per-entry
     // attribute, carried on the create bus from pfb_top.v:414). A prefetch
     // entry refills exactly like a demand miss but drains SILENTLY (no RTU
@@ -1832,6 +1865,8 @@ module LSU #(
                 lfb_dw_off[lfb_i]   <= 3'd0;
                 lfb_tag[lfb_i]      <= {DCACHE_TAG_WIDTH{1'b0}};
                 lfb_index[lfb_i]    <= {DCACHE_INDEX_W{1'b0}};
+                lfb_pc[lfb_i]       <= {PC_WIDTH{1'b0}};
+                lfb_len[lfb_i]      <= 1'b0;
                 lfb_pf[lfb_i]       <= 1'b0;
                 lfb_pfb_id[lfb_i]   <= 5'b0;
             end
@@ -1849,6 +1884,8 @@ module LSU #(
                 lfb_dw_off[lfb_tail_idx]   <= dc_dw_off_r;
                 lfb_tag[lfb_tail_idx]      <= dc_tag_r;
                 lfb_index[lfb_tail_idx]    <= dc_index_r;
+                lfb_pc[lfb_tail_idx]       <= dc_pc_full_r;    // M6 Task 7
+                lfb_len[lfb_tail_idx]      <= dc_inst_len_r;  // M6 Task 7
                 lfb_pf[lfb_tail_idx]       <= 1'b0;
                 lfb_pfb_id[lfb_tail_idx]   <= 5'b0;
                 lfb_state[lfb_tail_idx]    <= E_PENDING;
@@ -2832,6 +2869,31 @@ module LSU #(
     // IU pcgen tracker by the wrong amount (rv64uc-p-rvc pcgen drift,
     // scrambled branch PCs from test 18 onward).
     assign lsu_rtu_ex1_inst_len   = ag_inst_len_eff;
+    // M6 Task 7: the replying (or faulting-at-issue) op's OWN PC/next-PC,
+    // valid on every leg of lsu_rtu_ex1_cmplt_dp. The RTU consumes these
+    // when the LSU is the SOLE dp source that cycle -- by ST_REPLY/LFB-
+    // retire time the op has long left EX1 and the IU display has decayed
+    // (rv906's non-blocking LSU; the donor holds EX1 until dp and never
+    // needs this). Three mutually-adjacent legs, each with its own source:
+    //   misalign_issue / mmu_fault_issue: the op is in AG right now (EX1
+    //     still resident, pcgen display valid) -> LIVE iu_lsu_ex1_pc and
+    //     ag_inst_len_eff; the dc_*_r latches would hold the PREVIOUS op.
+    //   lfb_cmplt_fire: a deferred load retires -> its pc/len latched into
+    //     the LFB entry at defer time. (Mutually exclusive with the
+    //     ST_REPLY leg: it needs state==ST_IDLE/dc_wait_lfb_r.)
+    //   ST_REPLY (the rest): the in-flight DC op's latched pc/len.
+    wire [PC_WIDTH-1:0] lsu_reply_pc =
+          (misalign_issue || mmu_fault_issue) ? iu_lsu_ex1_pc
+          : lfb_cmplt_fire                    ? lfb_pc[lfb_head_idx]
+          :                                     dc_pc_full_r;
+    wire lsu_reply_len =
+          (misalign_issue || mmu_fault_issue) ? ag_inst_len_eff
+          : lfb_cmplt_fire                    ? lfb_len[lfb_head_idx]
+          :                                     dc_inst_len_r;
+    assign lsu_rtu_ex1_cur_pc  = lsu_reply_pc;
+    assign lsu_rtu_ex1_next_pc = lsu_reply_pc
+                               + (lsu_reply_len ? {{(PC_WIDTH-3){1'b0}}, 3'd4}
+                                                : {{(PC_WIDTH-3){1'b0}}, 3'd2});
 
     assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign)
                              || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // prefetch drains silently

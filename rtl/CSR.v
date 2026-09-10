@@ -1649,7 +1649,17 @@ module CSR #(
     // commit) -- nothing was silently broken; this is the first cycle
     // anything reads this port for real.
     //=========================================================================
-    assign cp0_rtu_ex1_wb_vld   = is_csr_op;
+    // Gate the GPR writeback on !expt_vld so an ILLEGAL CSR access does not
+    // still retire its readout (donor aq_cp0_iui.v:809: `cp0_rtu_ex1_wb_vld =
+    // iui_inst_dst_vld && iui_inst_cmplt && !iui_expt_vld && !iui_cancel` --
+    // the donor's two extra terms map here to: cmplt is implicit, EX1 only
+    // reaches this stage when complete, and iui_cancel has no rv906
+    // analogue -- a trap is the only same-cycle cancellation and it is
+    // carried by expt_vld). Without the gate an illegal `csrrw` from U-mode
+    // (e.g. RO-write to `cycle`) clobbers the destination GPR and the
+    // mret-advancing trap handler lands with a corrupted register file
+    // (rv64mi-p-csr TEST 14 pin).
+    assign cp0_rtu_ex1_wb_vld   = is_csr_op && !cp0_rtu_ex1_expt_vld;
     assign cp0_rtu_ex1_wb_data  = csr_rdata;
     assign cp0_rtu_ex1_wb_preg  = idu_cp0_ex1_dst0_reg;
     // fence_hold (above) holds a FENCE/FENCE.I in EX1 from LSU-quiescence

@@ -421,6 +421,7 @@ module RVProc #(
     wire [GPR_IDX_WIDTH-1:0] fpu_rtu_ex1_falu_preg;
     wire [PC_WIDTH-1:0]      iu_cp0_ex1_cur_pc;
     wire [15:0]              iu_lsu_ex1_cur_pc;   // M3b Task D: PFB PC tag
+    wire [PC_WIDTH-1:0]      iu_lsu_ex1_pc;       // M6 Task 7: full-width twin
 
     //=========================================================================
     // IU <-> RTU : the four separate writeback buses (contract 1) + RTU's
@@ -481,6 +482,8 @@ module RVProc #(
     wire                     lsu_rtu_ex1_cmplt_dp;
     wire                     lsu_rtu_ex1_cmplt_for_pcgen;   // Task 9.7 (donor aq_lsu_ag.v:1675)
     wire                     lsu_rtu_ex1_inst_len;   // Task 7.3
+    wire [PC_WIDTH-1:0]      lsu_rtu_ex1_cur_pc;   // M6 Task 7: replying-op PC
+    wire [PC_WIDTH-1:0]      lsu_rtu_ex1_next_pc;  // M6 Task 7: replying-op next-PC
     wire [63:0]              lsu_rtu_wb_data;
     wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg;
     wire                     lsu_rtu_wb_vld;
@@ -1066,6 +1069,7 @@ module RVProc #(
 
         .iu_cp0_ex1_cur_pc       (iu_cp0_ex1_cur_pc),
         .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
+        .iu_lsu_ex1_pc           (iu_lsu_ex1_pc),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr)
     );
@@ -1141,6 +1145,7 @@ module RVProc #(
         .idu_lsu_ex1_dst0_frf    (idu_lsu_ex1_dst0_frf),
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
         .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
+        .iu_lsu_ex1_pc           (iu_lsu_ex1_pc),
 
         .lsu_idu_full            (lsu_idu_full),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
@@ -1151,6 +1156,8 @@ module RVProc #(
         .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
         .lsu_rtu_ex1_cmplt_for_pcgen (lsu_rtu_ex1_cmplt_for_pcgen),
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
+        .lsu_rtu_ex1_cur_pc      (lsu_rtu_ex1_cur_pc),
+        .lsu_rtu_ex1_next_pc     (lsu_rtu_ex1_next_pc),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
@@ -1291,6 +1298,8 @@ module RVProc #(
         .lsu_rtu_ex1_cmplt_dp    (lsu_rtu_ex1_cmplt_dp),
         .lsu_rtu_ex1_cmplt_for_pcgen (lsu_rtu_ex1_cmplt_for_pcgen),
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
+        .lsu_rtu_ex1_cur_pc      (lsu_rtu_ex1_cur_pc),
+        .lsu_rtu_ex1_next_pc     (lsu_rtu_ex1_next_pc),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),

@@ -550,6 +550,83 @@ static void test_fetch_fault_priority(void) {
     test_result("T13b fetch-fault priority: vec 12 > vec 1 > vec 2 (illegal), no side effects");
 }
 
+static void test_csr_qual_illegal_no_wb(void) {
+    // M6 Task 7 (Class B, donor aq_cp0_iui.v:809 `!iui_expt_vld &&
+    // !iui_cancel`): an instruction that LOOKS like a legal CSR op but
+    // fails CSR.v's OWN access qualification must raise the
+    // illegal-instruction trap AND suppress the GPR writeback -- the
+    // readout must not clobber the destination register. rv64mi-p-csr
+    // TEST 14 is the e2e pin (U-mode `csrrw a0, cycle, zero` must leave
+    // a0 at its sentinel); this row pins the unit-level contract on both
+    // qualification wires that can fire on a well-formed CSR
+    // instruction (csr_ro_write, csr_priv_bad).
+    //
+    // Reach U-mode: MPP=U(00) + mret (mstatus reset is MPP=11, SPP=1).
+    csr_write(CSR_MSTATUS, 0);
+    DispatchResult r_mret_u = dispatch(CP0_FUNC_MRET, 0, 0, 0);
+    check(r_mret_u.chgflw, "qual setup: mret to U-mode issues chgflw");
+    check(dut->cp0_yy_priv_mode == 0, "qual setup: now in U-mode (PRIV_U=00)",
+          dut->cp0_yy_priv_mode, 0);
+
+    // 1) U-mode RO-write of `cycle` (0xC00): addr[9:8]=00 (user-visible,
+    //    priv OK) but addr[11:10]=11 (read-only) -> csr_ro_write.
+    DispatchResult r_ro = dispatch(CP0_FUNC_CSRRW, 0xC00, 1, /*dst=*/10);
+    check(r_ro.expt_vld && r_ro.expt_vec == 2,
+          "U csrrw cycle: csr_ro_write raises illegal-instruction (vec 2)",
+          r_ro.expt_vec, 2);
+    check(!r_ro.wb_vld,
+          "U csrrw cycle: GPR writeback SUPPRESSED (donor :809) -- the "
+          "readout must not clobber the destination");
+    check(r_ro.cmplt_dp,
+          "U csrrw cycle: cmplt_dp still heartbeats (the gate is on "
+          "wb_vld only, NOT the retire leg -- RTU must still latch the "
+          "trap-bearing EX1 slot)");
+
+    // 2) Contrast: a LEGAL U-mode read of the same CSR (csrrs a0, cycle,
+    //    x0: real rs1==x0, no write) must not be over-suppressed.
+    DispatchResult r_rd = dispatch(CP0_FUNC_CSRRS, 0xC00, 0, /*dst=*/10,
+                                   /*illegal=*/false, /*imm_form=*/false,
+                                   /*rs1_reg_field=*/0);
+    check(!r_rd.expt_vld, "U csrrs cycle,x0: legal U-mode read, no exception");
+    check(r_rd.wb_vld, "U csrrs cycle,x0: writeback still fires (no over-suppression)");
+
+    // Back to M: a non-delegated trap always captures to M (medeleg=0
+    // in this bench), same teardown pattern as T23d.
+    dut->idu_cp0_ex1_sel    = 0;
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_vec = 2;
+    dut->rtu_yy_xx_expt_int = 0;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    check(dut->cp0_yy_priv_mode == 3, "qual teardown: non-delegated trap back to M",
+          dut->cp0_yy_priv_mode, 3);
+
+    // 3) S-mode access to an M-only CSR (mscratch, 0x340: addr[9:8]=11)
+    //    -> csr_priv_bad -> illegal, writeback suppressed likewise.
+    csr_write(CSR_MSTATUS, (uint64_t)1 << 11);      // MPP=S(01)
+    dispatch(CP0_FUNC_MRET, 0, 0, 0);
+    check(dut->cp0_yy_priv_mode == 1, "qual setup: now in S-mode (PRIV_S=01)",
+          dut->cp0_yy_priv_mode, 1);
+    DispatchResult r_priv = dispatch(CP0_FUNC_CSRRW, 0x340, 1, /*dst=*/10);
+    check(r_priv.expt_vld && r_priv.expt_vec == 2,
+          "S csrrw mscratch: csr_priv_bad raises illegal-instruction (vec 2)",
+          r_priv.expt_vec, 2);
+    check(!r_priv.wb_vld, "S csrrw mscratch: GPR writeback SUPPRESSED (donor :809)");
+    check(r_priv.cmplt_dp, "S csrrw mscratch: cmplt_dp still heartbeats (ungated)");
+
+    // Teardown: trap back to M, MPP restored to M for any later test.
+    dut->rtu_yy_xx_expt_vld = 1;
+    dut->rtu_yy_xx_expt_vec = 2;
+    dut->rtu_yy_xx_expt_int = 0;
+    dut->eval();
+    tick();
+    dut->rtu_yy_xx_expt_vld = 0;
+    check(dut->cp0_yy_priv_mode == 3, "qual teardown: back to M", dut->cp0_yy_priv_mode, 3);
+    csr_write(CSR_MSTATUS, (uint64_t)3 << 11);      // MPP=M(11), clean slate
+    test_result("T13c CSR access qualification: illegal op traps AND suppresses GPR writeback");
+}
+
 static void test_fence_no_op(void) {
     // Plain FENCE: with LSU quiescent (tie_idle_inputs drives
     // lsu_cp0_stb_empty=1) it completes immediately -- cmplt_dp asserted,
@@ -1390,6 +1467,7 @@ int main(int argc, char **argv) {
     test_trap_entry_int_bit();
     test_ecall_ebreak_illegal();
     test_fetch_fault_priority();
+    test_csr_qual_illegal_no_wb();
     test_fence_no_op();
     test_sfence_launch_ack_complete();
     test_sfence_stb_wait();
