@@ -81,7 +81,7 @@ module PLIC #(
     wire [7:0]  dev_wstrb;
     wire        dev_read;
     wire        dev_write;
-    reg  [63:0] dev_rdata;
+    wire [63:0] dev_rdata;
 
     AXI4LSlave #(
         .ADDR_WIDTH(32),
@@ -143,14 +143,14 @@ module PLIC #(
     // - pending is cleared when claimed
     // - interrupt stays pending if still asserted after complete
 
-    wire [N_SOURCE-1:0] gateway_pending;
-    genvar gi;
-    generate
-        for (gi = 1; gi < N_SOURCE; gi = gi + 1) begin : gen_gateway
-            assign gateway_pending[gi] = int_src[gi] & ~claimed[gi];
-        end
-    endgenerate
-    assign gateway_pending[0] = 1'b0;  // Source 0 reserved
+    // Bit-parallel gateway (no genvar/for-loop): M6 Task 6 debug found
+    // that the -O3 simulation build ELIMINATES the pending-set below when
+    // it is written as a generate-for + integer-for with variable
+    // bit-selects (the whole gateway/claimed path vanished from the
+    // compiled model; -O1 kept it). Bit-parallel form is structurally
+    // identical and survives -O3. Source 0 is reserved (masked off,
+    // never asserted).
+    wire [N_SOURCE-1:0] gateway_pending = (int_src & ~claimed) & ~1'b1;
 
     //=========================================================================
     // Priority Comparison - Find Highest Priority Pending & Enabled
@@ -181,13 +181,53 @@ module PLIC #(
     //=========================================================================
     // Read Address Decode
     //=========================================================================
-    wire [23:0] rd_offset = dev_raddr[23:0];
-    wire rd_prio      = (rd_offset >= 24'h000004) && (rd_offset <= 24'h00001C);
-    wire rd_pending   = (rd_offset == 24'h001000);
-    wire rd_enable    = (rd_offset == 24'h002000);
-    wire rd_threshold = (rd_offset == 24'h200000);
-    wire rd_claim     = (rd_offset == 24'h200004);
-    wire [2:0] rd_prio_idx = (rd_offset[4:2] - 1);
+    // Read Decode. M6 Task 6 (class-B fix, see LSU.v MS_DIRECT_READ): the
+    // MMIO direct read carries the ACCESS PA (donor C906: 64-bit bus, AR
+    // = access address). The 512->64 AXIWidthAdapter passes the AR through
+    // (n_araddr = w_araddr[31:0]) and replicates the 64-bit reply across
+    // all eight 8-byte windows (w_rdata = {8{n_rdata}}); the LSU then
+    // byte-selects the half named by pa[2] within the window at pa[5:3].
+    // The PLIC must therefore present each 8-byte window as a PAIR of
+    // 32-bit registers: lower half = window base, upper half = base+4.
+    // (The pre-fix decode keyed off dev_raddr[2] while the AR was the
+    // 64-byte line base -- the +4 registers were unreadable and even the
+    // line-base decode could not see sub-line offsets at all.)
+    // Window base for the accessed 8-byte window. The AND-mask form is
+    // used deliberately: Verilator 5.020 miscompiled the equivalent
+    // concat form {dev_raddr[23:3], 2'b00} (dropped the 24-bit truncation,
+    // keeping PLIC-base bits 27/25 of the full PA in the offset), which
+    // made reads decode the wrong register. The PLIC base (0x0C000000)
+    // occupies only bits >= 24, so dev_raddr[23:0] IS the register offset.
+    wire [23:0] rd_offset   = dev_raddr[23:0];
+    wire [23:0] rd_lo_off   = rd_offset & 24'hfffff8;
+    wire [23:0] rd_hi_off   = rd_lo_off + 24'd4;
+
+    // One 32-bit register slot, addressed by its in-line 4-byte offset.
+    function automatic [31:0] plic_reg_read(input [23:0] off);
+        begin
+            if (off >= 24'h000004 && off <= 24'h00001C)
+                plic_reg_read = {29'b0, prio[off[4:2]]};
+            else if (off == 24'h001000)
+                plic_reg_read = {24'b0, pending};
+            else if (off == 24'h002000)
+                plic_reg_read = {24'b0, enable};
+            else if (off == 24'h200000)
+                plic_reg_read = {29'b0, threshold};
+            else if (off == 24'h200004)
+                plic_reg_read = {28'b0, max_id};
+            else
+                plic_reg_read = 32'd0;
+        end
+    endfunction
+
+    reg [31:0] rd_lo, rd_hi;
+    always @(*) begin
+        rd_lo = plic_reg_read(rd_lo_off);
+        rd_hi = plic_reg_read(rd_hi_off);
+    end
+
+    // Window: lower half = base register, upper half = base+4 register.
+    assign dev_rdata = {rd_hi, rd_lo};
 
     //=========================================================================
     // Write Decode (address + strobe)
@@ -202,46 +242,24 @@ module PLIC #(
     //=========================================================================
     // Write Data Alignment (32-bit registers)
     //=========================================================================
-    wire [31:0] wdata = dev_wdata[31:0];
+    wire [31:0] wdata = dev_waddr[2] ? dev_wdata[63:32] : dev_wdata[31:0];
+    // M6 Task 6: the LSU positions the store bytes at the exact line offset
+    // (LSU.v AG: ag_byte_off = ag_pa[2:0]) and the 512->64 width adapter
+    // slices the window at sel = awaddr[5:3], so within the delivered
+    // 64-bit beat the 32-bit value sits in the half named by dev_waddr[2]
+    // (the AW carries the exact store PA, LSU.v MS_DIRECT_WRITE).
     wire [3:0]  wstrb = dev_waddr[2] ? dev_wstrb[7:4] : dev_wstrb[3:0];
     wire [3:0]  complete_id = wdata[3:0];
 
     //=========================================================================
-    // Combinational Read Logic
-    //=========================================================================
-    // For 32-bit aligned accesses:
-    //   addr[2]=0: data returned in bits [31:0]
-    //   addr[2]=1: data returned in bits [63:32]
-    reg [31:0] rdata;
-
-    always @(*) begin
-        if (rd_prio && {{29{1'b0}}, rd_prio_idx} < N_SOURCE-1)
-            rdata = {29'b0, prio[rd_prio_idx + 1]};
-        else if (rd_pending)
-            rdata = {24'b0, pending};
-        else if (rd_enable)
-            rdata = {24'b0, enable};
-        else if (rd_threshold)
-            rdata = {29'b0, threshold};
-        else if (rd_claim)
-            rdata = {28'b0, max_id};
-        else
-            rdata = 32'b0;
-    end
-
-    // Align read data based on address
-    always @(*) begin
-        if (dev_raddr[2])
-            dev_rdata = {rdata, 32'b0};
-        else
-            dev_rdata = {32'b0, rdata};
-    end
-
-    //=========================================================================
     // Claim Logic
     //=========================================================================
-    // When claim register is read, mark the interrupt as claimed
-    wire do_claim = dev_read && rd_claim && (max_id != 0);
+    // Reading the claim register (0x200004) marks the highest-priority
+    // interrupt claimed. Since the M6 Task 6 LSU fix (MMIO direct reads
+    // carry the access PA, not the line base) the AR is the exact 32-bit
+    // access address, so threshold (0x200000) and claim (0x200004) reads
+    // are distinguishable.
+    wire do_claim = dev_read && (dev_raddr[23:0] == 24'h200004) && (max_id != 0);
 
     //=========================================================================
     // Complete Logic
@@ -268,17 +286,15 @@ module PLIC #(
     end
 
     // Pending bits (gateway + claim/complete)
-    integer k;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pending <= 0;
             claimed <= 0;
         end else begin
-            // Update pending from gateway
-            for (k = 1; k < N_SOURCE; k = k + 1) begin
-                if (gateway_pending[k] && !claimed[k])
-                    pending[k] <= 1'b1;
-            end
+            // Update pending from gateway (bit-parallel; see note above
+            // the gateway wire — the per-bit integer-for form was
+            // optimized away by Verilator 5.020 -O3)
+            pending <= pending | gateway_pending;
 
             // Claim: mark as claimed, clear pending
             if (do_claim) begin

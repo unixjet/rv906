@@ -29,6 +29,16 @@ struct UART16550_AXI4L : AXI4L::TSlaveFSM<UINT8>, ttysrv {
 	BIT devRead(UINT8 *data, AXI4L::AXI_AType addr, UINT3 size);
 	BIT devWrite(UINT8 data, AXI4L::AXI_AType addr, UINT3 size);
         void fsmUser();
+	// M6 Task 6: the UART's own interrupt level (IER-based), exposed so the
+	// harness can drive it into the PLIC as source 7. Mirrors fsmUser()'s
+	// condition exactly -- deliberately NOT the AXI channel's `intr`, which
+	// also carries 1-cycle read/write-completion pulses from the TSlaveFSM
+	// base class that would otherwise latch as spurious PLIC interrupts.
+	BIT irq() {
+		if (ier & 2) return 1;              // THRE: tx always empty in this model
+		if ((ier & 1) && ready(IN)) return 1; // RDA: rx data available
+		return 0;
+	}
 	//_C2R_FUNC(1)
 	//void step(AXI4L::CH *axi);
 	void update(AXI4L::TCH<UINT8> *axi) {

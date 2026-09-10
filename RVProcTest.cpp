@@ -53,7 +53,11 @@ constexpr int DUT_DI_UART = DI_UART;
 int RVProcAXI_Verilator(AXI4L::BUS<NUM_MASTERS, NUM_SLAVES> *axi_bus, IO_PINS *io_pins)
 {
     dut.write<DUT_DI_UART>(&axi_bus->s_ch[DI_UART]);
-    bool quitted = dut.step(&io_pins->mpin);
+    // M6 Task 6: sample the UART model's interrupt level pre-clock so the
+    // DUT sees it this step (device model state from the prior post-clock
+    // update -- level signal, 1-step skew is intentional).
+    UINT32 uart_irq = axi_uart.irq();
+    bool quitted = dut.step(&io_pins->mpin, uart_irq);
     dut.read<DUT_DI_UART>(&axi_bus->s_ch[DI_UART]);
     dut.sync(cpu);
     return quitted;

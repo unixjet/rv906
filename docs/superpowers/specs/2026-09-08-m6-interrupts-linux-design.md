@@ -1,6 +1,6 @@
 # M6: Interrupt path (CLINT/PLIC/CSR) + single-hart Linux boot — design doc
 
-## Status: Exploration complete (2026-09-08, 3 agents); decisions settled; ready for execution
+## Status: Tasks 1-5 done (b541e8d..20c12f4); Task 6 (PLIC UART IRQ) in flight; 7/8/9 to follow
 
 ## Context
 
@@ -241,6 +241,31 @@ of sim — run in background early, iterate on failures in parallel).
   (IMACFDSU = I|M|A|F|D|C|S|U). Task 5 uses 0x14111D; this supersedes
   row 5's 0x14112D. The CSR.v comment's "F(bit5)" label was the source
   of the original error.
+
+- **D-M6-7 — PLIC RTL forms pinned against Verilator 5.020 -O3
+  miscompiles (Task 6 debug, two separate tool bugs).**
+  (1) *Sequential-loop elimination:* the -O3 simulation build
+  **eliminates** the per-source pending-set when the gateway is written
+  as a generate-for + `integer` for-loop with variable bit-selects in
+  the sequential block — the entire gateway/claimed path vanishes from
+  the compiled model while -O1 keeps it (bisected on a 3-variant
+  standalone bench). The RTL therefore uses the structurally-identical
+  bit-parallel form `pending <= pending | ((int_src & ~claimed) &
+  ~1'b1);`. (2) *Concat part-select:* `rd_lo_off = {dev_raddr[23:3],
+  2'b00}` miscompiles (the 24-bit truncation is dropped, keeping
+  PLIC-base bits 27/25 of the full PA in the offset → reads decode the
+  wrong register); the RTL uses `dev_raddr[23:0] & 24'hfffff8` instead
+  (the PLIC base occupies only bits >= 24, so [23:0] IS the offset).
+  Both forms are commented at the RTL site (PLIC.v); a "cleanup" back
+  to the natural loop/concat form re-introduces silent miscompiles —
+  do not.
+- **D-M6-8 — UART IRQ lands on PLIC source 7 = int_src bit 7.**
+  `u_plic.int_src = {G_io_pins_uart_irq, 7'b0}`. The first wiring
+  `{7'b0, G_io_pins_uart_irq}` put the UART level on bit 0 — the
+  RESERVED source, which the gateway masks off — so the level never
+  pended (e2e hang; the PLIC config itself was provably correct, which
+  is what made the bit-0 wiring the prime suspect once the in-model
+  probe was width-corrected). int_src[N] = source N, N=1..7.
 
 ## Verification plan
 

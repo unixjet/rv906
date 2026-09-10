@@ -65,7 +65,7 @@ void DUT::init(RV_AType pc, RV_UType sp, RV_UType dtb) {
 #endif
 }
 
-bool DUT::step(MEMCTLPin *mpin) {
+bool DUT::step(MEMCTLPin *mpin, UINT32 uart_irq) {
     // Write memory response data (from memory controller)
     vdut->G_io_pins_mpin_dout_data_0 = mpin->dout.data[0];
     vdut->G_io_pins_mpin_dout_data_1 = mpin->dout.data[1];
@@ -75,6 +75,13 @@ bool DUT::step(MEMCTLPin *mpin) {
     vdut->G_io_pins_mpin_dout_data_5 = mpin->dout.data[5];
     vdut->G_io_pins_mpin_dout_data_6 = mpin->dout.data[6];
     vdut->G_io_pins_mpin_dout_data_7 = mpin->dout.data[7];
+
+    // M6 Task 6: UART interrupt level (device/uart16550 irq()) -> PLIC
+    // source 7. Driven pre-clock like the memory response data; the harness
+    // samples it from the model's current state (1-step skew is inherent to
+    // the post-clock device service order in TB::step and is fine for a
+    // level signal).
+    vdut->G_io_pins_uart_irq = uart_irq & 1;
 
     // Clock low phase
     vdut->clk = 0;

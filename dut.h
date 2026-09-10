@@ -21,7 +21,7 @@ struct DUT {
 	~DUT();
 
 	void init(RV_AType pc, RV_UType sp, RV_UType dtb);
-	bool step(MEMCTLPin *mpin);
+	bool step(MEMCTLPin *mpin, UINT32 uart_irq = 0);
 	void sync(CoreState &cpu);
 
 	template <int N> void write(AXI4L::CH *ch);

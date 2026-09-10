@@ -2032,7 +2032,22 @@ module LSU #(
                             end else begin
                                 axi_r_active  <= 1'b1;
                                 axi_r_ar_sent <= 1'b0;
-                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, 6'b0};
+                                // M6 Task 6 (class-B): the MMIO direct read
+                                // must use the access PA, like the direct
+                                // write above (donor C906: 64-bit bus, AR =
+                                // access address). The line-base form
+                                // ({tag,index,6'b0}) is only correct for
+                                // DRAM refills: the 512->64 AXIWidthAdapter
+                                // passes the AR through (n_araddr =
+                                // w_araddr[31:0]) and replicates the 64-bit
+                                // reply across all eight 8-byte windows
+                                // (w_rdata = {8{n_rdata}}), so a 32-bit
+                                // MMIO register file (PLIC) can only decode
+                                // the accessed register when the AR carries
+                                // pa[2:0]. Same PA rebuild as the direct
+                                // write (dc_addr_r[5:0] is the untranslated
+                                // page offset).
+                                axi_r_addr_r  <= {{(ADDR_WIDTH - PC_WIDTH){1'b0}}, dc_tag_r, dc_index_r, dc_addr_r[5:0]};
                                 miss_state <= MS_DIRECT_READ;
                             end
                         end else begin

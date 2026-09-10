@@ -40,6 +40,9 @@ module RVProcAXI (
     G_axi_bus_s_ch_2_rdat_s_resp, G_axi_bus_s_ch_2_rdat_s_valid, G_axi_bus_s_ch_2_rdat_s_last,
     G_axi_bus_s_ch_2_wdat_s_ready, G_axi_bus_s_ch_2_wres_s_resp, G_axi_bus_s_ch_2_wres_s_valid,
 
+    /* M6 Task 6: UART interrupt level (C++ device model) -> PLIC source 7 */
+    G_io_pins_uart_irq,
+
     /* Memory controller outputs */
     G_io_pins_mpin_addr, G_io_pins_mpin_din_data_0, G_io_pins_mpin_din_data_1,
     G_io_pins_mpin_din_data_2, G_io_pins_mpin_din_data_3, G_io_pins_mpin_din_data_4,
@@ -94,6 +97,10 @@ module RVProcAXI (
     input        G_axi_bus_s_ch_2_wdat_s_ready;
     input [1:0]  G_axi_bus_s_ch_2_wres_s_resp;
     input        G_axi_bus_s_ch_2_wres_s_valid;
+
+    // M6 Task 6: UART interrupt level (from the C++ device model), routed to
+    // the PLIC as external source 7 (see u_plic below).
+    input        G_io_pins_uart_irq;
 
     //=========================================================================
     // Output Ports
@@ -667,7 +674,10 @@ module RVProcAXI (
     ) u_plic (
         .clk            (clk),
         .rst_n          (rst_n),
-        .int_src        (8'b0),     // No external interrupts for now
+        // M6 Task 6: UART (source 7) interrupt level from the C++ device
+        // model, un-tied from 8'b0. Sources 1-6 remain 0 (D-M6-3: single
+        // M context, 7 sources; only the UART is wired at M6).
+        .int_src        ({G_io_pins_uart_irq, 7'b0}),
         .meip           (plic_meip),
         .axi_awvalid    (plic_awvalid),
         .axi_awready    (plic_awready),
