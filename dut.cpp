@@ -57,8 +57,9 @@ void DUT::init(RV_AType pc, RV_UType sp, RV_UType dtb) {
 
     // INIT_REG: Set registers AFTER reset release, BEFORE first clock
     rootp->CPU_PC = pc;
-    gpr[2] = sp;   // SP
-    gpr[11] = dtb; // A1
+    gpr[2]  = sp;   // SP
+    gpr[10] = 0;    // A0 = hartid (single-hart: 0; OpenSBI boot convention)
+    gpr[11] = dtb;  // A1
     vdut->eval();
 #else
     (void)pc; (void)sp; (void)dtb;

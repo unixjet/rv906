@@ -1339,8 +1339,21 @@ module IU (
                                  ? idu_iu_ex1_dst0_reg : div_preg_reg;
     assign iu_rtu_div_data       = div_cmplt_now ? div_result_live : div_result_reg;
 
-    assign iu_idu_div_full = ((div_state == DIV_CMPLT || div_state == DIV_WFWB) && !rtu_iu_div_wb_grant)
-                            || (div_state == DIV_WFI2) || (div_state == DIV_ALIGN) || (div_state == DIV_ITER);
+    // Donor aq_iu_div.v:764 defines div_full over the running states only;
+    // the donor's CMPLT/WFWB grant-exemption is dead there because
+    // aq_rtu_rbus.v:470 ties rbus_div_wb_grant_for_full=1'b1, so the donor
+    // keeps EX1 held through the WB-grant cycle. The M2 port wired the live
+    // grant into the full term instead, opening a one-cycle window: on the
+    // CMPLT/WFWB grant cycle a DIV parked in EX1 during a long division is
+    // released (adv=1) while div_new_dispatch still requires DIV_IDLE (true
+    // only the cycle after) -- the div is evicted, latched nowhere, and its
+    // WBT entry is orphaned (silent instruction loss; the next consumer of
+    // the dst RAW-stalls forever). Holding EX1 through the grant cycle is
+    // the donor's behavior; the parked div then dispatches on the following
+    // DIV_IDLE cycle. (The donor's grant-cycle back-to-back latch,
+    // aq_iu_div.v:317-319 div_is_idle/div_iter_start, stays unported; see
+    // the FSM note -- rv906 already deviates with IDLE-cycle fast WB.)
+    assign iu_idu_div_full = (div_state != DIV_IDLE);
 
     //=========================================================================
     // SECTION OUTPUT -- CSR-facing PC passthrough (IU note S4.5/S9).

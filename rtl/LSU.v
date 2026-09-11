@@ -671,39 +671,61 @@ module LSU #(
     //-------------------------------------------------------------------------
     // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
     //-------------------------------------------------------------------------
-    reg [55:0] lr_addr_r;         // last LR physical address (PA[55:0])
+    reg [55:0] lr_addr_r;         // last LR address, VA[55:0] (see the
+                                  // LR-latch comment below; sc_match_c
+                                  // compares both sides at this width,
+                                  // donor aq_lsu_lm.v:160)
     reg [1:0]  lr_size_r;         // reservation access size (donor lm_size,
                                   // aq_lsu_lm.v:159-161 -- SC must match it)
     reg        lr_valid_r;        // set when LR completes, cleared by SC or intervening access
     reg        dc_is_lr_r;        // in-flight transaction is an LR (issue latch)
 
-    // Exclusion detection on any store/load while lr_valid_r is held.
+    // Reservation exclusion while lr_valid_r is held.
     // (lr_valid_r itself has exactly ONE writer: the LR-buffer always block
     // below -- a second clear-only block here raced it and was removed.)
     //
+    // CLEAR SET -- DONOR-CONFORMANT (M6 Task 8). The donor's lock monitor
+    // clears ONLY on its own SC, on AMO, and on exception ack/exit -- NEVER
+    // on a load or a plain store: aq_lsu_dc.v:1618-1620 (lm_set on LR;
+    // lm_clr = dc_inst_vld & (dc_sc_inst | dc_amo_inst) & !dc_reply) and
+    // aq_lsu_lm.v (LM_EXCL leaves only on expt_ack | expt_exit | lm_clr).
+    // rv906's SC half is the `reply_fire && sc_addr_set` clear in the always
+    // block below (completion-based, same effect); this wire is the AMO half.
+    //
+    // The M3 port had two extra clear terms, both retracted here:
+    //   - clear-on-any-LOAD, justified at the time as "any completing LOAD
+    //     can evict the reserved line via refill" -- a non-argument for a
+    //     latch-based reservation (lr_addr_r/lr_size_r are plain latches,
+    //     independent of cache state) and spec-wrong besides (a local read
+    //     never breaks a reservation). It broke the Linux kernel: its
+    //     qspinlock acquire loop (lr.d; bne; sc.d.rl; bnez retry) spun
+    //     forever because the PFB stride prefetcher completed a load between
+    //     the kernel's LR and SC and killed the reservation -- SC then
+    //     always fails single-hart (hang sat at PA 0x8023ab80,
+    //     Image+0x3ab80).
+    //   - clear-on-any-STORE: the donor keeps the monitor across a plain
+    //     store (a same-hart store does not break the reservation); the only
+    //     store-like op that clears is the AMO (donor lm_clr).
+    //
     // lr_txn_event qualifies to a REAL transaction event: in ST_IDLE the
     // DCache response bus HOLDS the previous transaction's hit-way, so an
-    // unqualified dc_hit_c/dc_is_store_r reads stale and cleared a fresh
+    // unqualified dc_hit_c/dc_is_amo read would be stale and clear a fresh
     // reservation on any idle cycle (rv64ua-p-lrsc hung in its retry loop).
     // Cached transactions fire on their DCS response; UNCACHED transactions
-    // never get one (fire on the DCS pass itself). M3 audit coverage: an
-    // AMO is a store to the reservation even though load-like on this pipe
-    // (the donor clears its lock monitor on SC *and AMO*, aq_lsu_dc.v:1620)
-    // -- a MISSED AMO to the reserved line and uncached stores/AMOs used to
-    // slip through; and any completing LOAD can evict the reserved line via
-    // refill, so hit-or-miss both clear (conservative, spec-legal).
+    // never get one (fire on the DCS pass itself). amo_active (set at the
+    // AMO's issue, cleared at its own REPLY) makes the term fire exactly
+    // once during the AMO's ST_DCS read phase -- the same window as the
+    // donor's dc_inst_vld & dc_amo_inst & !dc_reply, including a MISSED or
+    // uncached AMO (the donor's lm_clr is not data-array-gated either).
     //
-    // An LR is EXCEPTED: LR-over-LR re-keys the reservation (donor lm_set
-    // overwrites addr/size in EXCL state, aq_lsu_lm.v:145-157). Without the
-    // exception, LR#2's own DCS response cleared lr_addr_set before the
-    // completion set-term could fire, leaving NO reservation (LR;LR;SC
-    // failed here; succeeds on the donor).
-    wire lr_txn_event        = (state == ST_DCS) && !dc_misalign_r
+    // An LR re-keys, never clears: the addr/size latches are re-written on
+    // every LR's issue (donor lm_set overwrites addr/size in EXCL state,
+    // aq_lsu_lm.v:145-157), and with no load-side clear left, LR#2's own
+    // DCS response interferes with nothing -- LR#1's reservation simply
+    // points at LR#2's address once LR#2 completes.
+    wire lr_txn_event       = (state == ST_DCS) && !dc_misalign_r
                              && (u_dc_resp_vld || !dc_touched_array_r);
-    wire lr_exclude_on_store = lr_valid_r && lr_txn_event
-                               && (dc_is_store_r || amo_active);
-    wire lr_exclude_on_load  = lr_valid_r && lr_txn_event
-                               && !dc_is_store_r && !amo_active && !dc_is_lr_r;
+    wire lr_exclude_on_amo  = lr_valid_r && lr_txn_event && amo_active;
 
     //-------------------------------------------------------------------------
     // SECTION STB (LSU note A4) -- 4 entries, one per distinct 8-byte-
@@ -1302,8 +1324,9 @@ module LSU #(
                 lr_valid_r <= 1'b1;
             end
 
-            // Clear on exclusion
-            if (lr_exclude_on_store || lr_exclude_on_load) begin
+            // Clear on exclusion (donor lm_clr AMO half; the SC half is the
+            // reply_fire term below -- see the wire comment above)
+            if (lr_exclude_on_amo) begin
                 lr_valid_r <= 1'b0;
                 lr_addr_set <= 1'b0;
             end
@@ -2732,8 +2755,17 @@ module LSU #(
     // is still 0 during the first DCS cycle). The DC-stage forward below
     // needs the result THIS cycle, one cycle before sc_match_r exists.
     // Donor aq_lsu_lm.v:159-161 matches on address AND access size
-    // (lm_size == lm_req_size), so a LR.W;SC.D to one address fails.
-    wire sc_match_c    = lr_valid_r && (dc_addr_r == lr_addr_r)
+    // (lm_size == lm_req_size), so a LR.W;SC.D to one address fails, and
+    // compares BOTH sides truncated to the same width (lm_addr[PADDR-1:0]
+    // == lm_req_addr[PADDR-1:0]). M6 Task 8: rv906's stored lr_addr_r is
+    // 56 bits while dc_addr_r is 64; the pre-fix `dc_addr_r == lr_addr_r`
+    // zero-extended the 56-bit side, so any LR/SC pair at an address with
+    // a bit above 55 set (e.g. a canonical Sv39 NEGATIVE VA, 0xFFFFFFFF...)
+    // never matched and the SC always failed. All VAs below 2^56 are
+    // unaffected (bits [63:56] are 0 on both sides), which is why the M3
+    // lr_sc rows and every riscv-tests suite passed. Truncate the left
+    // side to [55:0] to restore the donor's same-width compare.
+    wire sc_match_c    = lr_valid_r && (dc_addr_r[55:0] == lr_addr_r)
                          && (dc_size_r == lr_size_r);
 
     always @(posedge clk) begin
@@ -2787,8 +2819,39 @@ module LSU #(
             // AMO entry (drain_pick is lowest-first) and overwrote the AMO
             // result; while two entries shared the dword, the DA forward
             // also merged only the lowest-index entry's mask (stale reads).
-            if ((reply_is_store && !reply_is_misalign) || reply_is_sc_commit
-                || reply_is_amo_commit) begin
+            //
+            // M6 Task 8: the PLAIN-store create is gated on
+            // store_line_resident -- the same LATCHED path decision
+            // (dc_hit_r / dc_ca_r / frz_is_direct_r) that the entry's
+            // stb_was_hit field is built from -- mirroring donor
+            // aq_lsu_dc.v:1481-1482 (dc_st_alct = dc_ca_after &
+            // dcache_wa) in this module's terms: a plain store only
+            // needs an STB entry when its drain will write the array.
+            //
+            // A cacheable store to a RESIDENT line (hit, or a wa=1
+            // miss that just refilled) delivers its data to the D$
+            // array ONLY through this entry's later drain: the AG
+            // lookup drives way_sel=0, which in DCache.v disables the
+            // data array entirely (way_write_active/way_read_active
+            // both 0 -> cen_n=1), so the store's bytes reach the line
+            // only when the drain re-issues the write on stb_way.
+            // Dropping the entry for a resident store would lose its
+            // data (no direct array write, no direct-AXI write).
+            //
+            // An UNCACHEABLE store -- or a wa=0/AMR-disabled
+            // store-miss -- has the OPPOSITE problem: it already
+            // completed its own direct-AXI write before the FSM left
+            // ST_IDLE. Creating an entry made the drain re-issue the
+            // SAME direct-AXI write: every uncached store hit the bus
+            // twice (the OpenSBI UART init/banner doubling found in
+            // the M6 Task 8 boot smoke), and so did every wa=0
+            // store-miss.
+            // SC and AMO keep the unconditional create: their write-
+            // back payload (SC data / amo_new_c) first exists at REPLY
+            // and rides the drain as its only memory path (uncached
+            // included).
+            if ((reply_is_store && !reply_is_misalign && store_line_resident)
+                || reply_is_sc_commit || reply_is_amo_commit) begin
                 if (stb_match_here) begin
                     stb_data[stb_match_idx]     <= (expand_byte_mask(commit_mask) & commit_data)
                                                   | (~expand_byte_mask(commit_mask) & stb_data[stb_match_idx]);

@@ -91,11 +91,21 @@ struct AxiDSlave {
         if (!b_pending && d->axi_d_awvalid && d->axi_d_wvalid) {
             uint64_t addr = d->axi_d_awaddr;
             uint64_t strb = d->axi_d_wstrb;
+            // The 512-bit beat is LINE-ALIGNED (contract 17) while the AW
+            // address carries the ACCESS address for sub-line direct
+            // writes (LSU.v MS_DIRECT_WRITE / STB drain, donor-conformant
+            // per M6 Task 6): aw=0x800D0004 wstrb=0xf0 means "line 0x800D0000,
+            // bytes 4-7". The full-SoC model (RVProc_io.h getByAddr) applies
+            // the strobe against the line base -- mirror that here, not the
+            // raw AW. (Class-A bench bug: previously the strobe was applied
+            // against the access address, shifting sub-line writes by the
+            // intra-line offset; masked pre-M6-Task-8 by STB forwarding.)
+            uint64_t base = addr & ~0x3FULL;
             for (int i = 0; i < 64; i++) {
                 if ((strb >> i) & 1ULL) {
                     uint32_t word = d->axi_d_wdata[i / 4];
                     uint8_t byte = (uint8_t)((word >> ((i % 4) * 8)) & 0xFF);
-                    mem_wr(addr + i, byte);
+                    mem_wr(base + i, byte);
                 }
             }
             last_awaddr = addr;
@@ -130,10 +140,13 @@ struct AxiDSlave {
         d->axi_d_rresp   = 0;
         d->axi_d_rlast   = rv ? 1 : 0;
         if (rv) {
+            // Same convention as the write side: the returned beat is the
+            // LINE at (araddr & ~0x3F), not a window starting at araddr.
+            uint64_t base = r_addr & ~0x3FULL;
             for (int wi = 0; wi < 16; wi++) {
                 uint32_t w = 0;
                 for (int b = 0; b < 4; b++)
-                    w |= ((uint32_t)mem_rd(r_addr + wi * 4 + b)) << (b * 8);
+                    w |= ((uint32_t)mem_rd(base + wi * 4 + b)) << (b * 8);
                 d->axi_d_rdata[wi] = w;
             }
             r_pending = false;
@@ -647,14 +660,19 @@ static void test_lr_sc_warm_loop(void)
     test_result("T9 warm-cache LR/SC retry loop (32 iters)");
 }
 
-// T10: an intervening store to the reserved dword kills the reservation, and
-// a FAILED SC must not commit its store data.
+// T10: an intervening AMO to the reserved dword kills the reservation (the
+// donor's lm_clr covers SC and AMO, aq_lsu_dc.v:1618-1620), and a FAILED SC
+// must not commit its store data. (M6 Task 8: the intervening op here is an
+// AMO, not a plain store -- the M3 clear-on-store term was retracted because
+// a plain store does NOT clear the donor's lock monitor; see T11 phase 2
+// and the wire comment in LSU.v.)
 static void test_sc_fail_no_commit(void)
 {
     const uint64_t A = 0x00000000800B0000ULL;
     const uint32_t BASE = 0x11111111;
-    const uint32_t STORE_V = 0x22222222;
+    const uint32_t AMO_V  = 0x22222222;
     const uint32_t SC_V = 0x33333333;
+    const uint32_t F_AMOADD_W = 0x01008;
 
     for (int i = 0; i < 4; i++) mem_wr(A + i, (uint8_t)(BASE >> (i * 8)));
     do_op(F_LW, A, 0, 0, 5);   // warm the line
@@ -662,19 +680,20 @@ static void test_sc_fail_no_commit(void)
 
     do_op(F_LR, A, 0, 0, 5);
     settle(4);
-    do_op(F_SW, A, 0, STORE_V, 0);   // intervening store -> reservation lost
+    do_op(F_AMOADD_W, A, 0, AMO_V, 5);   // intervening AMO -> reservation lost
     settle(4);
     LsuResult sc = do_op(F_SC, A, 0, SC_V, 6);
     settle(10);
 
-    check(sc.sc_res == 1, "SC after intervening store fails", sc.sc_res, 1);
+    check(sc.sc_res == 1, "SC after intervening AMO fails", sc.sc_res, 1);
 
-    // The failed SC must NOT have written SC_V; memory holds STORE_V.
+    // The failed SC must NOT have written SC_V; memory holds BASE+AMO_V.
     LsuResult ld = do_op(F_LW, A, 0, 0, 5);
-    check((ld.wb_data & 0xFFFFFFFF) == STORE_V,
-          "failed SC did not commit its data", ld.wb_data & 0xFFFFFFFF, STORE_V);
+    check((ld.wb_data & 0xFFFFFFFF) == BASE + AMO_V,
+          "failed SC did not commit its data (AMO value intact)",
+          ld.wb_data & 0xFFFFFFFF, BASE + AMO_V);
 
-    test_result("T10 intervening store kills reservation, failed SC no-commit");
+    test_result("T10 intervening AMO kills reservation, failed SC no-commit");
 }
 
 // T11: reservation-consumption semantics (rv64ua-p-lrsc test 6): SC after a
@@ -697,7 +716,11 @@ static void test_sc_consumes_reservation(void)
     check(sc1.sc_res == 0, "first SC succeeds", sc1.sc_res, 0);
     check(sc2.sc_res == 1, "SC after successful SC fails", sc2.sc_res, 1);
 
-    // Phase 2: LR -> intervening store -> SC fail -> SC again must fail.
+    // Phase 2: LR -> intervening same-address store -> SC now SUCCEEDS
+    // (M6 Task 8: a plain store does NOT clear the donor's lock monitor,
+    // aq_lsu_dc.v:1618-1620 -- the M3 clear-on-store term was retracted;
+    // the Linux kernel qspinlock hang is the motivating regression) ->
+    // SC again must fail (the successful SC consumed the reservation).
     do_op(F_LR, A, 0, 0, 5);
     settle(4);
     do_op(F_SW, A, 0, 0x12345678, 0);
@@ -706,14 +729,18 @@ static void test_sc_consumes_reservation(void)
     settle(4);
     LsuResult sc4 = do_op(F_SC, A, 0, 0xFEEDFACE, 6);
     settle(10);
-    check(sc3.sc_res == 1, "SC after intervening store fails", sc3.sc_res, 1);
+    check(sc3.sc_res == 0,
+          "SC after intervening store SUCCEEDS (donor: stores don't clear)",
+          sc3.sc_res, 0);
     check(sc4.sc_res == 1, "SC after failed SC fails", sc4.sc_res, 1);
 
-    // Phase 1's successful SC committed 0xA5A5A5A5; phase 2's intervening
-    // store then legitimately overwrote it, and both failed SCs added nothing.
+    // Phase 1's successful SC committed 0xA5A5A5A5; the phase-2 store
+    // overwrote it, the successful sc3 committed 0xDEADBEEF, and the
+    // failed sc4 added nothing.
     LsuResult ld = do_op(F_LW, A, 0, 0, 5);
-    check((ld.wb_data & 0xFFFFFFFF) == 0x12345678,
-          "failed SCs committed nothing over the store", ld.wb_data & 0xFFFFFFFF, 0x12345678);
+    check((ld.wb_data & 0xFFFFFFFF) == 0xDEADBEEF,
+          "successful SC overwrote the store; failed SC added nothing",
+          ld.wb_data & 0xFFFFFFFF, 0xDEADBEEF);
 
     test_result("T11 SC consumes reservation (success and failure)");
 }
@@ -915,9 +942,12 @@ static void test_misaligned_amo_recovery(void)
 }
 
 // T18: LR;LR;SC on the same address must succeed -- a second LR RE-KEYS the
-// reservation (donor lm_set overwrites in EXCL state). Before the fix the
-// second LR's own DCS response hit exclude_on_load and destroyed the
-// reservation, so the SC failed.
+// reservation (donor lm_set overwrites addr/size in EXCL state,
+// aq_lsu_lm.v:145-157; rv906 re-writes the addr/size latches at the second
+// LR's issue). M6 Task 8 note: this row originally guarded the exclude-on-
+// load term's !dc_is_lr_r exception (LR#2's own DCS response used to clear
+// the reservation); that term was retracted, but the re-key semantics it
+// documents remain, so the row stays.
 static void test_lr_over_lr_rekey(void)
 {
     reset_dut();   // isolate
@@ -943,6 +973,134 @@ static void test_lr_over_lr_rekey(void)
           "SC committed after LR;LR", ld.wb_data & 0xFFFFFFFF, 0x5A5A5A5A);
 
     test_result("T18 LR;LR;SC reservation re-key");
+}
+
+//=============================================================================
+// M6 Task 8: donor-conformant reservation clear set
+//=============================================================================
+
+// T19: an unrelated completing LOAD to a DIFFERENT address must NOT clear
+// the reservation. This is the exact M6 Task 8 kernel-hang regression: the
+// Linux 6.5 qspinlock acquire loop (lr.d; bne; sc.d.rl; bnez retry) spun
+// forever because the M3 clear-on-any-load term let the PFB stride
+// prefetcher's completing load, landing between the kernel's LR and SC,
+// kill the reservation -- the SC then always failed single-hart (hang at
+// PA 0x8023ab80). The donor's lock monitor never clears on a load
+// (aq_lsu_dc.v:1618-1620; aq_lsu_lm.v LM_EXCL). This bench has no PFB, so
+// the intervening load is an explicit hitting load to another line: under
+// the pre-fix RTL this row FAILS (the load completion clears the
+// reservation, SC sees sc_res=1); post-fix the SC must succeed.
+static void test_load_between_lr_sc(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A = 0x0000000080140000ULL;   // LR/SC target line
+    const uint64_t B = 0x0000000080140080ULL;   // unrelated load line (other set)
+    const uint64_t INIT = 0x0F1E2D3C4B5A6978ULL;
+    const uint64_t BVAL = 0xCCCCCCCCCCCCCCCCULL;
+    const uint64_t NEWV = 0x89ABCDEF01234567ULL;
+    const uint32_t F_LR_D = 0x00b0c;   // LSU_FUNC_LR_D
+    const uint32_t F_SC_D = 0x00b0e;   // LSU_FUNC_SC_D
+
+    for (int i = 0; i < 8; i++) mem_wr(A + i, (uint8_t)(INIT >> (i * 8)));
+    for (int i = 0; i < 8; i++) mem_wr(B + i, (uint8_t)(BVAL >> (i * 8)));
+    do_op(F_LD, A, 0, 0, 5);   // warm BOTH lines so the intervening load HITS
+    do_op(F_LD, B, 0, 0, 5);   // (a hitting load is what fired the old term)
+    settle(10);
+
+    do_op(F_LR_D, A, 0, 0, 5);   // reservation at A
+    settle(4);
+
+    LsuResult ld = do_op(F_LD, B, 0, 0, 5);   // unrelated hitting load
+    check(ld.wb_data == BVAL, "intervening load reads B uncorrupted",
+          ld.wb_data, BVAL);
+    settle(4);
+
+    LsuResult sc = do_op(F_SC_D, A, 0, NEWV, 6);
+    settle(20);
+    check(sc.sc_res == 0, "SC.D after unrelated intervening load succeeds",
+          sc.sc_res, 0);
+
+    LsuResult ld2 = do_op(F_LD, A, 0, 0, 5);
+    check(ld2.wb_data == NEWV, "SC.D committed over A", ld2.wb_data, NEWV);
+
+    test_result("T19 intervening load (other addr) keeps reservation (kernel qspinlock)");
+}
+
+// T20: an AMO to a DIFFERENT address also clears the reservation -- the
+// donor's lm_clr (aq_lsu_dc.v:1620: dc_inst_vld & (dc_sc_inst | dc_amo_inst)
+// & !dc_reply) is NOT address-gated, and rv906 ports it faithfully. This
+// row pins that behavior so a future "improvement" (address-gating the AMO
+// clear) is caught as a deviation from the donor.
+static void test_amo_other_addr_clears(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A = 0x0000000080150000ULL;
+    const uint64_t B = 0x0000000080150080ULL;
+    const uint32_t F_LR_D     = 0x00b0c;
+    const uint32_t F_SC_D     = 0x00b0e;
+    const uint32_t F_AMOADD_D = 0x0100c;
+
+    for (int i = 0; i < 8; i++) mem_wr(A + i, 0x00);
+    for (int i = 0; i < 8; i++) mem_wr(B + i, 0x11);
+    do_op(F_LD, A, 0, 0, 5);   // warm both lines
+    do_op(F_LD, B, 0, 0, 5);
+    settle(10);
+
+    do_op(F_LR_D, A, 0, 0, 5);   // reservation at A
+    settle(4);
+    do_op(F_AMOADD_D, B, 0, 0x22, 5);   // AMO to B, NOT A
+    settle(10);
+
+    LsuResult sc = do_op(F_SC_D, A, 0, 0x99, 6);
+    settle(20);
+    check(sc.sc_res == 1,
+          "SC fails after AMO to a different address (donor lm_clr is ungated)",
+          sc.sc_res, 1);
+
+    test_result("T20 AMO to other address clears reservation (donor-ungated)");
+}
+
+// T21: LR/SC at a VA whose upper bits [63:56] are set must still match
+// (M6 Task 8). sc_match_c compared the 64-bit dc_addr_r against the
+// 56-bit lr_addr_r (Verilog zero-extends the RHS), so for any address with
+// a bit above 55 the two sides differ in the high bits even though the LR
+// and the SC use the SAME address -- the SC always fails. Every earlier
+// row uses VAs below 2^32 (high bits all 0), which is why none caught it;
+// a canonical Sv39 NEGATIVE VA (bit 63:39 = 1) is the realistic trigger
+// and is what the donor avoids by comparing both sides at the same width
+// (aq_lsu_lm.v:160: lm_addr[PADDR-1:0] == lm_req_addr[PADDR-1:0]).
+// This bench's MMU stub identity-maps VA>>12 truncated to the 28-bit PPN
+// (drive_mmu), so VA 0xFFFFFFFF80150000 lands at PA 0xF80150000 --
+// distinct from every other row's PA, with the LR/SC pair still hitting
+// the same line.
+static void test_high_va_lr_sc(void)
+{
+    reset_dut();   // isolate
+    const uint64_t A  = 0xFFFFFFFF80150000ULL;   // canonical Sv39 negative VA
+    const uint64_t PA = 0xF80150000ULL;          // = A under the stub's map
+    const uint64_t INIT = 0x123456789ABCDEF0ULL;
+    const uint64_t NEWV = 0xFEDCBA9876543210ULL;
+    const uint32_t F_LR_D = 0x00b0c;
+    const uint32_t F_SC_D = 0x00b0e;
+
+    for (int i = 0; i < 8; i++) mem_wr(PA + i, (uint8_t)(INIT >> (i * 8)));
+    do_op(F_LD, A, 0, 0, 5);   // warm the line at the high VA
+    settle(10);
+
+    do_op(F_LR_D, A, 0, 0, 5);   // reservation keyed at A
+    settle(4);
+
+    LsuResult sc = do_op(F_SC_D, A, 0, NEWV, 6);
+    settle(20);
+    check(sc.sc_res == 0,
+          "SC.D at a high VA (bits 63:56 set) succeeds -- same-width match",
+          sc.sc_res, 0);
+
+    LsuResult ld = do_op(F_LD, A, 0, 0, 5);
+    check(ld.wb_data == NEWV, "SC.D committed at the high VA",
+          ld.wb_data, NEWV);
+
+    test_result("T21 LR/SC at high VA (bits 63:56 set) matches");
 }
 
 //=============================================================================
@@ -973,6 +1131,9 @@ int main(int argc, char **argv)
     test_stb_full_amo_commit();
     test_misaligned_amo_recovery();
     test_lr_over_lr_rekey();
+    test_load_between_lr_sc();
+    test_amo_other_addr_clears();
+    test_high_va_lr_sc();
 
     printf("[lr_sc_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

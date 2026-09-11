@@ -9,6 +9,13 @@ config.h
 run/
 test/**/*.out
 test/**/build/
+# M6 Task 8: prebuilt third-party Linux boot kit (~19 MB). Source:
+# RVProc6/vla/rvvla/test/llm_demo/prebuilt/linux/{fw_jump.elf,Image,
+# rootfs.cpio} (OpenSBI 1.3 + Linux 6.5, known-good on the RVProc6 core).
+# Not repo-buildable; see test/m6/run_linux.sh header for the copy command.
+test/m6/linux/fw_jump.elf
+test/m6/linux/Image
+test/m6/linux/rootfs.cpio
 # Agent worktrees and per-agent state. `git worktree add .claude/worktrees/...`
 # puts another agent's full checkout in here; committing it would nest a second
 # copy of the repo inside itself.

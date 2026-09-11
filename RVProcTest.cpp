@@ -275,7 +275,12 @@ struct TB : public TestBench {
     uint32_t fencei_before = 0;
 
     TB() {
-        dtb_addr = 0x87000000;
+        // M6 Task 8: fw_jump's fw_next_arg1 returns the FIXED FDT address
+        // 0x82200000 (opensbi-1.3 firmware/fw_jump.S:46-52, verified by
+        // disassembly of the prebuilt fw_jump.elf) -- the TB must place the
+        // generated DTB there. 0x82200000 sits between the kernel image
+        // (0x80200000, ~14 MB) and the initrd (0x84000000).
+        dtb_addr = 0x82200000;
         initrd_addr = 0x84000000;
     }
 
