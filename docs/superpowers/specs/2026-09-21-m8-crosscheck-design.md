@@ -382,7 +382,7 @@ rv906-side deltas (for the port, mechanism pinned):
    root-table-base + 0, and satp PPN resets to 0 → on rv906 the write
    targets PA 0 → crossbar DEFAULT_SLAVE → **0x80000000, the running
    program image** (`rtl/RVProcAXI.v:749-760`) — self-clobber. The port
-   inserts a PPN write (satp PPN ← 0x80010, root table at PA 0x800100000,
+   inserts a PPN write (satp PPN ← 0x81000, root table at PA 0x81000000,
    same safe hole as the MMU case, §4.3) before the PTE write. The PTE
    itself (VA[0,4K)→PA[0,4K)) is inert on rv906: every live subtest is
    M-mode (MMU bypass, `rtl/MMU.v:226`), and the pagefault subtests are
@@ -402,7 +402,7 @@ rv906-side deltas (for the port, mechanism pinned):
    → no fault → subtest would never trap. The port re-targets the three
    subtests to **PMP L-bit deny at a MEM address**: pick one MEM scratch
    address (e.g. PA 0x800200000, 2 MB into MEM, clear of the image and the
-   0x800100000 page-table hole), and in the ACCERR setup replace the
+   0x81000000 page-table hole), and in the ACCERR setup replace the
    6-entry reconfig with a **single locked deny entry** — `pmpcfg0 = 0x80`
    (entry 0: L=1, A=11, R=W=X=0) + `pmpaddr0` = the NAPOT encoding of that
    4 KB page. M-mode is checked because the entry is locked
@@ -430,8 +430,8 @@ Donor: `tests/cases/MMU/C906_mmu_basic.s`. Donor-side patch per D-M8-2a:
 
 rv906-side deltas (exactly these, all in the case `.s`):
 
-1. **`MMU_SATP_PPN 0x40` → `MMU_SATP_PPN 0x80010`** — root (L1) table at PA
-   0x800100000 (16 MB into the 2 GB MEM window at 0x80000000; clear of the
+1. **`MMU_SATP_PPN 0x40` → `MMU_SATP_PPN 0x81000`** — root (L1) table at PA
+   0x81000000 (16 MB into the 2 GB MEM window at 0x80000000; clear of the
    image, which grows from 0x80000000 and is < 1 MB for this case —
    assumption recorded; T4 measures the image size). Donor PA 0x40000 was
    its data SRAM (linker.lcf MEM2).
@@ -456,7 +456,7 @@ rv906-side deltas (exactly these, all in the case `.s`):
    is this catch-all, approximated. So the S-mode access at 0x80030000 is
    PMP-allowed on rv906 exactly as 0x30000 is on the donor — same behavior,
    same (quirky) mechanism, zero delta. (This also covers the PTW's own
-   PMP check of the root table at 0x800100000.)
+   PMP check of the root table at 0x81000000.)
 5. **THEADFLAG=0xf kept** — rv906's Sv39 walker reads PTE bits 0–7 + PPN
    only (`rtl/MMU.v:547-550`); PTE[62:59] is ignored, source identity kept.
 6. `MMU_EN` (MODE=8), `MMU_SATP_ASID 0x1`, `MMODE_SMODE`, `EXIT` → all
@@ -563,7 +563,7 @@ vector_table/SETINT-11 — replace the init's source):
 **`test/m8/link_m8.ld`:** image at 0x80000000 (MEM, `rtl/RVProcAXI.v:152`);
 `.tohost`/`.fromhost` at **0x7FFFF000** (uncached aperture,
 `test/m2/common.ld:38-39` convention); stack grows down from the top of a
-1 MB window at 0x80100000; page-table scratch **reserved at 0x800100000**
+1 MB window at 0x80100000; page-table scratch **reserved at 0x81000000**
 (the MMU/exception root-table hole, §4.2/§4.3) — the linker must not place
 any section there (it won't: the image is < 1 MB and the hole is 16 MB
 in; the reservation is documented, not enforced).
@@ -647,7 +647,7 @@ T4's exception scope and T7's table). T7 is last.
 | R3 | **T2 slows m6-mtip past the 300 s/elf timeout** (`test/m6/run_all.sh:21-28`) | Low (mtip runs early, C small) | Low — floor gate | Measured-by-analysis: +≈90·C cycles (D-M8-5); if it trips, the documented fallback re-arms mtip from the CLINT mtime MMIO (test-side only). |
 | R4 | **ACCERR remap mtval semantics**: the PMP access-fault tval on rv906 might not carry the faulting address (spec allows 0) | Low | Low — exception subtest | M4 `mmu_pmp`/`mmu_pmpstore` already pass through this exact deny path (cause-gated); T4 confirms the tval value and, if it is 0, adjusts the remapped subtest's mtval check to expect 0 — ledgered, mechanism unchanged. |
 | R5 | **CSR.v line drift** between this design and T2 execution (M7 is mid-edit) | Certain | Low | T2 locates the arm by symbol (`CSR_TIME:` in the read mux), not by line; T2 re-runs the floor before closing. |
-| R6 | **rv906 image growth** collides with the 0x800100000 page-table hole or the 0x80030000 S-mode data spot (MMU case) | Very low (case images < 1 MB; holes 16 MB in) | Low — a silent clobber would be a confusing hang | T4 measures the linked image size per case (objdump) and asserts it stays < 128 K before the 0x80030000 data spot and < 16 MB before the table hole; the linker script documents both reservations. |
+| R6 | **rv906 image growth** collides with the 0x81000000 page-table hole or the 0x80030000 S-mode data spot (MMU case) | Very low (case images < 1 MB; holes 16 MB in) | Low — a silent clobber would be a confusing hang | T4 measures the linked image size per case (objdump) and asserts it stays < 128 K before the 0x80030000 data spot and < 16 MB before the table hole; the linker script documents both reservations. |
 | R7 | **run-to-run cycle noise** in the donor column (vvp is deterministic, but wall-time is not) | Certain (wall), none (sim time) | None | The cycle column uses **sim time** ($finish line), not wall time — deterministic for a given vvp+case. |
 | R8 | **M7 close-out slips**, blocking T2 | Medium | Schedule only | T2 is the only RTL task; T3–T6 proceed in parallel (test/m8 + donor side are independent). M8 close-out waits on T2+T7, nothing else. |
 
@@ -679,10 +679,10 @@ Seeded (T4/T6 finalize the exact line numbers as the ports are written):
 | L1 | exception | both | `C906_Exception.s:164` | `csrci mhcr,0x2` | `csrci 0x7c1,0x2` | name→numeric (both toolchains reject the name; same CSR, `rtl/rvproc_pkg.sv:281`) |
 | L2 | exception | donor | `C906_Exception.s:161` | `dcache.ciall` | `#dcache.ciall` | XThead CMO has no standard encoding; donor-side build necessity (D-M8-2a) |
 | L3 | exception | rv906 | `C906_Exception.s:161` | (present, active) | dropped | same line, no CMO decode in rv906 (body parity with the patched donor) |
-| L4 | exception | rv906 | `MMU_CFG` `:150-160` | PPN=0 (implicit) | +satp PPN←0x80010 before `MMU_PTW_4K` | PTE write must not land at PA 0 = the image on rv906 (DEFAULT_SLAVE, `rtl/RVProcAXI.v:749-760`) |
+| L4 | exception | rv906 | `MMU_CFG` `:150-160` | PPN=0 (implicit) | +satp PPN←0x81000 before `MMU_PTW_4K` | PTE write must not land at PA 0 = the image on rv906 (DEFAULT_SLAVE, `rtl/RVProcAXI.v:749-760`) |
 | L5 | exception | rv906 | `LOAD/STORE/INST_ACCERR` `:411-461` | 0x600000010 (bus error) + 6-entry PMP no-op | PMP-locked-deny at MEM scratch (e.g. 0x800200000), `pmpcfg0=0x80`+NAPOT pmpaddr0; mtval check → same new address | 0x600000010 is a silent MEM hit on rv906 (DEFAULT_SLAVE); PMP L-bit deny is the rv906-native access-fault mechanism (`rtl/PMP.v:314-333`) |
 | L6 | MMU | both | `C906_mmu_basic.s` 6 sites | `mxstatus` | `0x7c0` | name→numeric (same CSR, `rtl/rvproc_pkg.sv:280`) |
-| L7 | MMU | rv906 | `:263` | `MMU_SATP_PPN 0x40` | `MMU_SATP_PPN 0x80010` | root table in MEM (donor PA 0x40000 = its data SRAM) |
+| L7 | MMU | rv906 | `:263` | `MMU_SATP_PPN 0x40` | `MMU_SATP_PPN 0x81000` | root table in MEM (donor PA 0x40000 = its data SRAM) |
 | L8 | MMU | rv906 | `:281` | `MMU_PTW_1G 0x0,0x0,0xcf,0xf` | `MMU_PTW_1G 0x0,0x80000,0xcf,0xf` | 1G identity over MEM base 0x80000000 (Sv39 PPN field = PA[51:12] = 0x80000000>>12 = 0x80000) |
 | L9 | MMU | rv906 | theisaee/maee pokes | active bits | no-ops (MXSTATUS models `mm` only, `rtl/CSR.v:1453-1463`) | source identity kept; no readback checks in the macros |
 | L10 | interrupt | rv906 | init block | in-core PLIC 0x4000000000 + writable-INTPEND poke + INTIE_HART 0x80 | PLIC 0x0C000000 + UART IRQ source 7 (IER@0x10000004, deasserted before complete) + single-context enable | platform PLIC difference; real level source replaces the donor's one-shot pending backdoor (pattern: `test/m6/plic_uart.S`) |
