@@ -324,6 +324,8 @@ int TestBench::run(int argc, char **argv)
 		}
 	}
 
+	printf("final_cycles %lu\n", (unsigned long)cycle);
+
 	term();
 
 	uint64_t result;
