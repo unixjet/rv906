@@ -297,6 +297,41 @@ module RTU (
     input  wire [PC_WIDTH-1:0]      cp0_rtu_trap_pc,
 
     //=========================================================================
+    // M7 Task 1: DTU/debug ports (donor aq_rtu_top.v's dtu<->rtu group +
+    // aq_rtu_retire.v's IFU/CP0 debug legs). Halt sources: timing-1 (dm
+    // sync + step, honored at a non-split retire boundary, donor
+    // aq_rtu_retire.v:636-682) and timing-0 (ebreak-action halt from CSR,
+    // reset-halt from IFU -- immediate flush, donor :606-634).
+    // dtu_rtu_ebreak_action itself is NOT consumed here: the ebreak->halt
+    // conversion lives in CSR.v (the donor's halt_req_ebreak,
+    // aq_rtu_retire.v:613-617, needs the retiring instruction's ebreak-ness,
+    // which rv906's CSR already tracks as its ex1 sync-exception candidate);
+    // this port exists for the donor's port shape only and is tied off at
+    // the RVProc.v instantiation.
+    //=========================================================================
+    input  wire                     dtu_rtu_sync_halt_req,
+    input  wire                     dtu_rtu_resume_req,
+    input  wire                     dtu_rtu_step_en,
+    input  wire                     dtu_rtu_int_mask,
+    input  wire                     dtu_rtu_ebreak_action,
+    input  wire [63:0]              dtu_rtu_dpc,
+    // ebreak-with-action halt declaration from CSR (CSR withholds its vec-3
+    // sync exception and asks the RTU for a timing-0 halt instead; donor
+    // halt_req_ebreak aq_rtu_retire.v:613-617).
+    input  wire                     cp0_rtu_ebreak_halt,
+    // dret retired this EX1 (donor cp0_rtu_ex1_inst_dret, aq_cp0_iui.v:816).
+    input  wire                     cp0_rtu_ex1_inst_dret,
+    // halt-on-reset level from the IFU (donor ifu_rtu_reset_halt_req,
+    // aq_ifu_vec.v:279) -- timing-0, cause 5.
+    input  wire                     ifu_rtu_reset_halt_req,
+    output wire                     rtu_cp0_exit_debug,   // to CSR's pm FSM
+    output wire [63:0]              rtu_dtu_dpc,          // dpc latch source
+    output wire                     rtu_dtu_halt_ack,     // halt-taken pulse
+    output wire [3:0]               rtu_dtu_halt_cause,   // Task-1 direct cause
+    output wire                     rtu_dtu_retire_vld,   // per-inst retire
+    output wire                     rtu_dtu_retire_debug_expt_vld,
+
+    //=========================================================================
     // M6 Task 2: CSR's registered interrupt-claim export (clone donor
     // aq_cp0_trap_csr.v:1269-1338). The claim is exported as `cp0_rtu_int_sel`
     // [14:0] + active-low `cp0_rtu_int_b`. For the valid term, follow rv12's
@@ -763,6 +798,11 @@ module RTU (
     reg [4:0]  ex2_expt_vec;
     reg [63:0] ex2_tval;
     reg        ex2_inst_chgflw;
+    // M7 Task 1: dret flag riding the same EX1->EX2 stage (donor dp_ex2_
+    // inst_dret, aq_rtu_dp.v:447 -- the donor's `dp_ex1_inst_dret =
+    // cp0_rtu_ex1_cmplt_dp && cp0_rtu_ex1_inst_dret` at aq_rtu_dp.v:404).
+    // CP0-only producer, same shape as ex1_inst_chgflw's own CP0 gate.
+    reg        ex2_inst_dret;
     // M5 Task 8: the retiring instruction's FP-ness + its accrued flags,
     // riding the SAME dp-gated register stage as the rest of the retire
     // packet (M6 Task 7; the stage was unconditional in M5). `ex2_fpu_retire`
@@ -786,6 +826,7 @@ module RTU (
             ex2_expt_vec    <= 5'd0;
             ex2_tval        <= 64'd0;
             ex2_inst_chgflw <= 1'b0;
+            ex2_inst_dret   <= 1'b0;
             ex2_fpu_retire  <= 1'b0;
             ex2_fpu_fflags  <= 5'd0;
         end else begin
@@ -810,6 +851,10 @@ module RTU (
                 ex2_expt_vec    <= ex1_expt_vec;
                 ex2_tval        <= ex1_tval;
                 ex2_inst_chgflw <= ex1_inst_chgflw;
+                // M7 Task 1: donor aq_rtu_dp.v:404
+                // (`dp_ex1_inst_dret = cp0_rtu_ex1_cmplt_dp && cp0_rtu_ex1_
+                // inst_dret`) -- CP0-only producer.
+                ex2_inst_dret   <= ex1_cp0_cmplt_dp && cp0_rtu_ex1_inst_dret;
                 ex2_fpu_fflags  <= fpu_rtu_ex1_falu_fflags;
             end
             ex2_fpu_retire  <= ex1_fpu_cmplt_dp;
@@ -849,10 +894,14 @@ module RTU (
         endcase
     end
 
-    wire dtu_int_mask_tied0  = 1'b0;   // no DTU in M2
+    wire dtu_int_mask_tied0  = 1'b0;   // superseded: M7 Task 1 wires the real dtu_rtu_int_mask below
     wire int_ex2_split_tied0 = 1'b0;   // no split-instruction concept in M2
 
-    wire       retire_int_inst = !cp0_rtu_int_b && !dtu_int_mask_tied0 && !int_ex2_split_tied0;
+    // M7 Task 1: the donor's single-step interrupt mask (aq_rtu_retire.v:470
+    // `retire_int_inst = int_retire_int_vld && !dtu_rtu_int_mask && ...`),
+    // dcsr.step && !stepie out of the DTU (aq_dtu_ctrl.v:376). Interrupts are
+    // masked while single-stepping so the step lands exactly one instruction.
+    wire       retire_int_inst = !cp0_rtu_int_b && !dtu_rtu_int_mask && !int_ex2_split_tied0;
     wire [4:0] retire_int_vec  = int_vec_enc;
 
     //=========================================================================
@@ -928,9 +977,103 @@ module RTU (
     // async-epc-uses-cur-pc term never applies here).
     wire [PC_WIDTH-1:0] retire_trap_epc = retire_sync_expt ? ex2_cur_pc : ex2_next_pc;
 
-    // Trap-taken ack (aq_rtu_retire.v:585-589, simplified: halt_req/
-    // dbg_mode_on are both permanently 0/false -- no DTU in M2).
-    wire retire_trap_vld = ex2_retire_vld && (retire_expt_inst || retire_int_inst);
+    //=========================================================================
+    // SECTION DEBUG PROCESS (M7 Task 1; donor aq_rtu_retire.v:603-830). Halt
+    // sources, cause select, dbg_mode_on state, exit-debug.
+    //
+    // Timing-0 halts (donor :606-634, `halt_req`): reset-halt (IFU level)
+    // and the ebreak-with-action halt (CSR's cp0_rtu_ebreak_halt, standing
+    // in for the donor's halt_req_ebreak -- the donor's own terms
+    // `retire_ex2_retire_vld && dtu_rtu_ebreak_action && dp_retire_ex2_
+    // inst_ebreak && !pending && !dbg_mode_on_after_req` all fold into
+    // CSR.v's declaration, which already knows the retiring instruction is
+    // an ebreak and masks on action/dbgon). Timing-1 halts (donor :636-682,
+    // `halt_req_t1`): dm sync-halt and step, honored at a non-split retire
+    // boundary. rv906 has no split instructions (ex2 split tied 0), no
+    // pending/trigger halt_info yet (Task 2), and no async halt (D-M7-7) --
+    // the donor's `retire_bkpt_expt_t1` gate term and split-trigger buffers
+    // are absent here for the same reason.
+    //=========================================================================
+    // Debug-mode-on state (aq_rtu_retire.v:800-822): `_after_req` sets the
+    // cycle a halt request lands (masks new halt requests and new fetches);
+    // dbg_mode_on itself sets only once the frontend flush completes
+    // (retire_flush_be) -- it IS rtu_yy_xx_dbgon. Declared ahead of the halt
+    // request wires below, which reference both (single forward-reference
+    // style, matching this file's retire_async_expt precedent).
+    reg dbg_mode_on_after_req;
+    reg dbg_mode_on;
+
+    // t0 halt requests (aq_rtu_retire.v:610,613-617,630-634).
+    wire halt_req_reset  = ifu_rtu_reset_halt_req;
+    wire halt_req_ebreak = cp0_rtu_ebreak_halt;
+    wire halt_req_t0     = halt_req_reset || halt_req_ebreak;
+
+    // t1 halt requests (aq_rtu_retire.v:642-682): cannot ack while a t0
+    // request is live (donor's halt_req_t1_retire_vld && !halt_req) or while
+    // already in/entering debug. Step is NOT gated on !dbg_mode_on (a step
+    // request is only meaningful outside debug; inside debug dcsr.step has
+    // no effect on the debug-mode instructions themselves -- donor gates on
+    // dbg_mode_on_after_req the same way for every t1 source).
+    wire halt_req_t1_retire_vld = ex2_retire_vld && !dbg_mode_on_after_req
+                                && !halt_req_t0;
+    wire halt_req_dm_sync       = halt_req_t1_retire_vld && dtu_rtu_sync_halt_req;
+    wire halt_req_step          = halt_req_t1_retire_vld && dtu_rtu_step_en;
+    wire halt_req_t1            = halt_req_dm_sync || halt_req_step;
+
+    // Any halt request taking effect THIS retire boundary.
+    wire halt_req = halt_req_t0 || halt_req_t1;
+
+    // Cause select (aq_rtu_retire.v:768-795, Task-1 subset): the donor's
+    // priority is async(8) > pending(halt_info) > trigger(2) > ebreak(1) >
+    // reset(5) > dm_sync(3) > step(4); async is tied off (D-M7-7),
+    // pending/trigger arrive with Task 2.
+    reg [3:0] halt_cause;
+    always @* begin
+        if (halt_req_ebreak)
+            halt_cause = 4'd1;
+        else if (halt_req_reset)
+            halt_cause = 4'd5;
+        else if (halt_req_dm_sync)
+            halt_cause = 4'd3;
+        else
+            halt_cause = 4'd4;   // halt_req_step
+    end
+
+    // Exit debug mode (aq_rtu_retire.v:755-760): resume pulse, or a retiring
+    // dret. "Exit debug ignore exception": executing dret in debug mode
+    // never generates an exception (IDU already marks a non-debug dret
+    // illegal, so a dret that reaches retire IS a debug-mode dret).
+    wire retire_exit_debug = dbg_mode_on_after_req
+                           && (dtu_rtu_resume_req || (ex2_retire_vld && ex2_inst_dret));
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            dbg_mode_on_after_req <= 1'b0;
+        else if (halt_req)
+            dbg_mode_on_after_req <= 1'b1;
+        else if (retire_exit_debug)
+            dbg_mode_on_after_req <= 1'b0;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            dbg_mode_on <= 1'b0;
+        else if (retire_flush_be && dbg_mode_on_after_req)
+            dbg_mode_on <= 1'b1;
+        else if (retire_exit_debug)
+            dbg_mode_on <= 1'b0;
+    end
+
+    // retire_expt_debug (aq_rtu_retire.v:461-464): an exception while in
+    // debug mode (excludes the never-fire bkpt legs in Task 1).
+    wire retire_expt_debug = ex2_inst_expt || retire_async_expt;
+
+    // Trap-taken ack (aq_rtu_retire.v:585-589, M7 Task 1: the donor's
+    // `&& !halt_req && !dbg_mode_on` qualifiers now REAL -- a pending halt
+    // defers a pending trap, and an exception in debug mode takes no
+    // architectural trap).
+    wire retire_trap_vld = ex2_retire_vld && !halt_req && !dbg_mode_on
+                         && (retire_expt_inst || retire_int_inst);
     wire retire_trap_int = retire_int_inst && !retire_pending_bkpt_expt;
 
     //=========================================================================
@@ -963,10 +1106,15 @@ module RTU (
     // is the real donor's own intent (mret needs a front-end flush) even
     // though the specific bit path differs due to CSR.v's simpler,
     // collapsed signal shape.
+    // M7 Task 1: the donor's halt terms restored (aq_rtu_retire.v:905-913):
+    // `|| halt_req || halt_req_t1` -- a t0 halt flushes immediately (the
+    // donor's halt_req bundle is t0); a t1 halt flushes once the retiring
+    // instruction completes (the donor's halt_req_t1 term). rv906's
+    // halt_req wire already ORs t0 and t1 together, so both terms collapse
+    // to the single `|| halt_req` here.
     wire retire_inst_flush_fe_set = ex2_retire_vld
-                                  && (retire_expt_inst || retire_int_inst || ex2_inst_chgflw);
-    // vstart_updt/bkpt_expt_t1/debug_flush/halt_req/halt_req_t1 all omitted
-    // -- no vector/debug unit anywhere in M2's contracts (see header).
+                                  && (retire_expt_inst || retire_int_inst || ex2_inst_chgflw)
+                                  || halt_req;
 
     wire retire_bju_flush_req = iu_rtu_ex2_bju_ras_mispred || iu_rtu_depd_lsu_chgflow_vld;
     wire retire_flush_fe_set  = retire_inst_flush_fe_set || retire_bju_flush_req;
@@ -1028,15 +1176,19 @@ module RTU (
         else if (retire_flush_be)                                    retire_xret_vld <= 1'b0;
     end
 
-    // Changeflow-PC mux (aq_rtu_retire.v:1026-1039, simplified: no DTU
-    // `retire_exit_debug`/`dtu_rtu_dpc` leg in M2).
-    wire [PC_WIDTH-1:0] retire_chgflw_pc = retire_trap_chgflw_vld ? cp0_rtu_trap_pc : ex2_next_pc;
+    // Changeflow-PC mux (aq_rtu_retire.v:1026-1039, M7 Task 1: the
+    // exit-debug leg now REAL -- dpc wins when leaving debug, ahead of the
+    // trap leg, exactly the donor's priority).
+    wire [PC_WIDTH-1:0] retire_chgflw_pc = retire_exit_debug     ? dtu_rtu_dpc[PC_WIDTH-1:0]
+                                         : retire_trap_chgflw_vld ? cp0_rtu_trap_pc
+                                         :                          ex2_next_pc;
 
-    // Changeflow-valid (aq_rtu_retire.v:1003-1008, simplified: no
-    // `dp_retire_ex2_inst_flush`/vstart/exit_debug legs in M2 -- see the
-    // flush-FSM section's note on why `ex2_inst_chgflw` alone covers this).
+    // Changeflow-valid (aq_rtu_retire.v:1003-1008, M7 Task 1: the
+    // retire_exit_debug leg restored; vstart/dp_retire_ex2_inst_flush legs
+    // stay omitted per the flush-FSM section's note).
     wire retire_chgflw_vld = (ex2_retire_vld && !retire_trap_vld && ex2_inst_chgflw)
-                           || (retire_trap_chgflw_vld && retire_flush_fe);
+                           || (retire_trap_chgflw_vld && retire_flush_fe)
+                           || retire_exit_debug;
 
     //=========================================================================
     // SECTION WB0/WB1 REGISTER (task 4.1 -- 2 architectural GPR write
@@ -1126,11 +1278,40 @@ module RTU (
     assign rtu_yy_xx_expt_vec = retire_trap_vec;
     assign rtu_yy_xx_flush_fe = retire_flush_fe;
     assign rtu_yy_xx_flush    = retire_flush_be;
-    assign rtu_yy_xx_dbgon    = 1'b0;   // no DTU in M2
+    // M7 Task 1: dbg_mode_on for real (donor aq_rtu_retire.v:1157).
+    assign rtu_yy_xx_dbgon    = dbg_mode_on;
 
     assign rtu_cp0_epc  = retire_trap_epc;
     assign rtu_cp0_tval = retire_trap_tval;
     assign rtu_cp0_inst_retire = ex2_retire_vld;
+
+    //=========================================================================
+    // SECTION DTU OUTPUTS (M7 Task 1; donor aq_rtu_retire.v:1172-1235,
+    // Task-1 subset -- no halt_info bundle / pending_ack / tval / mret-sret /
+    // pcfifo next_pc exports yet, those ride the Task-2 trigger machinery).
+    //=========================================================================
+    // rtu_dtu_dpc (donor :1200-1202, minus the dropped async-halt leg): the
+    // retiring instruction's own PC, sign-extended -- the "would-be-next PC"
+    // the dpc register needs so the debugger resumes at the instruction that
+    // was ABOUT to execute (the retiring one has completed; pcgen has
+    // already advanced past it).
+    assign rtu_dtu_dpc = {{(64-PC_WIDTH){ex2_cur_pc[PC_WIDTH-1]}}, ex2_cur_pc};
+    // halt_ack (donor :1223 is `halt_req` -- the t0 bundle; the t1 ack rides
+    // the retire_halt_info PENDING_HALT bit there, a Task-2 path rv906 does
+    // not have yet -- so here BOTH timings pulse the ack directly, the same
+    // information Task 2's bundle would carry).
+    assign rtu_dtu_halt_ack   = halt_req;
+    assign rtu_dtu_halt_cause = halt_cause;
+    // retire_vld (donor :1227-1228, minus the split qualifier rv906 never
+    // sets): one pulse per retiring instruction.
+    assign rtu_dtu_retire_vld = ex2_retire_vld;
+    // Debug-mode exception pulse (donor :1229-1231): an exception while
+    // dbgon -- no architectural trap taken (retire_trap_vld is gated by
+    // !dbg_mode_on above); the DM turns this into abstract-cmd cmderr=3.
+    assign rtu_dtu_retire_debug_expt_vld = ex2_retire_vld && dbg_mode_on
+                                         && retire_expt_debug;
+    // exit_debug pulse to CSR's pm FSM (donor :1255).
+    assign rtu_cp0_exit_debug = retire_exit_debug;
 
     // M5 Task 8 (D7): off the EX2 retire packet above -- CSR.v OR's
     // rtu_cp0_fflags into fflags and takes rtu_cp0_fs_dirty_updt as its

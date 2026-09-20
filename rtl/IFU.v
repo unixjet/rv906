@@ -180,7 +180,25 @@ module IFU (
     // Boot / reset vector (aq_ifu_vec.v, reduced to RESET->RUN + pcload for
     // M1 -- see header note)
     //=========================================================================
-    input  wire [PC_WIDTH-1:0]      cp0_xx_mrvbr
+    input  wire [PC_WIDTH-1:0]      cp0_xx_mrvbr,
+
+    //=========================================================================
+    // M7 Task 1: DTU debug ports (donor aq_dtu_top.v's ifu side +
+    // aq_ifu_vec.v's halt-on-reset). dtu_ifu_debug_inst[_vld] is the DM's
+    // itr instruction channel (aq_ifu_ibuf.v:949,1085,1098: while dbgon and
+    // the vld pulse is live, the fetch entry is the injected word, not an
+    // ICache fetch). rtu_yy_xx_dbgon masks ICache fetch while in/entering
+    // debug (the donor masks on rtu_ifu_dbg_mask = dbg_mode_on_after_req,
+    // aq_ifu_ctrl.v:95; rv906 uses the real rtu_yy_xx_dbgon = dbg_mode_on,
+    // the same shape the ibuf injection mux uses). dtu_ifu_halt_on_reset
+    // arms the reset-halt; ifu_rtu_reset_halt_req is the timing-0 halt
+    // request back to the RTU (aq_ifu_vec.v:279).
+    //=========================================================================
+    input  wire [31:0]              dtu_ifu_debug_inst,
+    input  wire                     dtu_ifu_debug_inst_vld,
+    input  wire                     rtu_yy_xx_dbgon,
+    input  wire                     dtu_ifu_halt_on_reset,
+    output wire                     ifu_rtu_reset_halt_req
 );
 
     //=========================================================================
@@ -202,6 +220,23 @@ module IFU (
         if (!rst_n) boot_rst_vld <= 1'b1;
         else        boot_rst_vld <= 1'b0;
     end
+
+    //=========================================================================
+    // M7 Task 1: HALT-ON-RESET (donor aq_ifu_vec.v:157-209's HALT state,
+    // reduced to rv906's RESET->RUN boot): after rst_n release, the first
+    // fetch with dtu_ifu_halt_on_reset set raises ifu_rtu_reset_halt_req
+    // (donor :279 `ifu_rtu_reset_halt_req = vec_sm_halt`) -- a one-cycle
+    // pulse the RTU takes as a timing-0 halt (cause 5). The donor's level
+    // (HALT state held one cycle) vs rv906's pulse is the same observable
+    // timing: vec_sm_halt is asserted for exactly one cycle too
+    // (vec.v:196-199 HALT->IDLE unconditionally).
+    //=========================================================================
+    reg reset_halt_req_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) reset_halt_req_r <= 1'b0;
+        else        reset_halt_req_r <= dtu_ifu_halt_on_reset && boot_rst_vld;
+    end
+    assign ifu_rtu_reset_halt_req = reset_halt_req_r;
 
     //=========================================================================
     // SECTION: PCGEN  (aq_ifu_pcgen.v -- next-PC arbiter / redirect-priority
@@ -458,7 +493,11 @@ module IFU (
     // fwd decl: driven in SECTION IBUF below.
     wire ibuf_ctrl_inst_fetch;
 
-    wire ctrl_inst_fetch = ibuf_ctrl_inst_fetch;                                     // ctrl.v:93-96, M1-reduced
+    // M7 Task 1: the donor's debug fetch mask (aq_ifu_ctrl.v:93-96,
+    // `ctrl_inst_fetch = ibuf_ctrl_inst_fetch && !(lpmd) && !rtu_ifu_dbg_mask
+    // && !reset_mask`) -- ICache fetch stops while in debug mode so the only
+    // instruction flow is the DTU's itr injection (SECTION IBUF below).
+    wire ctrl_inst_fetch = ibuf_ctrl_inst_fetch && !rtu_yy_xx_dbgon;         // ctrl.v:93-96, M7: dbg_mask real
     wire ctrl_if_cancel  = rtu_ifu_flush_fe || pcgen_ctrl_chgflw_vld;                // ctrl.v:106
 
     assign ctrl_icache_req_vld = ctrl_inst_fetch;                                    // ctrl.v:117
@@ -913,8 +952,18 @@ module IFU (
     end
 
     // ---- Output to IDU (frozen ports) --------------------------------------
-    assign ifu_idu_id_inst_vld = pop_entry_vld;                                      // ibuf.v:1354
-    assign ifu_idu_id_inst     = {ibuf_h1, ibuf_h0};                                  // ibuf.v:1355-1356
+    // M7 Task 1: debug-instruction (itr) injection (donor aq_ifu_ibuf.v:949-
+    // 953,1085,1098 -- the donor inserts the DM's word into the ibuf's own
+    // create path; rv906's ibuf has no separate create0 port, so the
+    // equivalent is a delivery mux here). While dbgon, ctrl_inst_fetch is
+    // masked and the halt flush already emptied the ibuf, so pop_entry_vld
+    // is 0 and the injected word is the ONLY thing delivered -- no double
+    // issue is possible. The word bypasses the ibuf (no head advance): the
+    // donor's create path also consumes no ICache fetch entry.
+    wire dtu_dbg_inst_deliver = rtu_yy_xx_dbgon && dtu_ifu_debug_inst_vld;
+    assign ifu_idu_id_inst_vld = pop_entry_vld || dtu_dbg_inst_deliver;   // ibuf.v:1354
+    assign ifu_idu_id_inst     = dtu_dbg_inst_deliver ? dtu_ifu_debug_inst
+                                                      : {ibuf_h1, ibuf_h0}; // ibuf.v:1355-1356
 
     // ifu_idu_id_bht_pred (ibuf.v:1357-1358) rides pred_ibuf_br_taken{0,1}
     // alongside each halfword in the real RTL. TASK 9: BPU.v's BHT is real

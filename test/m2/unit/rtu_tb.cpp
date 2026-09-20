@@ -130,6 +130,16 @@ static void tie_idle_inputs(void) {
     dut->fpu_rtu_ex1_falu_fvld  = 0;
     dut->fpu_rtu_ex1_falu_xvld  = 0;
     dut->fpu_rtu_ex1_falu_preg  = 0;
+    // M7 Task 1: DTU/debug ports, idle = "no debugger attached, no halt".
+    dut->dtu_rtu_sync_halt_req  = 0;
+    dut->dtu_rtu_resume_req     = 0;
+    dut->dtu_rtu_step_en        = 0;
+    dut->dtu_rtu_int_mask       = 0;
+    dut->dtu_rtu_ebreak_action  = 0;
+    dut->dtu_rtu_dpc            = 0;
+    dut->cp0_rtu_ebreak_halt    = 0;
+    dut->cp0_rtu_ex1_inst_dret  = 0;
+    dut->ifu_rtu_reset_halt_req = 0;
 }
 
 static void tick(void) {
@@ -193,6 +203,11 @@ static void test_reset_state(void) {
     check(dut->rtu_iu_div_wb_grant == 1, "reset: div_wb_grant asserted (EX1 group idle)");
     check(RTUP(dut)->dbg_onehot_violation == 0, "reset: onehot assertion quiescent");
     check(RTUP(dut)->dbg_fwd_collision == 0, "reset: fwd-collision assertion quiescent");
+    // M7 Task 1: debug state quiescent at reset (off-path identity).
+    check(dut->rtu_yy_xx_dbgon == 0, "reset: dbgon quiescent (off-path identity)");
+    check(dut->rtu_dtu_halt_ack == 0, "reset: halt_ack quiescent");
+    check(dut->rtu_cp0_exit_debug == 0, "reset: exit_debug quiescent");
+    check(dut->rtu_dtu_retire_debug_expt_vld == 0, "reset: retire_debug_expt quiescent");
     test_result("T1 reset state: everything quiescent");
 }
 
@@ -932,6 +947,271 @@ static void test_fpu_cmplt_retire_heartbeat(void) {
 }
 
 //=============================================================================
+// M7 Task 1 -- core-side debug halt machinery (donor aq_rtu_retire.v).
+// Timing map for the t1 (retire-boundary) halt:
+//   T   : cp0_rtu_ex1_cmplt_dp=1 (retiring inst in EX1), iu_rtu_ex1_cur_pc=X
+//   T+1 : ex2_retire_vld=1; dtu_rtu_sync_halt_req=1 -> halt_req_t1=1:
+//         rtu_dtu_halt_ack=1, rtu_dtu_halt_cause=3, rtu_dtu_dpc=X (donor
+//         aq_rtu_retire.v:1200-1202: cur_pc for the sync leg); flush IDLE->FE
+//         (retire_inst_flush_fe_set = || halt_req); dbg_mode_on_after_req=1
+//   T+2 : flush FE->BE (cpu_no_op)
+//   T+3 : flush BE, dbg_mode_on set at this edge -> rtu_yy_xx_dbgon=1 at T+4
+//=============================================================================
+
+static void test_m7_dm_sync_halt_t1(void) {
+    tie_idle_inputs();
+    // T: a CP0 op retires through EX1 (pc 0x7000).
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->iu_rtu_ex1_cur_pc    = 0x7000;
+    dut->iu_rtu_ex1_next_pc   = 0x7004;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 0, "t1: no ack yet (pre-retire)");
+    tick();   // -> T+1: ex2_retire_vld=1
+    dut->cp0_rtu_ex1_cmplt_dp = 0;   // one-cycle retire pulse; let ex2 fall at T+2
+                                     // so cpu_no_op frees the flush FE->BE (S6)
+
+    // T+1: the DM's sync-halt request lands on the retire boundary.
+    dut->dtu_rtu_sync_halt_req = 1;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "t1: halt_ack pulses at the retire boundary");
+    check(dut->rtu_dtu_halt_cause == 3, "t1: cause == 3 (dm_sync)", dut->rtu_dtu_halt_cause, 3);
+    check(dut->rtu_dtu_dpc == 0x7000, "t1: dpc latch source == retiring inst's cur_pc",
+          dut->rtu_dtu_dpc, 0x7000);
+    check(dut->rtu_yy_xx_dbgon == 0, "t1: dbgon not yet (flush not at BE)");
+    tick();   // -> T+2: flush FE
+    tie_idle_inputs();
+    check(dut->rtu_idu_flush_fe == 1, "t1: flush FE reached");
+    tick();   // -> T+3: flush BE
+    check(dut->rtu_idu_flush_wbt == 1, "t1: flush BE reached");
+    tick();   // -> T+4: dbg_mode_on set
+    check(dut->rtu_yy_xx_dbgon == 1, "t1: rtu_yy_xx_dbgon=1 once flush completes",
+          dut->rtu_yy_xx_dbgon, 1);
+    for (int i = 0; i < 3; i++) tick();   // settle idle
+    check(dut->rtu_yy_xx_dbgon == 1, "t1: dbgon holds (no exit requested)");
+    test_result("T21 M7 dm-sync halt (t1): ack/cause3/dpc=cur_pc, dbgon after flush BE");
+
+    // Teardown: resume out of debug (also exercised fully in T24).
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 2; i++) tick();
+}
+
+static void test_m7_ebreak_reset_halt_t0(void) {
+    // (a) EBREAK-with-action: timing-0, cause 1, no retire needed at all.
+    tie_idle_inputs();
+    dut->cp0_rtu_ebreak_halt = 1;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "t0 ebreak: halt_ack IMMEDIATE (no retire boundary)");
+    check(dut->rtu_dtu_halt_cause == 1, "t0 ebreak: cause == 1 (ebreak)",
+          dut->rtu_dtu_halt_cause, 1);
+    check(dut->rtu_yy_xx_dbgon == 0, "t0 ebreak: dbgon not yet");
+    tick();   // flush IDLE->FE at this edge
+    tie_idle_inputs();
+    tick();   // FE->BE
+    tick();   // BE->IDLE, dbg_mode_on set at this edge
+    check(dut->rtu_yy_xx_dbgon == 1, "t0 ebreak: dbgon=1 after flush");
+    // Resume out.
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 2; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "t0 ebreak: resumed out of debug");
+
+    // (b) RESET-halt from the IFU: timing-0, cause 5.
+    tie_idle_inputs();
+    dut->ifu_rtu_reset_halt_req = 1;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "t0 reset: halt_ack immediate");
+    check(dut->rtu_dtu_halt_cause == 5, "t0 reset: cause == 5 (reset)",
+          dut->rtu_dtu_halt_cause, 5);
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "t0 reset: dbgon=1 after flush");
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 2; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "t0 reset: resumed out of debug");
+    test_result("T22 M7 timing-0 halts: ebreak(cause1) + reset(cause5), immediate ack");
+}
+
+static void test_m7_step_halt_and_int_mask(void) {
+    // (a) Single-step: timing-1, cause 4.
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->iu_rtu_ex1_cur_pc    = 0x8000;
+    dut->iu_rtu_ex1_next_pc   = 0x8004;
+    tick();   // -> ex2_retire_vld
+    dut->cp0_rtu_ex1_cmplt_dp = 0;   // one-cycle retire pulse; ex2 falls at T+2
+    dut->dtu_rtu_step_en = 1;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "step: halt_ack at retire boundary");
+    check(dut->rtu_dtu_halt_cause == 4, "step: cause == 4 (step)",
+          dut->rtu_dtu_halt_cause, 4);
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "step: dbgon=1 after flush");
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 2; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "step: resumed out of debug");
+
+    // (b) dcsr.int_mask (step && !stepie) blocks the interrupt-claim retire.
+    // Baseline: an interrupt claim (cp0_rtu_int_b=0) on a normal ALU retire
+    // takes the interrupt.
+    tie_idle_inputs();
+    dut->cp0_rtu_int_b = 0;   // a claim is present
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    tick();   // -> ex2_retire_vld
+    dut->iu_rtu_ex1_alu_cmplt    = 0;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 0;
+    dut->eval();
+    check(dut->rtu_yy_xx_expt_vld == 1, "int_mask=0: interrupt claim taken at retire",
+          dut->rtu_yy_xx_expt_vld, 1);
+    // Now with the DTU's step-interrupt mask asserted: no interrupt.
+    tie_idle_inputs();
+    dut->dtu_rtu_int_mask = 1;
+    dut->cp0_rtu_int_b = 0;
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    tick();
+    dut->iu_rtu_ex1_alu_cmplt    = 0;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 0;
+    dut->eval();
+    check(dut->rtu_yy_xx_expt_vld == 0, "int_mask=1: interrupt claim masked (single-step)",
+          dut->rtu_yy_xx_expt_vld, 0);
+    tie_idle_inputs();
+    test_result("T23 M7 step halt (cause4) + dcsr.int_mask blocks interrupt retire");
+}
+
+static void test_m7_exit_debug_resume_and_dret(void) {
+    // Enter debug via the ebreak timing-0 halt.
+    tie_idle_inputs();
+    dut->cp0_rtu_ebreak_halt = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "exit: entered debug (prerequisite)");
+
+    // (a) RESUME exit: rtu_cp0_exit_debug pulses AND a redirect to dpc.
+    // The donor's exit_debug chgflw leg fires for resume too (not just dret):
+    // aq_rtu_retire.v:1008 ORs retire_exit_debug into retire_chgflw_vld and
+    // :1032 points retire_chgflw_pc at dtu_rtu_dpc for either leg.
+    dut->dtu_rtu_dpc = 0x4000;   // debugger's resume target
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    check(dut->rtu_cp0_exit_debug == 1, "resume: rtu_cp0_exit_debug pulses");
+    check(dut->rtu_ifu_chgflw_vld == 1, "resume: redirect asserted (exit_debug leg)");
+    check(dut->rtu_ifu_chgflw_pc == 0x4000, "resume: redirect target == dpc",
+          dut->rtu_ifu_chgflw_pc, 0x4000);
+    tick();
+    tie_idle_inputs();
+    check(dut->rtu_yy_xx_dbgon == 0, "resume: dbgon cleared");
+    for (int i = 0; i < 3; i++) tick();
+
+    // (b) DRET exit: re-enter debug, then retire a dret -> redirect to
+    // dtu_rtu_dpc (the debugger-set resume PC), dbgon cleared.
+    dut->cp0_rtu_ebreak_halt = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "dret exit: re-entered debug");
+
+    dut->dtu_rtu_dpc          = 0x8000;   // debugger's resume target
+    dut->cp0_rtu_ex1_cmplt_dp = 1;        // the dret retires
+    dut->cp0_rtu_ex1_inst_dret = 1;
+    tick();   // -> ex2_retire_vld && ex2_inst_dret
+    dut->eval();
+    check(dut->rtu_cp0_exit_debug == 1, "dret exit: rtu_cp0_exit_debug pulses");
+    check(dut->rtu_ifu_chgflw_vld == 1, "dret exit: redirect asserted");
+    check(dut->rtu_ifu_chgflw_pc == 0x8000, "dret exit: redirect target == dtu_rtu_dpc",
+          dut->rtu_ifu_chgflw_pc, 0x8000);
+    tick();
+    tie_idle_inputs();
+    check(dut->rtu_yy_xx_dbgon == 0, "dret exit: dbgon cleared");
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_ifu_chgflw_vld == 0, "dret exit: redirect is one-shot");
+    test_result("T24 M7 exit-debug: resume (redirect to dpc) + dret (redirect to dpc)");
+}
+
+static void test_m7_debug_mode_exception(void) {
+    // Enter debug.
+    tie_idle_inputs();
+    dut->cp0_rtu_ebreak_halt = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "dbg-expt: entered debug (prerequisite)");
+
+    // An ecall retires WHILE in debug: no architectural trap (retire_trap_vld
+    // is gated by !dbg_mode_on), but the DM sees retire_debug_expt_vld.
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->cp0_rtu_ex1_expt_vld = 1;
+    dut->cp0_rtu_ex1_expt_vec = 11;   // ecall
+    dut->iu_rtu_ex1_cur_pc    = 0x9000;
+    tick();   // -> ex2_retire_vld
+    dut->cp0_rtu_ex1_cmplt_dp = 0;
+    dut->cp0_rtu_ex1_expt_vld = 0;
+    dut->eval();
+    check(dut->rtu_yy_xx_expt_vld == 0, "dbg-expt: NO architectural trap while dbgon",
+          dut->rtu_yy_xx_expt_vld, 0);
+    check(dut->rtu_dtu_retire_debug_expt_vld == 1,
+          "dbg-expt: rtu_dtu_retire_debug_expt_vld pulses for the DM");
+    tie_idle_inputs();
+    // Resume out of debug for the next scenario (t1 halts only ack outside
+    // debug -- dbg_mode_on_after_req gates them).
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "halt-defer: back out of debug (prerequisite)");
+
+    // A concurrent t1 HALT request suppresses a pending sync trap: the halt
+    // takes the retire boundary, the trap is deferred (retire_trap_vld is
+    // gated by !halt_req).
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->cp0_rtu_ex1_expt_vld = 1;
+    dut->cp0_rtu_ex1_expt_vec = 2;    // illegal instruction
+    tick();   // -> ex2_retire_vld
+    dut->cp0_rtu_ex1_cmplt_dp = 0;
+    dut->cp0_rtu_ex1_expt_vld = 0;
+    dut->dtu_rtu_sync_halt_req = 1;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "halt-defer: halt taken at the boundary");
+    check(dut->rtu_yy_xx_expt_vld == 0, "halt-defer: pending trap suppressed by the halt");
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "halt-defer: halted (dbgon=1)");
+    // Resume out.
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    test_result("T25 M7 exception-in-debug: no arch trap + retire_debug_expt_vld; halt defers trap");
+}
+
+//=============================================================================
 // main
 //=============================================================================
 int main(int argc, char **argv) {
@@ -962,6 +1242,13 @@ int main(int argc, char **argv) {
     test_falu_xvld_arbiter_leg();
     test_wbf0_register();
     test_fpu_cmplt_retire_heartbeat();
+
+    // M7 Task 1: core-side debug halt machinery.
+    test_m7_dm_sync_halt_t1();
+    test_m7_ebreak_reset_halt_t0();
+    test_m7_step_halt_and_int_mask();
+    test_m7_exit_debug_resume_and_dret();
+    test_m7_debug_mode_exception();
 
     printf("[rtu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

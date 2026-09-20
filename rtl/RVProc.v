@@ -549,6 +549,56 @@ module RVProc #(
     wire                     rtu_cp0_fs_dirty_updt;
 
     //=========================================================================
+    // M7 Task 1: core-side debug nets (DTU <-> CSR/RTU/IFU). The DM side
+    // (tdt_dm_dtu_*) is tied to reset constants until Task 3 lands TDT_DM.v;
+    // the DTU -> SoC side is REAL (it feeds CSR/RTU/IFU). All the
+    // rtu_yy_xx_dbgon consumers see 0 at reset (off-path identity).
+    //=========================================================================
+    // DTU <-> CP0 (dtu_cp0_* = DTU outputs; cp0_dtu_* = CSR outputs)
+    wire [11:0]              cp0_dtu_addr;
+    wire [63:0]              cp0_dtu_wdata;
+    wire                     cp0_dtu_wreg;
+    wire                     cp0_dtu_rreg;
+    wire [63:0]              dtu_cp0_rdata;
+    wire [1:0]               dtu_cp0_dcsr_prv;
+    wire                     dtu_cp0_dcsr_mprven;
+    wire                     dtu_cp0_wake_up;
+    // RTU <-> DTU (dtu_rtu_* = DTU outputs; rtu_dtu_* = RTU outputs)
+    wire                     dtu_rtu_sync_halt_req;
+    wire                     dtu_rtu_resume_req;
+    wire                     dtu_rtu_step_en;
+    wire                     dtu_rtu_int_mask;
+    wire                     dtu_rtu_ebreak_action;
+    wire [63:0]              dtu_rtu_dpc;
+    wire [63:0]              rtu_dtu_dpc;
+    wire                     rtu_dtu_halt_ack;
+    wire [3:0]               rtu_dtu_halt_cause;
+    wire                     rtu_dtu_retire_vld;
+    wire                     rtu_dtu_retire_debug_expt_vld;
+    wire                     rtu_cp0_exit_debug;
+    wire                     cp0_rtu_ebreak_halt;
+    wire                     cp0_rtu_ex1_inst_dret;
+    wire                     rtu_yy_xx_dbgon;
+    // DTU <-> IFU
+    wire [31:0]              dtu_ifu_debug_inst;
+    wire                     dtu_ifu_debug_inst_vld;
+    wire                     dtu_ifu_halt_on_reset;
+    wire                     ifu_rtu_reset_halt_req;
+    // DTU <-> TDT_DM (tied constants; Task 3 wires the real DM)
+    wire                     tdt_dm_dtu_halt_req       = 1'b0;
+    wire                     tdt_dm_dtu_resume_req     = 1'b0;
+    wire                     tdt_dm_dtu_halt_on_reset  = 1'b0;
+    wire                     tdt_dm_dtu_ack_havereset  = 1'b1;  // drain havereset
+    wire [31:0]              tdt_dm_dtu_itr            = 32'd0;
+    wire                     tdt_dm_dtu_itr_vld        = 1'b0;
+    wire                     tdt_dm_dtu_wr_vld         = 1'b0;
+    wire [1:0]               tdt_dm_dtu_wr_flg         = 2'b00;
+    wire [63:0]              tdt_dm_dtu_wdata          = 64'd0;
+    // DTU -> HPCP (no HPCP in rv906; dangling, D-M7-10)
+    wire                     dtu_hpcp_dcsr_stopcount;
+    wire                     dtu_rtu_pending_tval_unused;
+
+    //=========================================================================
     // RTU <-> IDU : the exclusive bypass network (fwd0/1/2 + wb0/1, IDU
     // note S6) + the flush/drain/commit group (RTU note S6)
     //=========================================================================
@@ -739,6 +789,13 @@ module RVProc #(
         .rtu_ifu_chgflw_vld      (rtu_ifu_chgflw_vld),
         .rtu_ifu_chgflw_pc       (rtu_ifu_chgflw_pc),
         .rtu_ifu_flush_fe        (rtu_ifu_flush_fe),
+
+        // M7 Task 1: DTU debug-injection + halt-on-reset
+        .dtu_ifu_debug_inst      (dtu_ifu_debug_inst),
+        .dtu_ifu_debug_inst_vld  (dtu_ifu_debug_inst_vld),
+        .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon),
+        .dtu_ifu_halt_on_reset   (dtu_ifu_halt_on_reset),
+        .ifu_rtu_reset_halt_req  (ifu_rtu_reset_halt_req),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr)
     );
@@ -962,7 +1019,8 @@ module RVProc #(
         .rtu_idu_flush_wbt       (rtu_idu_flush_wbt),
         .rtu_idu_commit          (rtu_idu_commit),
         .rtu_idu_commit_for_bju  (rtu_idu_commit_for_bju),
-        .rtu_idu_pipeline_empty  (rtu_idu_pipeline_empty)
+        .rtu_idu_pipeline_empty  (rtu_idu_pipeline_empty),
+        .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon)
     );
 
     //=========================================================================
@@ -1328,6 +1386,23 @@ module RVProc #(
         .cp0_rtu_ex1_chgflw_pc   (cp0_rtu_ex1_chgflw_pc),
         .cp0_rtu_trap_pc         (cp0_rtu_trap_pc),
 
+        // M7 Task 1: DTU/debug -> RTU
+        .dtu_rtu_sync_halt_req   (dtu_rtu_sync_halt_req),
+        .dtu_rtu_resume_req      (dtu_rtu_resume_req),
+        .dtu_rtu_step_en         (dtu_rtu_step_en),
+        .dtu_rtu_int_mask        (dtu_rtu_int_mask),
+        .dtu_rtu_ebreak_action   (),                    // not consumed by RTU (see RTU.v header)
+        .dtu_rtu_dpc             (dtu_rtu_dpc),
+        .cp0_rtu_ebreak_halt     (cp0_rtu_ebreak_halt),
+        .cp0_rtu_ex1_inst_dret   (cp0_rtu_ex1_inst_dret),
+        .ifu_rtu_reset_halt_req  (ifu_rtu_reset_halt_req),
+        .rtu_cp0_exit_debug      (rtu_cp0_exit_debug),
+        .rtu_dtu_dpc             (rtu_dtu_dpc),
+        .rtu_dtu_halt_ack        (rtu_dtu_halt_ack),
+        .rtu_dtu_halt_cause      (rtu_dtu_halt_cause),
+        .rtu_dtu_retire_vld      (rtu_dtu_retire_vld),
+        .rtu_dtu_retire_debug_expt_vld (rtu_dtu_retire_debug_expt_vld),
+
         // M6 Task 2: connect interrupt claim export to RTU consumer leg
         .cp0_rtu_int_sel         (cp0_rtu_int_sel),
         .cp0_rtu_int_b           (cp0_rtu_int_b),
@@ -1344,7 +1419,7 @@ module RVProc #(
         .rtu_yy_xx_expt_vec      (rtu_yy_xx_expt_vec),
         .rtu_yy_xx_flush_fe      (rtu_yy_xx_flush_fe),
         .rtu_yy_xx_flush         (rtu_yy_xx_flush),
-        .rtu_yy_xx_dbgon         (),
+        .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon),
         .rtu_cp0_epc             (rtu_cp0_epc),
         .rtu_cp0_tval            (rtu_cp0_tval),
         .rtu_cp0_inst_retire     (rtu_cp0_inst_retire),
@@ -1442,6 +1517,21 @@ module RVProc #(
         .rtu_cp0_fflags          (rtu_cp0_fflags),
         .rtu_cp0_fs_dirty_updt   (rtu_cp0_fs_dirty_updt),
 
+        // M7 Task 1: cp0 <-> DTU debug-CSR port + ebreak/dret to RTU
+        .cp0_dtu_addr            (cp0_dtu_addr),
+        .cp0_dtu_wdata           (cp0_dtu_wdata),
+        .cp0_dtu_wreg            (cp0_dtu_wreg),
+        .cp0_dtu_rreg            (cp0_dtu_rreg),
+        .dtu_cp0_rdata           (dtu_cp0_rdata),
+        .dtu_cp0_dcsr_prv        (dtu_cp0_dcsr_prv),
+        .dtu_cp0_dcsr_mprven     (dtu_cp0_dcsr_mprven),
+        .dtu_cp0_wake_up         (dtu_cp0_wake_up),
+        .dtu_rtu_ebreak_action   (dtu_rtu_ebreak_action),
+        .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon),
+        .rtu_cp0_exit_debug      (rtu_cp0_exit_debug),
+        .cp0_rtu_ebreak_halt     (cp0_rtu_ebreak_halt),
+        .cp0_rtu_ex1_inst_dret   (cp0_rtu_ex1_inst_dret),
+
         // M5 Task 11 BUG 2: frm read-out for the FPU's DYN-rm resolution.
         .cp0_fpu_frm             (cp0_fpu_frm),
 
@@ -1493,6 +1583,68 @@ module RVProc #(
         .msip                    (msip),
         .meip                    (meip),
         .mtime                   (mtime)
+    );
+
+    //=========================================================================
+    // DTU instance (M7 Task 1): core-side debug state. The TDT_DM side is
+    // tied to reset constants (the DM module is Task 3); every DTU -> SoC
+    // output is a REAL net (feeds CSR/RTU/IFU above). The HPCP stopcount
+    // output has no consumer in rv906 (no HPCP, D-M7-10) and is sunk.
+    //=========================================================================
+    DTU u_dtu (
+        .clk                          (clk),
+        .rst_n                        (rst_n),
+
+        // CP0 <-> DTU
+        .cp0_dtu_addr                 (cp0_dtu_addr),
+        .cp0_dtu_wdata                (cp0_dtu_wdata),
+        .cp0_dtu_wreg                 (cp0_dtu_wreg),
+        .cp0_dtu_rreg                 (cp0_dtu_rreg),
+        .cp0_yy_priv_mode             (cp0_yy_priv_mode),
+        .dtu_cp0_rdata                (dtu_cp0_rdata),
+        .dtu_cp0_dcsr_prv             (dtu_cp0_dcsr_prv),
+        .dtu_cp0_dcsr_mprven          (dtu_cp0_dcsr_mprven),
+        .dtu_cp0_wake_up              (dtu_cp0_wake_up),
+
+        // TDT_DM <-> DTU (tied; Task 3 wires the real DM)
+        .tdt_dm_dtu_halt_req          (tdt_dm_dtu_halt_req),
+        .tdt_dm_dtu_resume_req        (tdt_dm_dtu_resume_req),
+        .tdt_dm_dtu_halt_on_reset     (tdt_dm_dtu_halt_on_reset),
+        .tdt_dm_dtu_ack_havereset     (tdt_dm_dtu_ack_havereset),
+        .tdt_dm_dtu_itr               (tdt_dm_dtu_itr),
+        .tdt_dm_dtu_itr_vld           (tdt_dm_dtu_itr_vld),
+        .tdt_dm_dtu_wr_vld            (tdt_dm_dtu_wr_vld),
+        .tdt_dm_dtu_wr_flg            (tdt_dm_dtu_wr_flg),
+        .tdt_dm_dtu_wdata             (tdt_dm_dtu_wdata),
+        .dtu_tdt_dm_halted            (),
+        .dtu_tdt_dm_havereset         (),
+        .dtu_tdt_dm_itr_done          (),
+        .dtu_tdt_dm_retire_debug_expt_vld (),
+        .dtu_tdt_dm_wr_ready          (),
+        .dtu_tdt_dm_rx_data           (),
+
+        // RTU <-> DTU
+        .rtu_dtu_dpc                  (rtu_dtu_dpc),
+        .rtu_dtu_halt_ack             (rtu_dtu_halt_ack),
+        .rtu_dtu_halt_cause           (rtu_dtu_halt_cause),
+        .rtu_dtu_retire_vld           (rtu_dtu_retire_vld),
+        .rtu_dtu_retire_debug_expt_vld (rtu_dtu_retire_debug_expt_vld),
+        .rtu_yy_xx_dbgon              (rtu_yy_xx_dbgon),
+        .dtu_rtu_sync_halt_req        (dtu_rtu_sync_halt_req),
+        .dtu_rtu_resume_req           (dtu_rtu_resume_req),
+        .dtu_rtu_step_en              (dtu_rtu_step_en),
+        .dtu_rtu_int_mask             (dtu_rtu_int_mask),
+        .dtu_rtu_ebreak_action        (dtu_rtu_ebreak_action),
+        .dtu_rtu_dpc                  (dtu_rtu_dpc),
+        .dtu_rtu_pending_tval         (dtu_rtu_pending_tval_unused),
+
+        // DTU -> IFU
+        .dtu_ifu_debug_inst           (dtu_ifu_debug_inst),
+        .dtu_ifu_debug_inst_vld       (dtu_ifu_debug_inst_vld),
+        .dtu_ifu_halt_on_reset        (dtu_ifu_halt_on_reset),
+
+        // DTU -> HPCP (no HPCP; dangling)
+        .dtu_hpcp_dcsr_stopcount      (dtu_hpcp_dcsr_stopcount)
     );
 
     //=========================================================================

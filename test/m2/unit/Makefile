@@ -33,14 +33,18 @@ VFLAGS = --cc --exe -O2 -Wno-fatal --compiler clang
 BIN_DIR = $(ROOT)/bin/unit
 
 .PHONY: all run clean
-all: csr iu rtu idu dcache mmu lsu lr_sc fpu
+all: csr iu rtu idu dcache mmu lsu lr_sc fpu dtu
 
 #-----------------------------------------------------------------------------
 # CSR (plan task 2.2)
 #-----------------------------------------------------------------------------
 CSR_OBJ = $(ROOT)/obj/unit/csr
 CSR_BIN = $(BIN_DIR)/csr_tb
-CSR_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/CSR.v
+# M7 Task 1: DTU.v joins the CSR bench's RTL list (CSR.v's 0x7B0-0x7B3
+# decode arms route to the DTU; DTU.v is compiled alongside even though the
+# CSR --top-module only elaborates CSR.v, keeping the two debug-state files
+# lint-checked together in one build).
+CSR_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/CSR.v $(ROOT)/rtl/DTU.v
 
 .PHONY: csr
 csr: $(CSR_BIN)
@@ -183,6 +187,22 @@ $(FPU_BIN): $(FPU_RTL) $(CURDIR)/fpu_tb.cpp
 		-o $@ $(FPU_RTL) $(CURDIR)/fpu_tb.cpp
 	$(MAKE) -C $(FPU_OBJ) -f VFPU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
 
+#-----------------------------------------------------------------------------
+# DTU (M7 Task 1) -- core-side debug unit, standalone white-box bench.
+#-----------------------------------------------------------------------------
+DTU_OBJ = $(ROOT)/obj/unit/dtu
+DTU_BIN = $(BIN_DIR)/dtu_tb
+DTU_RTL = $(ROOT)/rtl/rvproc_pkg.sv $(ROOT)/rtl/DTU.v
+
+.PHONY: dtu
+dtu: $(DTU_BIN)
+
+$(DTU_BIN): $(DTU_RTL) $(CURDIR)/dtu_tb.cpp
+	@mkdir -p $(DTU_OBJ) $(BIN_DIR)
+	$(VERILATOR) $(VFLAGS) --top-module DTU --Mdir $(DTU_OBJ) \
+		-o $@ $(DTU_RTL) $(CURDIR)/dtu_tb.cpp
+	$(MAKE) -C $(DTU_OBJ) -f VDTU.mk CXX=$(CXX_TOOL) LINK=$(CXX_TOOL)
+
 # Run EVERY bench even when one fails, then report -- a recipe line that
 # exits non-zero would otherwise abort the target and hide the benches
 # behind it, exactly backwards for a regression run (test/m1/unit/Makefile
@@ -198,10 +218,11 @@ run: all
 	$(LSU_BIN) || rc=1; \
 	$(LR_SC_BIN) || rc=1; \
 	$(FPU_BIN) || rc=1; \
+	$(DTU_BIN) || rc=1; \
 	if [ $$rc -ne 0 ]; then echo "UNIT-SUITE-FAIL"; else echo "UNIT-SUITE-PASS"; fi; \
 	exit $$rc
 
 clean:
 	rm -rf $(ROOT)/obj/unit/csr $(CSR_BIN) $(ROOT)/obj/unit/iu $(IU_BIN) $(ROOT)/obj/unit/rtu $(RTU_BIN) $(ROOT)/obj/unit/idu $(IDU_BIN) \
 	       $(ROOT)/obj/unit/dcache $(DCACHE_BIN) $(ROOT)/obj/unit/mmu $(MMU_BIN) $(ROOT)/obj/unit/lsu $(LSU_BIN) \
-	       $(ROOT)/obj/unit/lr_sc $(LR_SC_BIN) $(ROOT)/obj/unit/fpu $(FPU_BIN)
+	       $(ROOT)/obj/unit/lr_sc $(LR_SC_BIN) $(ROOT)/obj/unit/fpu $(FPU_BIN) $(ROOT)/obj/unit/dtu $(DTU_BIN)

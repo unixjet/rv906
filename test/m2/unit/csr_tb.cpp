@@ -59,6 +59,24 @@ static const uint32_t CSR_FFLAGS    = 0x001;
 static const uint32_t CSR_FRM       = 0x002;
 static const uint32_t CSR_FCSR      = 0x003;
 
+// M7 Task 1 (rvproc_pkg.sv) -- the debug-mode CSR file, storage in DTU.v.
+static const uint32_t CSR_DCSR      = 0x7B0;
+static const uint32_t CSR_DPC       = 0x7B1;
+static const uint32_t CSR_DSCRATCH0 = 0x7B2;
+static const uint32_t CSR_DSCRATCH1 = 0x7B3;
+// dcsr bit positions (0.13 layout, DTU.v SECTION DCSR):
+// [31:28]xdebugver, [15]ebreakm, [13]ebreaks, [12]ebreaku, [11]stepie,
+// [10]stopcount, [8:6]cause, [4]mprven, [2]step, [1:0]prv.
+static const int  DCSR_STEP      = 2;
+static const int  DCSR_MPRVEN    = 4;
+static const int  DCSR_CAUSE_LO  = 6;
+static const int  DCSR_STOPCOUNT = 10;
+static const int  DCSR_STEPIE    = 11;
+static const int  DCSR_EBREAKU   = 12;
+static const int  DCSR_EBREAKS   = 13;
+static const int  DCSR_EBREAKM   = 15;
+static const uint64_t DCSR_XDEBUGVER_013 = (0x4ULL << 28);
+
 // mstatus field bit positions used by the M5 FP tests (CSR.v layout):
 // [63]SD, [14:13]FS (00=Off,01=Clean,10=Initial,11=Dirty), [12:11]MPP.
 static const int MSTATUS_SD    = 63;
@@ -90,6 +108,7 @@ static const uint32_t CP0_FUNC_CSRRWI  = 0x00211;
 static const uint32_t CP0_FUNC_CSRRSI  = 0x00221;
 static const uint32_t CP0_FUNC_CSRRCI  = 0x00241;
 static const uint32_t CP0_FUNC_SFENCE  = 0x00044;   // M4 Task 7 (rvproc_pkg.sv)
+static const uint32_t CP0_FUNC_DRET    = 0x00202;   // M7 Task 1 (rvproc_pkg.sv)
 
 //-----------------------------------------------------------------------------
 // DUT plumbing
@@ -126,6 +145,16 @@ static void tie_idle_inputs(void) {
     dut->msip = 0;
     dut->meip = 0;
     dut->mtime = 0;   // M6 Task 3: CLINT mtime mirror (driven per-test below)
+    // M7 Task 1: cp0<->DTU debug ports. All tied to "no debugger attached":
+    // not in debug mode, no exit-debug, DTU returns reset values, no ebreak
+    // action, no WFI wake. Individual debug tests drive these per-test.
+    dut->dtu_cp0_rdata          = 0;
+    dut->dtu_cp0_dcsr_prv       = 0;
+    dut->dtu_cp0_dcsr_mprven    = 0;
+    dut->dtu_cp0_wake_up        = 0;
+    dut->dtu_rtu_ebreak_action  = 0;
+    dut->rtu_yy_xx_dbgon        = 0;
+    dut->rtu_cp0_exit_debug     = 0;
 }
 
 static void tick(void) {
@@ -1431,6 +1460,147 @@ static void test_int_claim_tvec_vectored(void) {
 }
 
 //=============================================================================
+// M7 Task 1 -- core-side debug: CSR.v's cp0<->dtu port. The DTU module is
+// NOT instantiated in this bench (top-module CSR), so dtu_cp0_rdata is a
+// driven input and cp0_dtu_addr/wdata/wreg/rreg are observed outputs. These
+// rows test CSR.v's OWN documented contract: (a) the read mux routes
+// 0x7B0-0x7B3 to the DTU's rdata bus, (b) a 0x7B0-0x7B3 write strobes
+// cp0_dtu_wreg with the right addr/wdata, (c) ebreak becomes a debug HALT
+// (cp0_rtu_ebreak_halt, no vec-3) when (dbgon || ebreak_action), (d) dret
+// declares cp0_rtu_ex1_inst_dret when dbgon, (e) mret/sret/wfi/ecall are
+// gated OFF in debug mode.
+//=============================================================================
+
+// Probe a CSRRW write and capture the combinational cp0_dtu_* port the same
+// cycle (CSR.v asserts these off the live decode, before any tick).
+struct DebugWriteProbe {
+    bool     wreg = false;
+    uint32_t addr = 0;
+    uint64_t wdata = 0;
+};
+static DebugWriteProbe debug_write_probe(uint32_t csr_addr, uint64_t value) {
+    dut->idu_cp0_ex1_sel       = 1;
+    dut->idu_cp0_ex1_func      = CP0_FUNC_CSRRW;
+    dut->idu_cp0_ex1_illegal   = 0;
+    dut->idu_cp0_ex1_src1_data = csr_addr;
+    dut->idu_cp0_ex1_src0_data = value;
+    dut->idu_cp0_ex1_dst0_reg  = 0;
+    dut->eval();
+    DebugWriteProbe p;
+    p.wreg  = dut->cp0_dtu_wreg != 0;
+    p.addr  = dut->cp0_dtu_addr;
+    p.wdata = dut->cp0_dtu_wdata;
+    tick();
+    dut->idu_cp0_ex1_sel = 0;
+    return p;
+}
+
+static void test_debug_csr_read_routing(void) {
+    // Drive the DTU's rdata bus to a sentinel; all four debug CSRs must read
+    // it back through the CSR read mux.
+    const uint64_t S0 = 0x1111111111111111ULL;
+    const uint64_t S1 = 0x2222222222222222ULL;
+    dut->dtu_cp0_rdata = S0;
+    check(csr_read(CSR_DCSR) == S0, "dcsr read routed to dtu_cp0_rdata", csr_read(CSR_DCSR), S0);
+    dut->dtu_cp0_rdata = S1;
+    check(csr_read(CSR_DPC) == S1, "dpc read routed to dtu_cp0_rdata", csr_read(CSR_DPC), S1);
+    dut->dtu_cp0_rdata = S0;
+    check(csr_read(CSR_DSCRATCH0) == S0, "dscratch0 read routed to dtu_cp0_rdata", csr_read(CSR_DSCRATCH0), S0);
+    check(csr_read(CSR_DSCRATCH1) == S0, "dscratch1 read routed to dtu_cp0_rdata", csr_read(CSR_DSCRATCH1), S0);
+
+    // A non-debug CSR must NOT read the DTU bus (its own storage wins).
+    dut->dtu_cp0_rdata = 0xDEADBEEFDEADBEEFULL;
+    csr_write(CSR_MSCRATCH, 0x4242);
+    check(csr_read(CSR_MSCRATCH) == 0x4242, "mscratch read NOT hijacked by dtu_cp0_rdata",
+          csr_read(CSR_MSCRATCH), 0x4242);
+    dut->dtu_cp0_rdata = 0;   // teardown
+    test_result("T27 M7 debug CSR read routing: 0x7B0-0x7B3 -> dtu_cp0_rdata");
+}
+
+static void test_debug_csr_write_strobe(void) {
+    // A write to a debug CSR strobes cp0_dtu_wreg with the right addr/wdata.
+    DebugWriteProbe p = debug_write_probe(CSR_DCSR, 0xA5A5);
+    check(p.wreg, "dcsr write: cp0_dtu_wreg strobes", p.wreg);
+    check(p.addr == CSR_DCSR, "dcsr write: cp0_dtu_addr == 0x7B0", p.addr, CSR_DCSR);
+    check(p.wdata == 0xA5A5, "dcsr write: cp0_dtu_wdata == 0xA5A5", p.wdata, 0xA5A5);
+
+    p = debug_write_probe(CSR_DSCRATCH1, 0x1234);
+    check(p.wreg && p.addr == CSR_DSCRATCH1 && p.wdata == 0x1234,
+          "dscratch1 write: wreg/addr/wdata correct", p.addr, CSR_DSCRATCH1);
+
+    // A write to a NON-debug CSR must NOT strobe the DTU port.
+    p = debug_write_probe(CSR_MSCRATCH, 0x99);
+    check(!p.wreg, "mscratch write: cp0_dtu_wreg does NOT strobe", p.wreg);
+    test_result("T28 M7 debug CSR write strobe: 0x7B0-0x7B3 -> cp0_dtu_wreg/addr/wdata");
+}
+
+static void test_debug_ebreak_halt(void) {
+    // (1) dbgon=0, action=0 -> classic vec-3 breakpoint, no halt (pre-M7).
+    dut->rtu_yy_xx_dbgon = 0;
+    dut->dtu_rtu_ebreak_action = 0;
+    DispatchResult r1 = dispatch(CP0_FUNC_EBREAK, 0, 0, 0);
+    check(r1.expt_vld && r1.expt_vec == 3, "ebreak !dbgon !action: vec-3 exception", r1.expt_vec, 3);
+    check(dut->cp0_rtu_ebreak_halt == 0, "ebreak !dbgon !action: NO ebreak_halt");
+
+    // (2) dbgon=1 -> ebreak is a HALT, NOT a vec-3 exception.
+    dut->rtu_yy_xx_dbgon = 1;
+    DispatchResult r2 = dispatch(CP0_FUNC_EBREAK, 0, 0, 0);
+    check(dut->cp0_rtu_ebreak_halt == 1, "ebreak dbgon: cp0_rtu_ebreak_halt fires");
+    check(!r2.expt_vld, "ebreak dbgon: NO vec-3 exception (it is a halt)");
+    dut->rtu_yy_xx_dbgon = 0;
+
+    // (3) dbgon=0, action=1 (dcsr.ebreakX for current priv) -> also a HALT.
+    dut->dtu_rtu_ebreak_action = 1;
+    DispatchResult r3 = dispatch(CP0_FUNC_EBREAK, 0, 0, 0);
+    check(dut->cp0_rtu_ebreak_halt == 1, "ebreak action: cp0_rtu_ebreak_halt fires");
+    check(!r3.expt_vld, "ebreak action: NO vec-3 exception");
+    dut->dtu_rtu_ebreak_action = 0;   // teardown
+    test_result("T29 M7 ebreak->debug-halt conversion (dbgon || ebreak_action)");
+}
+
+static void test_debug_dret_and_xret_gating(void) {
+    // dret declares cp0_rtu_ex1_inst_dret ONLY in debug mode.
+    dut->rtu_yy_xx_dbgon = 1;
+    dispatch(CP0_FUNC_DRET, 0, 0, 0);
+    // cp0_rtu_ex1_inst_dret is combinational off is_dret; re-dispatch and read
+    // it on the eval cycle (dispatch already ticked, so re-probe).
+    dut->idu_cp0_ex1_sel = 1;
+    dut->idu_cp0_ex1_func = CP0_FUNC_DRET;
+    dut->idu_cp0_ex1_illegal = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_inst_dret == 1, "dret dbgon: cp0_rtu_ex1_inst_dret fires");
+    check(dut->cp0_rtu_ex1_expt_vld == 0, "dret dbgon: no exception");
+    dut->idu_cp0_ex1_sel = 0;
+    tick();
+
+    // dret OUTSIDE debug: is_dret is gated off (IDU would flag it illegal).
+    // With illegal=1 (as IDU sets it) -> vec-2; the dret flag must stay 0.
+    dut->rtu_yy_xx_dbgon = 0;
+    dut->idu_cp0_ex1_sel = 1;
+    dut->idu_cp0_ex1_func = CP0_FUNC_DRET;
+    dut->idu_cp0_ex1_illegal = 1;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_inst_dret == 0, "dret !dbgon: cp0_rtu_ex1_inst_dret gated OFF");
+    check(dut->cp0_rtu_ex1_expt_vld == 1 && dut->cp0_rtu_ex1_expt_vec == 2,
+          "dret !dbgon illegal: vec-2 (IDU-flagged illegal)", dut->cp0_rtu_ex1_expt_vec, 2);
+    dut->idu_cp0_ex1_sel = 0;
+    dut->idu_cp0_ex1_illegal = 0;
+    tick();
+
+    // mret in debug mode must be gated OFF (no chgflw, no pm pop).
+    dut->rtu_yy_xx_dbgon = 1;
+    dut->idu_cp0_ex1_sel = 1;
+    dut->idu_cp0_ex1_func = CP0_FUNC_MRET;
+    dut->idu_cp0_ex1_illegal = 0;
+    dut->eval();
+    check(dut->cp0_rtu_ex1_chgflw == 0, "mret dbgon: chgflw gated OFF (xret not declared in debug)");
+    dut->idu_cp0_ex1_sel = 0;
+    tick();
+    dut->rtu_yy_xx_dbgon = 0;   // teardown
+    test_result("T30 M7 dret declare + xret/ebreak gating in debug mode");
+}
+
+//=============================================================================
 // Mutation-check discipline note (plan task 2.2): the mutation itself is
 // applied by hand to rtl/CSR.v (NOT left as code here), the bench re-run to
 // confirm a FAIL, then the mutation reverted before committing -- the same
@@ -1493,6 +1663,12 @@ int main(int argc, char **argv) {
     // M6 Task 1: interrupt claim matrix + vectored tvec.
     test_int_claim_matrix();
     test_int_claim_tvec_vectored();
+
+    // M7 Task 1: core-side debug CSR routing + ebreak/dret/xret gating.
+    test_debug_csr_read_routing();
+    test_debug_csr_write_strobe();
+    test_debug_ebreak_halt();
+    test_debug_dret_and_xret_gating();
 
     printf("[csr_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

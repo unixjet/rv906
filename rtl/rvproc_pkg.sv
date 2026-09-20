@@ -320,6 +320,13 @@ parameter [11:0] CSR_TDATA1     = 12'h7A1;
 parameter [11:0] CSR_TDATA2     = 12'h7A2;
 parameter [11:0] CSR_TDATA3     = 12'h7A3;
 parameter [11:0] CSR_TCONTROL   = 12'h7A5;
+// M7 Task 1: core-side debug-mode CSRs (RISC-V debug spec 0.13; donor
+// aq_dtu_ctrl.v:314-317 / read mux :581-606). Storage lives in rtl/DTU.v;
+// CSR.v routes 0x7B0-0x7B3 accesses through the cp0<->dtu port.
+parameter [11:0] CSR_DCSR       = 12'h7B0;
+parameter [11:0] CSR_DPC        = 12'h7B1;
+parameter [11:0] CSR_DSCRATCH0  = 12'h7B2;
+parameter [11:0] CSR_DSCRATCH1  = 12'h7B3;
 
 // M5 Task 1: user-level floating-point CSRs (standard RISC-V unprivileged
 // ISA addresses; donor confirms the same numbers, aq_cp0_regs.v FFLAGS/FRM/
@@ -500,6 +507,12 @@ parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRC   = 20'h00041;  // cfig.h:471
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRWI  = 20'h00211;  // cfig.h:472
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRSI  = 20'h00221;  // cfig.h:473
 parameter [FUNC_WIDTH-1:0] CP0_FUNC_CSRRCI  = 20'h00241;  // cfig.h:474
+// M7 Task 1: CP0_FUNC_DRET, pinned now (the header note above documents
+// DRET as deliberately unpinned through M2-M6). Donor aq_idu_cfig.h:460
+// FUNC_DRET = 10'b100000_0010 zero-extended = 20'h00202; decode arm at
+// donor aq_idu_id_decd.v:2110-2114, legality rule (dret outside debug is
+// illegal) at :857.
+parameter [FUNC_WIDTH-1:0] CP0_FUNC_DRET    = 20'h00202;  // cfig.h:460 (M7)
 
 //-----------------------------------------------------------------------------
 // M2 Task 3.6a: idu_iu_ex1_func bit-per-opcode table for ALU/BJU/MULT/DIV --

@@ -291,7 +291,33 @@ module CSR #(
     input  wire                     meip,
     // M6 Task 3: live CLINT mtime mirror -- read-only `time` CSR (0xC01),
     // serves the M/S/U alias from one mirror (design doc Task 3).
-    input  wire [63:0]              mtime
+    input  wire [63:0]              mtime,
+
+    //=========================================================================
+    // M7 Task 1: cp0 <-> DTU debug-CSR port (donor aq_dtu_top.v:15-210 +
+    // aq_cp0_iui.v:858-860). CSR.v decodes 0x7B0-0x7B3 and routes them here;
+    // DTU.v owns the storage and the debug-mode (dbgon) write gating.
+    // rtu_yy_xx_dbgon is the debug-mode broadcast (donor rtu_yy_xx_dbgon);
+    // rtu_cp0_exit_debug pulses when the RTU leaves debug (donor
+    // aq_rtu_retire.v:1255), driving the pm FSM's debug-exit arm.
+    //=========================================================================
+    output wire [11:0]              cp0_dtu_addr,
+    output wire [63:0]              cp0_dtu_wdata,
+    output wire                     cp0_dtu_wreg,
+    output wire                     cp0_dtu_rreg,
+    input  wire [63:0]              dtu_cp0_rdata,
+    input  wire [1:0]               dtu_cp0_dcsr_prv,
+    input  wire                     dtu_cp0_dcsr_mprven,
+    input  wire                     dtu_cp0_wake_up,
+    input  wire                     dtu_rtu_ebreak_action,
+    input  wire                     rtu_yy_xx_dbgon,
+    input  wire                     rtu_cp0_exit_debug,
+    // ebreak-with-action halt declaration to the RTU (donor's halt_req_ebreak
+    // shape, aq_rtu_retire.v:613-617): with (dtu_rtu_ebreak_action || dbgon)
+    // an ebreak is a debug halt, NOT the vec-3 exception.
+    output wire                     cp0_rtu_ebreak_halt,
+    // dret retired this EX1 (donor cp0_rtu_ex1_inst_dret, aq_cp0_iui.v:816).
+    output wire                     cp0_rtu_ex1_inst_dret
 );
 
     //=========================================================================
@@ -330,14 +356,25 @@ module CSR #(
     wire ex1_ok      = ex1_active && !idu_cp0_ex1_illegal && !ex1_fetch_fault;   // legal, actionable this cycle
     wire ex1_illegal = ex1_active &&  idu_cp0_ex1_illegal;
 
-    wire is_ecall  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_ECALL);
     wire is_ebreak = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_EBREAK);
-    wire is_mret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_MRET);
+    // M7 Task 1: the xret/ecall/wfi special instructions are DECLARED
+    // !rtu_yy_xx_dbgon (donor aq_cp0_iui.v:523-531 -- in debug mode the
+    // core only runs DM-injected instructions and the debugger drives the
+    // exit via dret, so mret/sret/wfi/ecall must not assert their fire/
+    //chgflw/priv-illegal terms while dbgon). is_dret is the inverse: it
+    // declares ON rtu_yy_xx_dbgon (aq_cp0_iui.v:532-533). Off-path (dbgon=0)
+    // these gates are all 1, so the pre-M7 battery is bit-identical.
+    wire is_ecall  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_ECALL) && !rtu_yy_xx_dbgon;
+    wire is_mret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_MRET) && !rtu_yy_xx_dbgon;
     // M4: SRET / WFI / SFENCE.VMA (IDU decodes them as CP0 ops; privilege-
     // based legality -- TSR/TW/TVM/U-mode -- is checked below in CSR.v).
-    wire is_sret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_SRET);
-    wire is_wfi    = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_WFI);
+    wire is_sret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_SRET) && !rtu_yy_xx_dbgon;
+    wire is_wfi    = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_WFI)  && !rtu_yy_xx_dbgon;
     wire is_sfence = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_SFENCE);
+    // M7 Task 1: DRET (IDU decodes it as a CP0 op; donor aq_cp0_iui.v:532-
+    // 533 gates the dret declaration ON rtu_yy_xx_dbgon -- IDU.v already
+    // marks a non-debug dret illegal, so is_dret here is always debug-mode).
+    wire is_dret   = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_DRET) && rtu_yy_xx_dbgon;
     // FENCE/FENCE.I serialization sequence (Task 10.1, rv64ui-p-fence_i;
     // donor aq_cp0_fence_inst.v's FNC_FENC->FNC_CDCA->FNC_IICA ordering):
     // (1) hold in EX1 until the LSU is quiescent (`lsu_cp0_stb_empty` --
@@ -398,7 +435,11 @@ module CSR #(
     // drains the pipe by construction; the IF buffer backpressures fetch.
     // The TW=1 && pm<M illegal trap arm (wfi_priv_illegal below) is
     // untouched -- an illegal wfi traps, it does not hold.
-    wire wfi_wake = (mip_value & mie_reg) != 64'd0;
+    // M7 Task 1: the debug wake term (donor aq_dtu_ctrl.v:623-626's
+    // low_power_wakeup feeding aq_cp0_lpmd.v's wake): a DM halt request or
+    // an armed single-step wakes a wfi'd hart straight into the halt
+    // machinery (the RTU's timing-1 halt leg then takes over).
+    wire wfi_wake = (mip_value & mie_reg) != 64'd0 || dtu_cp0_wake_up;
     wire wfi_hold = is_wfi && !wfi_wake;
 
     wire is_csrrw  = ex1_ok && (idu_cp0_ex1_func == CP0_FUNC_CSRRW);
@@ -451,14 +492,15 @@ module CSR #(
     // software CSR write > hold) -- one flop per bit, no FSM (CP0 note B1).
     // xret_fire is gated by the privilege checks below (an illegal mret/sret
     // must NOT change pm); the illegal condition itself is raised as vec 2 in
-    // the exception section. pm_r/tsr_f/tw_f/tvm_f are forward references to
-    // the flops defined in the PRIVILEGE/MSTATUS sections below.
-    wire mret_priv_illegal  = is_mret && (pm_r != PRIV_M);
-    wire sret_priv_illegal  = is_sret && ((pm_r == PRIV_U)
-                                          || (pm_r == PRIV_S && tsr_f));
-    wire wfi_priv_illegal   = is_wfi  && (pm_r != PRIV_M) && tw_f;
-    wire sfence_priv_illegal= is_sfence && ((pm_r == PRIV_U)
-                                          || (pm_r == PRIV_S && tvm_f));
+    // the exception section. pm_eff (the dbgon-OR'd effective privilege,
+    // SECTION PRIVILEGE)/tsr_f/tw_f/tvm_f are forward references to the
+    // values defined in the PRIVILEGE/MSTATUS sections below.
+    wire mret_priv_illegal  = is_mret && (pm_eff != PRIV_M);
+    wire sret_priv_illegal  = is_sret && ((pm_eff == PRIV_U)
+                                          || (pm_eff == PRIV_S && tsr_f));
+    wire wfi_priv_illegal   = is_wfi  && (pm_eff != PRIV_M) && tw_f;
+    wire sfence_priv_illegal= is_sfence && ((pm_eff == PRIV_U)
+                                          || (pm_eff == PRIV_S && tvm_f));
     wire xret_illegal = mret_priv_illegal || sret_priv_illegal
                       || wfi_priv_illegal || sfence_priv_illegal;
     wire mret_fire = is_mret && !mret_priv_illegal;
@@ -564,18 +606,23 @@ module CSR #(
     wire trap_vld      = rtu_yy_xx_expt_vld;
     wire trap_int      = rtu_yy_xx_expt_int;
     wire [4:0] trap_vec = rtu_yy_xx_expt_vec;
-    wire trap_deleg    = trap_vld && (pm_r != PRIV_M) &&
+    wire trap_deleg    = trap_vld && (pm_eff != PRIV_M) &&
                          (trap_int ? mideleg_reg[{1'b0, trap_vec}]
                                    : (trap_vec <= 5'd15) && medeleg_reg[trap_vec[3:0]]);
 
     // pm register (donor :590-631). Priority mret > sret > trap (the data-mux
     // order below is the donor's; mret/sret are gated by rtu_idu_commit so a
     // same-cycle older trap always wins in practice, see the DECODE note).
+    // M7 Task 1: the donor's debug-exit arm restored (aq_cp0_trap_csr.v:
+    // 585-631) -- `pm_wen |= rtu_cp0_exit_debug`, and the exit arm has TOP
+    // priority: on leaving debug the architectural privilege becomes
+    // dcsr.prv (donor :605-606). MPP/SPP untouched (donor has no arm).
     reg [1:0] pm_r;
     reg [1:0] pm_wdata;
-    wire      pm_wen = trap_vld || mret_fire || sret_fire;
+    wire      pm_wen = trap_vld || mret_fire || sret_fire || rtu_cp0_exit_debug;
     always @* begin
-        if (mret_fire)                 pm_wdata = mpp_field;
+        if (rtu_cp0_exit_debug)        pm_wdata = dtu_cp0_dcsr_prv;
+        else if (mret_fire)            pm_wdata = mpp_field;
         else if (sret_fire)            pm_wdata = {1'b0, spp_field};
         else if (trap_vld && !trap_deleg) pm_wdata = PRIV_M;
         else                           pm_wdata = PRIV_S;   // trap && trap_deleg
@@ -584,7 +631,14 @@ module CSR #(
         if (!rst_n) pm_r <= PRIV_M;
         else if (pm_wen) pm_r <= pm_wdata;
     end
-    assign cp0_yy_priv_mode = pm_r;
+    // Effective privilege (donor aq_cp0_trap_csr.v:630): in debug mode all
+    // operations execute at M mode. Every privilege-QUESTIONING consumer
+    // below (priv-illegal checks, delegation, trap-vec select, the interrupt
+    // claim matrix, csr priv checks, ecall cause, PMP) reads pm_eff, NOT the
+    // raw flop -- mirroring the donor, whose own sites all read pm (the
+    // post-OR value). The flop itself is written only here.
+    wire [1:0] pm_eff = pm_r | {2{rtu_yy_xx_dbgon}};
+    assign cp0_yy_priv_mode = pm_eff;
 
     //=========================================================================
     // SECTION MSTATUS -- full arm set (M4 Task 1; donor aq_cp0_trap_csr.v
@@ -645,7 +699,7 @@ module CSR #(
         if (!rst_n)
             mpp_field <= PRIV_M;
         else if (trap_to_m)
-            mpp_field <= pm_r;
+            mpp_field <= pm_eff;
         else if (mret_fire)
             mpp_field <= PRIV_U;
         else if (mstatus_wr)
@@ -656,7 +710,7 @@ module CSR #(
         if (!rst_n)
             spp_f <= 1'b1;                 // donor reset SPP=1
         else if (trap_to_s)
-            spp_f <= pm_r[0];
+            spp_f <= pm_eff[0];
         else if (sret_fire)
             spp_f <= 1'b0;
         else if (mstatus_wr)
@@ -792,7 +846,8 @@ module CSR #(
     //                                            : {regs_tvec[39:2], 2'b0}
     // TIMING (why this is safe here): m_intr/m_vector/s_intr/s_vector are
     // the mcause/scause CAPTURE flops (SECTION MCAUSE), latched on the
-    // rtu_yy_xx_expt_vld cycle; pm_r flips the same edge. RTU reads
+    // rtu_yy_xx_expt_vld cycle; pm_r flips the same edge (pm_eff is its
+    // combinational post-OR alias). RTU reads
     // cp0_rtu_trap_pc through its REGISTERED retire_trap_chgflw_vld +
     // retire_chgflw_pc path (RTU.v:933-951) one+ cycles AFTER the trap
     // cycle, so the cause and the post-trap pm are both settled flops when
@@ -800,9 +855,9 @@ module CSR #(
     // captured for THIS trap" argument (extraction notes §3). The
     // cause-capture logic itself is untouched (mcause bit-63 arm already
     // exists).
-    wire [PC_WIDTH-1:0] regs_tvec   = (pm_r == PRIV_M) ? mtvec_pc : stvec_pc;
-    wire [4:0]          regs_vector = (pm_r == PRIV_M) ? m_vector : s_vector;
-    wire                regs_intr   = (pm_r == PRIV_M) ? m_intr   : s_intr;
+    wire [PC_WIDTH-1:0] regs_tvec   = (pm_eff == PRIV_M) ? mtvec_pc : stvec_pc;
+    wire [4:0]          regs_vector = (pm_eff == PRIV_M) ? m_vector : s_vector;
+    wire                regs_intr   = (pm_eff == PRIV_M) ? m_intr   : s_intr;
     wire [PC_WIDTH-1:0] vec_int_pc  = {regs_tvec[PC_WIDTH-1:2], 2'b00}
                                     + {{(PC_WIDTH-7){1'b0}}, regs_vector, 2'b00};
     wire [PC_WIDTH-1:0] regs_trap_pc =
@@ -1050,7 +1105,7 @@ module CSR #(
     //    that matters -- exactly the donor's equation.
     //  - deleg arm: `(pm==S && sie_bit || pm==U) && *_en && mideleg[s]` --
     //    U-mode is "global always on" (donor comment :1306-1309).
-    // pm_r/mie_f/sie_f are the live flops (SECTION PRIVILEGE / MSTATUS).
+    // pm_eff/mie_f/sie_f are the live flops (SECTION PRIVILEGE / MSTATUS).
     //=========================================================================
     wire meip_en = mie_reg[11] & mip_meip;
     wire mtip_en = mie_reg[7]  & mip_mtip;
@@ -1064,44 +1119,44 @@ module CSR #(
     wire mcip_en = 1'b0;   // donor :1233 mcip=1'b0 (ECC); mcie constant 0
 
     // M trio (donor :1302-1304).
-    wire meip_vld = (pm_r != PRIV_M || mie_f) && meip_en;
-    wire mtip_vld = (pm_r != PRIV_M || mie_f) && mtip_en;
-    wire msip_vld = (pm_r != PRIV_M || mie_f) && msip_en;
+    wire meip_vld = (pm_eff != PRIV_M || mie_f) && meip_en;
+    wire mtip_vld = (pm_eff != PRIV_M || mie_f) && mtip_en;
+    wire msip_vld = (pm_eff != PRIV_M || mie_f) && msip_en;
 
     // Delegable sources: nodeleg/deleg pair (donor :1281-1301 customs,
     // :1310-1330 S trio, verbatim shapes).
-    wire seip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire seip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && seip_en && !mideleg_reg[9];
-    wire stip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire stip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && stip_en && !mideleg_reg[5];
-    wire ssip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire ssip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && ssip_en && !mideleg_reg[1];
-    wire seip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire seip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && seip_en && mideleg_reg[9];
-    wire stip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire stip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && stip_en && mideleg_reg[5];
-    wire ssip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire ssip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && ssip_en && mideleg_reg[1];
     // Customs' pair terms kept structurally (donor :1281-1301); their *_en
     // is 0 so they can never assert, and mideleg_reg bits 16/17/18 are
     // hardwired 0 by the write mask anyway.
-    wire mhip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire mhip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && mhip_en && !mideleg_reg[18];
-    wire moip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire moip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && moip_en && !mideleg_reg[17];
-    wire mcip_nodeleg_vld = ((pm_r == PRIV_M && mie_f)
-                          || (pm_r == PRIV_S) || (pm_r == PRIV_U))
+    wire mcip_nodeleg_vld = ((pm_eff == PRIV_M && mie_f)
+                          || (pm_eff == PRIV_S) || (pm_eff == PRIV_U))
                          && mcip_en && !mideleg_reg[16];
-    wire mhip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire mhip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && mhip_en && mideleg_reg[18];
-    wire moip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire moip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && moip_en && mideleg_reg[17];
-    wire mcip_deleg_vld = ((pm_r == PRIV_S && sie_f) || (pm_r == PRIV_U))
+    wire mcip_deleg_vld = ((pm_eff == PRIV_S && sie_f) || (pm_eff == PRIV_U))
                         && mcip_en && mideleg_reg[16];
 
     // The select vector (donor :1332-1338, VERBATIM 15-term order). Bit ->
@@ -1283,7 +1338,14 @@ module CSR #(
     assign cp0_mmu_satp_wen  = satp_local_en && satp_mode_ok;
     assign cp0_mmu_mxr       = mxr_f;
     assign cp0_mmu_sum       = sum_f;
-    assign cp0_lsu_mprv      = mprv_f;
+    // M7 Task 1: MPRV in debug mode (donor aq_cp0_trap_csr.v:1422): while
+    // dbgon, the LSU's effective MPRV is dcsr.mprven AND'd with mstatus.mprv;
+    // the redirect privilege is mpp as usual (a debugger sets mprv+mpp, or
+    // dcsr.prv for the post-dret mode). cp0_yy_priv_mode is already pm_eff
+    // (M during debug), so the LSU's `mprv ? mpp : priv` mux needs no own
+    // debug term.
+    assign cp0_lsu_mprv      = rtu_yy_xx_dbgon ? (dtu_cp0_dcsr_mprven && mprv_f)
+                                               : mprv_f;
     assign cp0_lsu_mpp       = mpp_field;
 
     //=========================================================================
@@ -1302,6 +1364,24 @@ module CSR #(
     wire [63:0] tdata2_value   = 64'd0;
     wire [63:0] tdata3_value   = 64'd0;
     wire [63:0] tcontrol_value = 64'd0;
+
+    //=========================================================================
+    // SECTION DEBUG-MODE CSRs (M7 Task 1): dcsr/dpc/dscratch0/dscratch1
+    // (0x7B0-0x7B3) route through the cp0<->dtu port to rtl/DTU.v (donor
+    // aq_cp0_iui.v:858-860's cp0_dtu_* fan-out + aq_dtu_ctrl.v:581-606's
+    // read mux). The DTU does the debug-mode (dbgon) write gating itself
+    // (aq_dtu_ctrl.v:314-317); the [9:8]==11 privilege check is the existing
+    // csr_priv_bad below (M-only), unchanged. Reads return the DTU's value
+    // in ANY privilege mode that passes csr_priv_bad (the 0.13 "accessible
+    // in debug mode only" rule bites as "writes dropped, reads of
+    // reset-value 0/xdebugver outside debug", exactly the donor).
+    //=========================================================================
+    wire csr_dtu_addr = (csr_addr == CSR_DCSR) || (csr_addr == CSR_DPC)
+                     || (csr_addr == CSR_DSCRATCH0) || (csr_addr == CSR_DSCRATCH1);
+    assign cp0_dtu_addr  = csr_addr;
+    assign cp0_dtu_wdata = csr_wdata;
+    assign cp0_dtu_wreg  = csr_wen && csr_dtu_addr;
+    assign cp0_dtu_rreg  = is_csr_op && csr_dtu_addr;
 
     //=========================================================================
     // SECTION PMP (M4 Task 2). Decode pmpcfg0/pmpcfg2/pmpaddr0-7; the storage
@@ -1330,7 +1410,7 @@ module CSR #(
     wire [63:0] pmpcfg2_value = 64'd0;
 
     // current privilege mode for PMP's M-mode bypass
-    assign cp0_pmp_priv_mode = pm_r;
+    assign cp0_pmp_priv_mode = pm_eff;
 
 
     //=========================================================================
@@ -1580,6 +1660,13 @@ module CSR #(
             CSR_TDATA2:     csr_read_mux = tdata2_value;
             CSR_TDATA3:     csr_read_mux = tdata3_value;
             CSR_TCONTROL:   csr_read_mux = tcontrol_value;
+            // M7 Task 1: debug-mode CSRs read from the DTU (aq_dtu_ctrl.v
+            // :599-606 read mux). All four share the same dtu_cp0_rdata bus;
+            // the DTU's own addr-mux picks the register.
+            CSR_DCSR:       csr_read_mux = dtu_cp0_rdata;
+            CSR_DPC:        csr_read_mux = dtu_cp0_rdata;
+            CSR_DSCRATCH0:  csr_read_mux = dtu_cp0_rdata;
+            CSR_DSCRATCH1:  csr_read_mux = dtu_cp0_rdata;
             CSR_PMPCFG0:    csr_read_mux = pmp_cfg0_value;
             CSR_PMPCFG2:    csr_read_mux = pmpcfg2_value;
             CSR_MVENDORID:  csr_read_mux = mvendorid_value;
@@ -1693,11 +1780,11 @@ module CSR #(
     wire [1:0] csr_min_priv   = csr_addr[9:8];
     wire csr_priv_bad = is_csr_op &&
                         ((csr_min_priv == 2'b10)                              // reserved
-                      || (pm_r == PRIV_U && csr_min_priv != 2'b00)            // U: U-only
-                      || (pm_r == PRIV_S && csr_min_priv == 2'b11));          // S: not M
+                      || (pm_eff == PRIV_U && csr_min_priv != 2'b00)            // U: U-only
+                      || (pm_eff == PRIV_S && csr_min_priv == 2'b11));          // S: not M
     wire csr_ro_write = is_csr_op && (csr_addr[11:10] == 2'b11) && csr_wen_raw;
     wire satp_tvm_illegal = is_csr_op && (csr_addr == CSR_SATP)
-                          && (pm_r == PRIV_S) && tvm_f;
+                          && (pm_eff == PRIV_S) && tvm_f;
     // M5 Task 1: fflags/frm/fcsr access with mstatus.FS==Off is illegal
     // (donor aq_cp0_regs.v:1101-1104, `regs_imm_inv = regs_fs_off` grouped
     // identically for all three addresses).
@@ -1708,21 +1795,36 @@ module CSR #(
                             || csr_fp_illegal;
 
     // Per-privilege ecall cause (U=8, S=9, M=11).
-    wire [4:0] ecall_vec = (pm_r == PRIV_M) ? CAUSE_MACHINE_ECALL
-                         : (pm_r == PRIV_S) ? CAUSE_SUPERVISOR_ECALL
+    wire [4:0] ecall_vec = (pm_eff == PRIV_M) ? CAUSE_MACHINE_ECALL
+                         : (pm_eff == PRIV_S) ? CAUSE_SUPERVISOR_ECALL
                                             : CAUSE_USER_ECALL;
+
+    // M7 Task 1: EBREAK-TO-DEBUG-HALT conversion (donor aq_rtu_retire.v:
+    // 613-617 halt_req_ebreak vs :687-690 bkpt_req_ebreak): with
+    // (dtu_rtu_ebreak_action || rtu_yy_xx_dbgon) an ebreak is a timing-0
+    // debug HALT (cause 1), NOT the vec-3 sync exception. The RTU performs
+    // the halt off cp0_rtu_ebreak_halt; the vec-3 path below is withheld
+    // exactly then. Otherwise (action=0, not in debug) the pre-M7 exception
+    // path is unchanged (rv64mi-p-sbreak and the sweep stay green).
+    assign cp0_rtu_ebreak_halt = is_ebreak && (dtu_rtu_ebreak_action || rtu_yy_xx_dbgon);
+    wire ebreak_expt = is_ebreak && !(dtu_rtu_ebreak_action || rtu_yy_xx_dbgon);
 
     // M4 Task 6: ex1_fetch_fault (pgflt || accflt) OR'd in, and given
     // priority OVER everything else in the vec mux below (donor
     // aq_cp0_iui.v:645-666: pgflt(12) > accflt(1) > illegal(2) > ecall).
-    assign cp0_rtu_ex1_expt_vld = ex1_fetch_fault || ex1_illegal || is_ecall || is_ebreak
+    assign cp0_rtu_ex1_expt_vld = ex1_fetch_fault || ex1_illegal || is_ecall || ebreak_expt
                                 || csr_access_illegal || xret_illegal;
     assign cp0_rtu_ex1_expt_int = 1'b0;
     assign cp0_rtu_ex1_expt_vec = ex1_fetch_pgflt  ? CAUSE_FETCH_PAGE_FAULT :
                                   ex1_fetch_accflt ? CAUSE_FETCH_ACCESS :
                                   (ex1_illegal || csr_access_illegal || xret_illegal) ? CAUSE_ILLEGAL :
                                   is_ecall     ? ecall_vec :
-                                  is_ebreak    ? CAUSE_BREAKPOINT : 5'd0;
+                                  ebreak_expt  ? CAUSE_BREAKPOINT : 5'd0;
+
+    // M7 Task 1: dret retired this EX1 (donor aq_cp0_iui.v:532-533,816 --
+    // iui_inst_dret is already dbgon-gated there; IDU.v's decode legality
+    // rule gives the same net effect here).
+    assign cp0_rtu_ex1_inst_dret = is_dret;
 
     //=========================================================================
     // SECTION MHCR / MXSTATUS FAN-OUT -- replaces FetchSink's harness config

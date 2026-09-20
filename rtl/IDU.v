@@ -356,7 +356,12 @@ module IDU (
     input  wire                     rtu_idu_flush_wbt,
     input  wire                     rtu_idu_commit,
     input  wire                     rtu_idu_commit_for_bju,
-    input  wire                     rtu_idu_pipeline_empty
+    input  wire                     rtu_idu_pipeline_empty,
+    // M7 Task 1: debug-mode broadcast for the dret legality rule (donor
+    // aq_idu_id_decd.v:857 -- dret outside debug is illegal). Wired to
+    // rtu_yy_xx_dbgon at RVProc.v; tied 1 in the IDU unit bench (whose
+    // pre-existing rows never decode dret anyway -- OFF-path identity).
+    input  wire                     rtu_yy_xx_dbgon
 );
 
     //=========================================================================
@@ -842,6 +847,16 @@ module IDU (
                 d32_eu      = EU_CP0;
                 d32_func    = CP0_FUNC_MRET;
                 d32_illegal = (inst[19:15] != 5'd0) || (inst[11:7] != 5'd0);
+            end
+            // M7 Task 1: dret (donor aq_idu_id_decd.v:2110-2114; funct7=
+            // 0111101, funct3=000, SYSTEM -- the standard 0x7B200073
+            // encoding). Legality rule per donor decd.v:857: a dret OUTSIDE
+            // debug mode is illegal ({rs2,rd} must also be 0).
+            15'b011110100011100: begin  // dret
+                d32_eu      = EU_CP0;
+                d32_func    = CP0_FUNC_DRET;
+                d32_illegal = (inst[19:15] != 5'd0) || (inst[11:7] != 5'd0)
+                            || !rtu_yy_xx_dbgon;
             end
             // M4: sret / wfi share funct7=0001000, funct3=000, split by rs2
             // (rs2=2 sret, rs2=5 wfi). Privilege-based legality (TSR/TW/U-
