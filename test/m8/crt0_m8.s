@@ -259,7 +259,7 @@ __asychronous_int:
  .align  10
   vector_table:   #totally 256 entries
   .rept   128
-  .long   __fail
+  .quad   __fail   # 64-bit: dispatch uses 8-byte offsets (slli 3) + 64-bit ld
   .endr
 
   .global __dummy

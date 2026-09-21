@@ -463,6 +463,17 @@ rv906-side deltas (exactly these, all in the case `.s`):
    verbatim. M-mode writes the PTE directly (MMU bypass, `rtl/MMU.v:226`),
    then mret into S-mode where the MMU is live — the donor's exact pattern
    (donor analog: `PTW_MACH_PMP` in `aq_mmu_ptw.v`).
+7. **T4 port delta (not in the original pinned set): two more 1G pages.**
+   The donor image loads at 0x0, so its S-mode code, data, and tohost all
+   fell in VPN2=0 — one 1G page covered them. On rv906 the image loads at
+   0x80000000 and tohost at 0x7FFFF000, so the three S-mode accesses split
+   across three 1G pages: data 0x30000 (VPN2=0, item 2's pinned page),
+   tohost 0x7FFFF000 (VPN2=1), S-code TEST1 0x800002b8 (VPN2=2). The pinned
+   single page covered only the data; the S-code fetch and the tohost store
+   page-faulted (instruction PF cause 12 / store PF cause 15). Added
+   `MMU_PTW_1G 0x40000,0x40000,0xcf,0xf` (L1[1], tohost identity) and
+   `MMU_PTW_1G 0x80000,0x80000,0xcf,0xf` (L1[2], code identity). With all
+   three, rv906 PASSes (730 cyc) — matching the donor's PASS.
 
 ### 4.4 interrupt — restructured init (rv906 side)
 
@@ -554,8 +565,15 @@ vector_table/SETINT-11 — replace the init's source):
    symbol (harness polls by symbol, the tohost-gotcha memory: the ELF must
    export it, `test/entry.S:204-212` pattern).
 3. Keep the trap handler + 128-entry `vector_table`→`__fail` scaffold
-   (`crt0.s:160-230`) — works on rv906 (mtvec/cause-based dispatch, the
-   M2–M6 trap path is standard).
+   (`crt0.s:160-230`) — mtvec/cause-based dispatch, the M2–M6 trap path is
+   standard. **T4 glue delta (crt0, not the case):** the as-ported table used
+   4-byte `.long __fail` entries, but the dispatch computes an 8-byte offset
+   (`slli x14, x14, 0x3`) and reads it with a 64-bit `ld x14, 0(x15)` — so a
+   real trap read two adjacent 4-byte entries = a garbage address and `jr`'d
+   into it (infinite trap loop / hang, not a clean FAIL). Fixed the table to
+   `.quad __fail` (8-byte entries matching the 8-byte dispatch); the async
+   handler's 32-bit `lw` still gets the correct low word. Verified: csr
+   still PASS (345) after the change.
 4. Stack: `__kernel_stack` provided by the link script (below, not the
    donor's 0xee000).
 5. Drop nothing else — no mcor drop (R4), no mhcr/mhint drop.

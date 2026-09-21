@@ -59,6 +59,7 @@ for elf in "${elfs[@]}"; do
     # T3: csr has none (byte-identical body). T4/T5 fill these in.
     case "$name" in
         csr)        deltas="[]" ;;
+        MMU)        deltas='["satp PPN pinned 0x40->0x81000 (root table in MEM, clear of image)","1G leaf PPN pinned 0x0->0x80000 (VA[0,1G)->PA[0x80000000,1G): covers S-mode data 0x30000->PA 0x80030000)","+1G L1[1] 0x40000,0x40000 (tohost VA 0x7FFFF000 -> PA 0x7FFFF000): rv906 image at 0x80000000 puts tohost in a 1G page the donor case (image at 0x0) never needed","+1G L1[2] 0x80000,0x80000 (S-mode code TEST1 VA 0x800002b8 -> PA 0x800002b8): same design-doc gap"]' ;;
         *)          deltas="[]" ;;
     esac
 
