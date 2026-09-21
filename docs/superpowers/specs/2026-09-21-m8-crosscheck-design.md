@@ -502,7 +502,7 @@ vector_table/SETINT-11 — replace the init's source):
 2. **Interrupt source: real UART IRQ (PLIC source 7)**, replacing the
    INTPEND backdoor poke. Sequence (exactly the proven M6 pattern,
    `test/m6/plic_uart.S`): prio[7]@0x0C00001C = 4, enable bit7
-   @0x0C00002000, threshold @0x0C200000 = 0, then UART IER @0x10000004 = 2
+   @0x0C002000, threshold @0x0C200000 = 0, then UART IER @0x10000004 = 2
    (THRE → `G_io_pins_uart_irq`, `device/uart16550.cpp:101-104`,
    `rtl/RVProcAXI.v:680`), `wfi`, on the m-mode interrupt claim
    0x0C200004 (returns 7), **deassert IER = 0 before completing**
