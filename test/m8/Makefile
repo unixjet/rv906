@@ -44,7 +44,18 @@ LDFLAGS = -T $(M8_DIR)link_m8.ld -nostdlib
 # Everything else byte-identical to the donor line, incl.
 # -DITERATIONS=10000 (vestigial: core_main.c:178 hard-codes
 # results[0].iterations = 2).
-COREMARK_CFLAGS = -march=rv64imafdc_zicsr_zifencei -mabi=lp64d -O3 -static \
+# T4b delta (rv906-only, platform link base): -mcmodel=medany. The xpack
+# toolchain defaults to medlow, under which GCC emits ABSOLUTE lui-based
+# data references (R_RISCV_HI20, verified by probe: default -> lui,
+# -mcmodel=medany -> auipc). Absolute lui+addi is sign-extended 32-bit
+# and cannot encode the 0x80000000+ link base (link_m8.ld image at the
+# reset vector) -> "relocation truncated to fit: R_RISCV_HI20". medany is
+# the same code model test/m2/Makefile already uses for its 0x80000000 C
+# tests; it changes only the addressing mode (PC-relative auipc), not the
+# benchmark semantics. No donor counterpart needed: the donor image is at
+# 0x0 where either model encodes fine (verified: the donor-side build in
+# T6 linked clean at 0x0).
+COREMARK_CFLAGS = -march=rv64imafdc_zicsr_zifencei -mabi=lp64d -mcmodel=medany -O3 -static \
   -funroll-all-loops -finline-limit=500 -fgcse-sm -fno-schedule-insns \
   --param max-rtl-if-conversion-unpredictable-cost=100 -fno-code-hoisting \
   -DITERATIONS=10000 \
@@ -82,9 +93,17 @@ $(BUILD_DIR):
 $(BUILD_DIR)/crt0_m8.o: $(M8_DIR)crt0_m8.s $(M8_DIR)link_m8.ld | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# clib objects
-$(BUILD_DIR)/clib/%.o: $(CLIB_DIR)%.c | $(BUILD_DIR)/clib
-	$(CC) $(CFLAGS) -c $< -o $@
+# clib objects (ported donor clib; needed by the C cases only).
+# T4b: built with COREMARK_CFLAGS -- identical-both-sides: the donor flow
+# compiles the clib TUs (fputc/intc/uart/vtimer) with the same coremark
+# CFLAGS line (tests/lib/Makefile:50) as the case .c bodies, so the
+# four GCC>=14 acceptance tokens (T6 patch 5) cover them too. Plain
+# CFLAGS would reject uart.h's uint32_t and intc.c's int->pointer inits.
+# (Also T4b: the pattern prereq gained its missing slash -- CLIB_DIR has
+# no trailing one; surfaced now because coremark is the first case to
+# build clib objects.)
+$(BUILD_DIR)/clib/%.o: $(CLIB_DIR)/%.c | $(BUILD_DIR)/clib
+	$(CC) $(COREMARK_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/clib:
 	mkdir -p $@
@@ -108,13 +127,26 @@ $(foreach c,$(filter-out coremark,$(CASES)), \
 
 # coremark (T4): the .c bodies (byte-identical) + clib + crt0, compiled
 # with COREMARK_CFLAGS. Inert until cases/coremark/ is ported.
+# T4b: link line gains -lc -lgcc after the objects (donor flow's exact
+# link ends "-lc -lgcc <objs> -lm"; stdlib provides printf/puts/memset --
+# newlib stdout reaches the console through the linked fputc, i.e.
+# clib/printf.c's THR 0x10000000 writer). fputc.o stays excluded from
+# the link (duplicate fputc symbol with printf.c; printf.c's is the one
+# that targets the rv906 console).
+# T4b: crt0_m8.o is FIRST on the line. GCC compiles the C `main` into a
+# `.text.startup` input section, so with the case objects first the
+# image start (and the ISS reset vector 0x80000000 -- the harness NOTEs
+# "the ISS follows the reset vector", e_entry is ignored) would be main's
+# prologue, not __start: no boot pokes, sp/mtvec unset. crt0 first
+# restores the documented crt0-first image order (donor linker.lcf's
+# explicit `crt0.o (.text)`-first reference; link_m8.ld header).
 ifneq ($(COREMARK_CSRC),)
 $(BUILD_DIR)/coremark.elf: $(COREMARK_CSRC) $(COREMARK_HDRS) $(BUILD_DIR)/crt0_m8.o $(CLIB_OBJS) | $(BUILD_DIR)
 	@mkdir -p $(BUILD_DIR)/coremark
 	@for f in $(COREMARK_CSRC); do \
 	  $(CC) $(COREMARK_CFLAGS) -I$(M8_DIR)clib -c $$f -o $(BUILD_DIR)/coremark/$$(basename $$(basename $$f .c)).o || exit 1; \
 	done
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/coremark/*.o $(filter-out $(BUILD_DIR)/clib/fputc.o,$(CLIB_OBJS)) $(BUILD_DIR)/crt0_m8.o -lm
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/crt0_m8.o $(BUILD_DIR)/coremark/*.o $(filter-out $(BUILD_DIR)/clib/fputc.o,$(CLIB_OBJS)) -lc -lgcc -lm
 endif
 
 dump: $(ELFS)

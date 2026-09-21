@@ -32,10 +32,22 @@ if [ ${#elfs[@]} -eq 0 ]; then
     exit 2
 fi
 
-pass=0; fail=0; faillist=""
+# coremark runs LAST, with its own 6 h wall cap (design section 4.5):
+# it is the only case with a C-level workload (donor reference: 3 h 44 m
+# at iterations=1 on iverilog). If the cap trips, the run is reported as
+# TIMEOUT with the partial state (cycles + console excerpt captured so far
+# in the record) rather than failing the whole run.
+run_order=()
+cm_elf=""
 for elf in "${elfs[@]}"; do
+    if [ "$(basename "$elf" .elf)" = "coremark" ]; then cm_elf="$elf"; else run_order+=("$elf"); fi
+done
+[ -n "$cm_elf" ] && run_order+=("$cm_elf")
+
+pass=0; fail=0; faillist=""
+for elf in "${run_order[@]}"; do
     name=$(basename "$elf" .elf)
-    if [ "$name" = "coremark" ]; then tmo=7200; else tmo=300; fi
+    if [ "$name" = "coremark" ]; then tmo=21600; else tmo=300; fi
     log="$RECORDS/$name.rv906.log"
 
     timeout "$tmo" bin/verisim/testbench --print-result "$elf" > "$log" 2>&1
@@ -61,6 +73,7 @@ for elf in "${elfs[@]}"; do
         csr)        deltas="[]" ;;
         MMU)        deltas='["satp PPN pinned 0x40->0x81000 (root table in MEM, clear of image)","1G leaf PPN pinned 0x0->0x80000 (VA[0,1G)->PA[0x80000000,1G): covers S-mode data 0x30000->PA 0x80030000)","+1G L1[1] 0x40000,0x40000 (tohost VA 0x7FFFF000 -> PA 0x7FFFF000): rv906 image at 0x80000000 puts tohost in a 1G page the donor case (image at 0x0) never needed","+1G L1[2] 0x80000,0x80000 (S-mode code TEST1 VA 0x800002b8 -> PA 0x800002b8): same design-doc gap"]' ;;
         interrupt)  deltas='["PLICBASE_M 0x4000000000 -> 0x0C000000 (rv906 PLIC base, rtl/RVProcAXI.v:156; offsets map 1:1, rtl/PLIC.v:9-17)","source: donor INTPEND 0x1000 backdoor (writable one-shot pending, sw 0x2) -> real UART IRQ, PLIC source 7 (IER@0x10000004=2, device/uart16550.cpp:101-104 -> G_io_pins_uart_irq, rtl/RVProcAXI.v:680); rv906 pending reg is RO","reordered init (M6 pattern): UART IER assert is the LAST poke, after set_mthreshold_off -- a level source poked before threshold-off would raise meip while the store is in flight and take the trap at the store retire boundary (mepc=wfi) -> wfi would block after mret","prio[7]=4 @0x0C00001C (donor 0xa out of range: rv906 prio is 3-bit), enable bit7 @0x0C002000, DROPPED donor INTIE_HART 0x80 second-level poke (rv906 single-context: 0x2000 is the context-0 enable)","handler: IER deassert (li x13,0x10000004; li x12,0; sb x12,0(x13)) between claim and complete, replacing 3 of the 4 nops -- mandatory on rv906: THRE level stays high while IER set, so without it the interrupt re-fires after mret and the case loops in claim forever","handler stack frame: mstatus slot 0x16(x2)->0x10(x2) in stack_push/stack_pop (donor 0x16=22 is an unaligned sd on rv906, which traps misaligned at issue, LSU.v contract 3 / design 4.2 item 5; donor C906 tolerated it via mxstatus.mm; same 24-byte frame, donor -24/+16 push/pop asymmetry kept)"]' ;;
+        coremark)   deltas='["case body trim (identical-both-sides, the one approved .c-source deviation; T6 patch 6): core_main.c:178 results[0].iterations= 2 -> 1 -- the donor 2-iteration run tripped its ~2 h wall guard with no $finish, so the final donor PASS verdict (435,894.5 cycles) was produced at iterations=1 and both sides run that setting (note 2026-09-21-m8-t6-donor-runs.md section 6); ported core_main.c md5 bb0aae42c4104f5e9da1cbf723fba40c == donor current (trimmed) md5, other 8 files byte-identical","exit glue (rv906 only, ledger L13 class): clib/vtimer.c sim_end() donor magic write 0xffff0000 -> 0x6000FFF8 (donor tb $finish on that write, tb.v:259-282) replaced by a call to __exit() (crt0_m8.s:171-180 -> tohost=1 PASS); both sides end at the same program point (sim_end is the last call of the VCUNT_SIM block)","console (rv906 only, ledger L12 class): the linked fputc is clib/printf.c (the Makefile excludes clib/fputc.o -- duplicate fputc symbol, the donor flow carries the same latent duplicate), which writes THR 0x10000000 (device/uart16550.cpp:66-71 -> ttysrv::out -> verisim stdout); the donor fputc targets 0x6000fff8 (unmapped, axi_err, invisible), so the VCUNT_SIM lines are visible on rv906 and absent on donor"]' ;;
         *)          deltas="[]" ;;
     esac
 
