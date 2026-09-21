@@ -190,6 +190,10 @@ module RTU (
     input  wire                     iu_rtu_ex1_branch_inst,
     input  wire [PC_WIDTH-1:0]      iu_rtu_ex1_cur_pc,
     input  wire [PC_WIDTH-1:0]      iu_rtu_ex1_next_pc,
+    // M7 Task 2: the EX1-resident (non-LSU) instruction's execute-trigger
+    // halt_info, piped from the IDU through the IU (donor aq_rtu_dp.v's
+    // dp_ex1_halt_info non-LSU leg). 0 for a trigger-free instruction.
+    input  wire [TDT_HINFO_WIDTH-1:0] iu_rtu_ex1_halt_info,
     input  wire                     iu_rtu_ex2_bju_ras_mispred,
     input  wire                     iu_rtu_depd_lsu_chgflow_vld,
     input  wire [PC_WIDTH-1:0]      iu_rtu_depd_lsu_chgflow_next_pc,
@@ -254,6 +258,11 @@ module RTU (
     // that boundary. Donor never needs this (its EX1 blocks until dp).
     input  wire [PC_WIDTH-1:0]      lsu_rtu_ex1_cur_pc,
     input  wire [PC_WIDTH-1:0]      lsu_rtu_ex1_next_pc,
+    // M7 Task 2: the replying LSU op's ldst-trigger halt_info (the LSU's
+    // own dc-stage latch, valid on every cmplt_dp leg -- donor's
+    // dp_ex1_halt_info LSU leg). 0 when the LSU op had no trigger match
+    // at its AG issue (or the replying op is a drain/prefetch).
+    input  wire [TDT_HINFO_WIDTH-1:0] lsu_rtu_ex1_halt_info,
     input  wire [63:0]              lsu_rtu_wb_data,
     input  wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     input  wire                     lsu_rtu_wb_vld,
@@ -315,6 +324,11 @@ module RTU (
     input  wire                     dtu_rtu_int_mask,
     input  wire                     dtu_rtu_ebreak_action,
     input  wire [63:0]              dtu_rtu_dpc,
+    // M7 Task 2: the DTU's pending-halt level (its pending_halt_r, set by a
+    // timing-1 action-1 trigger match or the iie icount trigger, donor
+    // aq_dtu_m_iie_all.v:993-1001). Honored at the next retire boundary as
+    // a timing-1 halt (cause 2); rtu_dtu_pending_ack below releases it.
+    input  wire                     dtu_rtu_pending_halt,
     // ebreak-with-action halt declaration from CSR (CSR withholds its vec-3
     // sync exception and asks the RTU for a timing-0 halt instead; donor
     // halt_req_ebreak aq_rtu_retire.v:613-617).
@@ -330,6 +344,11 @@ module RTU (
     output wire [3:0]               rtu_dtu_halt_cause,   // Task-1 direct cause
     output wire                     rtu_dtu_retire_vld,   // per-inst retire
     output wire                     rtu_dtu_retire_debug_expt_vld,
+    // M7 Task 2: the retiring instruction's halt_info fed back to the DTU
+    // (donor rtu_dtu_retire_halt_info, aq_rtu_retire.v:1188) and the ack
+    // that clears the DTU's pending_halt_r (donor rtu_dtu_pending_ack).
+    output wire [TDT_HINFO_WIDTH-1:0] rtu_dtu_retire_halt_info,
+    output wire                     rtu_dtu_pending_ack,
 
     //=========================================================================
     // M6 Task 2: CSR's registered interrupt-claim export (clone donor
@@ -757,6 +776,15 @@ module RTU (
                            || ex1_vec_cmplt_dp;
     wire ex1_lsu_solo_dp   = ex1_lsu_cmplt_dp && !ex1_nonslsu_cmplt;
 
+    // M7 Task 2: the dp'ing instruction's execute/ldst-trigger halt_info
+    // (donor dp_ex1_halt_info, aq_rtu_dp.v). Solo-LSU dp: the LSU's own
+    // latched bundle (its AG-issue match, or a timing-1 match carried from
+    // its AG to the reply); any non-LSU dp: the EX1-resident instruction's
+    // bundle via the IU (the same completer-selection as ex1_cur_pc above).
+    wire [TDT_HINFO_WIDTH-1:0] ex1_halt_info =
+            ex1_lsu_solo_dp ? lsu_rtu_ex1_halt_info
+                             : iu_rtu_ex1_halt_info;
+
     wire ex1_inst_chgflw = ex1_cp0_cmplt_dp && cp0_rtu_ex1_chgflw;   // mret (M2's only chgflw source)
     // chgflw_pc wins when set (CP0, EX1-resident -- never co-occurs with a
     // solo-LSU dp); else the LSU's own next-pc on a solo-LSU dp; else the
@@ -816,6 +844,12 @@ module RTU (
     // CSR's sticky-OR consumers need no further qualification.)
     reg        ex2_fpu_retire;
     reg [4:0]  ex2_fpu_fflags;
+    // M7 Task 2: the retiring instruction's trigger halt_info, riding the
+    // same dp-gated EX1->EX2 stage as the rest of the retire packet (donor
+    // dp_ex2_halt_info, aq_rtu_dp.v:433-454's own gate). Drives the
+    // priority-chain breakpoint legs (1/4), the trigger-halt requests, and
+    // the wb0 cancel below; fed back to the DTU as rtu_dtu_retire_halt_info.
+    reg [TDT_HINFO_WIDTH-1:0] ex2_halt_info;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -829,6 +863,7 @@ module RTU (
             ex2_inst_dret   <= 1'b0;
             ex2_fpu_retire  <= 1'b0;
             ex2_fpu_fflags  <= 5'd0;
+            ex2_halt_info   <= {TDT_HINFO_WIDTH{1'b0}};
         end else begin
             // Unconditional 1-delay of the dp pulse -- the donor's own
             // ctrl_ex2_cmplt (aq_rtu_ctrl.v:174-182).
@@ -856,6 +891,7 @@ module RTU (
                 // inst_dret`) -- CP0-only producer.
                 ex2_inst_dret   <= ex1_cp0_cmplt_dp && cp0_rtu_ex1_inst_dret;
                 ex2_fpu_fflags  <= fpu_rtu_ex1_falu_fflags;
+                ex2_halt_info   <= ex1_halt_info;
             end
             ex2_fpu_retire  <= ex1_fpu_cmplt_dp;
         end
@@ -916,10 +952,31 @@ module RTU (
     // at M6 Task 2; legs 1/4 remain structurally never-fire. M2 has no
     // debug unit, so legs 1/4 are permanently tied off.
     //=========================================================================
-    wire retire_pending_bkpt_expt = 1'b0;                      // leg 1: no DTU
+    // M7 Task 2: leg 1 (donor bkpt_req_pending, aq_rtu_retire.v:692-693):
+    // a pending action-0 trigger breakpoint. rv906's basic pending design
+    // has no per-instruction PENDING_HALT record (the DTU's pending path
+    // is the dtu_rtu_pending_halt LEVEL, honored as a timing-1 halt in the
+    // halt section below), so the donor's `PENDING_HALT && !ACTION` bit
+    // form is structurally never set here -- leg 1 stays 0.
+    wire retire_pending_bkpt_expt = 1'b0;
     // M6 Task 2: retire_int_inst above                                      // leg 2: interrupt
     wire retire_async_expt        = lsu_rtu_async_expt_vld;    // leg 3: real, LSU-sourced
-    wire retire_bkpt_expt         = 1'b0;                      // leg 4: no DTU
+    // M7 Task 2: leg 4 goes LIVE (donor bkpt_req_trigger_t0, aq_rtu_retire.
+    // v:696-700, plus the donor's separate retire_bkpt_expt_t1): MATCH &&
+    // !CHAIN && !ACTION (action-0 = breakpoint), TIMING deliberately NOT
+    // qualified --
+    //   timing-0: the side effects were already removed (execute: the wb0
+    //     cancel below; ldst: the LSU's own trap-at-issue AG exception,
+    //     which this leg's vec-3/cur-pc result matches anyway),
+    //   timing-1: the side effects happen, THEN the trap at this retire --
+    //     exactly the spec's timing-1 (after-completion) semantics.
+    // epc falls out of retire_sync_expt below (donor :447,:455): leg 4
+    // counts as a sync expt, so epc = ex2_cur_pc = the trigger's PC.
+    wire retire_bkpt_expt         = ex2_retire_vld
+                                   && ex2_halt_info[TDT_HINFO_MATCH]
+                                   && !ex2_halt_info[TDT_HINFO_CHAIN]
+                                   && !ex2_halt_info[TDT_HINFO_ACTION]
+                                   && !ex2_halt_info[TDT_HINFO_PENDING_HALT];
 
     reg [4:0] retire_trap_vec;
     always @* begin
@@ -946,10 +1003,13 @@ module RTU (
                         || (retire_trap_vec == 5'd13)
                         || (retire_trap_vec == 5'd15);
 
-    // Sync/overall exception classification (aq_rtu_retire.v:434-464,
-    // simplified: retire_pending_bkpt_expt/retire_bkpt_expt are both 0).
-    wire retire_sync_expt = ex2_inst_expt;
-    wire retire_expt_inst = retire_sync_expt || retire_async_expt;
+    // Sync/overall exception classification (aq_rtu_retire.v:447,455,458,
+    // M7 Task 2: the trigger-breakpoint legs now count as SYNC exceptions
+    // -- that is what puts a trigger's epc at ex2_cur_pc instead of
+    // ex2_next_pc, exactly the donor's own mechanism).
+    wire retire_inst_expt   = ex2_inst_expt || retire_bkpt_expt;
+    wire retire_sync_expt   = retire_inst_expt || retire_pending_bkpt_expt;
+    wire retire_expt_inst   = retire_sync_expt || retire_async_expt;
 
     // mtval allowlist (RTU note S4, aq_rtu_retire.v:514-522): {1,2,4,5,6,7,
     // 12,13,15} -- carried forward UNCHANGED, do not "fix". Checked against
@@ -1003,10 +1063,24 @@ module RTU (
     reg dbg_mode_on_after_req;
     reg dbg_mode_on;
 
-    // t0 halt requests (aq_rtu_retire.v:610,613-617,630-634).
+    // t0 halt requests (aq_rtu_retire.v:610,613-617,618-624,630-634).
     wire halt_req_reset  = ifu_rtu_reset_halt_req;
     wire halt_req_ebreak = cp0_rtu_ebreak_halt;
-    wire halt_req_t0     = halt_req_reset || halt_req_ebreak;
+    // M7 Task 2: timing-0 trigger halt (donor halt_req_trigger_t0,
+    // aq_rtu_retire.v:618-624): MATCH && !CHAIN && !TIMING && ACTION
+    // (action-1 = enter debug) && !PENDING_HALT && !dbg_mode_on_after_req.
+    // The triggered instruction's own side effects were already removed at
+    // the producer (wb0 cancel below / the LSU's trap-at-issue), so the
+    // halt takes effect with a clean architectural state; dpc = ex2_cur_pc
+    // (the rtu_dtu_dpc assign below).
+    wire halt_req_trigger_t0 = ex2_retire_vld
+                              && ex2_halt_info[TDT_HINFO_MATCH]
+                              && !ex2_halt_info[TDT_HINFO_CHAIN]
+                              && !ex2_halt_info[TDT_HINFO_TIMING]
+                              && ex2_halt_info[TDT_HINFO_ACTION]
+                              && !ex2_halt_info[TDT_HINFO_PENDING_HALT]
+                              && !dbg_mode_on_after_req;
+    wire halt_req_t0     = halt_req_reset || halt_req_ebreak || halt_req_trigger_t0;
 
     // t1 halt requests (aq_rtu_retire.v:642-682): cannot ack while a t0
     // request is live (donor's halt_req_t1_retire_vld && !halt_req) or while
@@ -1018,18 +1092,41 @@ module RTU (
                                 && !halt_req_t0;
     wire halt_req_dm_sync       = halt_req_t1_retire_vld && dtu_rtu_sync_halt_req;
     wire halt_req_step          = halt_req_t1_retire_vld && dtu_rtu_step_en;
-    wire halt_req_t1            = halt_req_dm_sync || halt_req_step;
+    // M7 Task 2: timing-1 trigger halt (donor halt_req_trigger_t1,
+    // aq_rtu_retire.v:692-699): MATCH && !CHAIN && TIMING && ACTION &&
+    // !PENDING_HALT -- the instruction completes (its side effects happen),
+    // THEN the halt takes effect at this retire boundary. rv906 has no
+    // split instructions, so the donor's split-trigger buffer legs are
+    // absent (same documented reduction as the header's Task-1 note).
+    wire halt_req_trigger_t1 = halt_req_t1_retire_vld
+                              && ex2_halt_info[TDT_HINFO_MATCH]
+                              && !ex2_halt_info[TDT_HINFO_CHAIN]
+                              && ex2_halt_info[TDT_HINFO_TIMING]
+                              && ex2_halt_info[TDT_HINFO_ACTION]
+                              && !ex2_halt_info[TDT_HINFO_PENDING_HALT];
+    // M7 Task 2: the DTU's pending-halt LEVEL (basic pending path, donor's
+    // halt_req_pending shape aq_rtu_retire.v:625-628 with the dtu_rtu_
+    // pending_halt level standing in for the donor's per-instruction
+    // PENDING_HALT record -- rv906's DTU pending_halt_r, set by a timing-1
+    // action-1 match or the iie icount trigger). Honored at the next t1
+    // retire boundary; the ack below releases the level.
+    wire halt_req_pending   = halt_req_t1_retire_vld && dtu_rtu_pending_halt;
+    wire halt_req_t1        = halt_req_dm_sync || halt_req_step
+                            || halt_req_trigger_t1 || halt_req_pending;
 
     // Any halt request taking effect THIS retire boundary.
     wire halt_req = halt_req_t0 || halt_req_t1;
 
-    // Cause select (aq_rtu_retire.v:768-795, Task-1 subset): the donor's
-    // priority is async(8) > pending(halt_info) > trigger(2) > ebreak(1) >
-    // reset(5) > dm_sync(3) > step(4); async is tied off (D-M7-7),
-    // pending/trigger arrive with Task 2.
+    // Cause select (aq_rtu_retire.v:768-795): the donor's priority is
+    // async(8) > pending(halt_info) > trigger(2) > ebreak(1) > reset(5) >
+    // dm_sync(3) > step(4); async is tied off (D-M7-7), M7 Task 2 adds the
+    // trigger legs (cause 2 = dcsr.cause TRIGGER) ahead of ebreak, and the
+    // basic pending-level halt reports the same trigger cause.
     reg [3:0] halt_cause;
     always @* begin
-        if (halt_req_ebreak)
+        if (halt_req_trigger_t0 || halt_req_trigger_t1 || halt_req_pending)
+            halt_cause = 4'd2;
+        else if (halt_req_ebreak)
             halt_cause = 4'd1;
         else if (halt_req_reset)
             halt_cause = 4'd5;
@@ -1064,9 +1161,12 @@ module RTU (
             dbg_mode_on <= 1'b0;
     end
 
-    // retire_expt_debug (aq_rtu_retire.v:461-464): an exception while in
-    // debug mode (excludes the never-fire bkpt legs in Task 1).
-    wire retire_expt_debug = ex2_inst_expt || retire_async_expt;
+    // retire_expt_debug (aq_rtu_retire.v:461-464, M7 Task 2: the donor's
+    // exact form -- a trigger-breakpoint (leg 4) is NOT a "debug-mode
+    // exception" for cmderr purposes, it is the trigger's own action).
+    wire retire_expt_debug = retire_pending_bkpt_expt
+                           || retire_async_expt
+                           || ex2_inst_expt && !retire_bkpt_expt;
 
     // Trap-taken ack (aq_rtu_retire.v:585-589, M7 Task 1: the donor's
     // `&& !halt_req && !dbg_mode_on` qualifiers now REAL -- a pending halt
@@ -1209,13 +1309,24 @@ module RTU (
     reg        wb0_vld_r;
     reg [GPR_IDX_WIDTH-1:0] wb0_preg_r;
     reg [63:0] wb0_data_r;
+    // M7 Task 2: a timing-0 trigger (action 0 OR 1) means the triggered
+    // instruction must not commit its side effects -- the donor cancels it
+    // via halt_info[CANCEL] (aq_dtu_mcontrol_output_select.v:2977-2984's
+    // exe0_cancel, asserted on every non-chain execute match). The DTU's
+    // ifu bundle sets CANCEL=1 on any execute match, so the wb0 latch here
+    // is the rv906 consumption point: the triggered instruction's GPR
+    // write is dropped (a JAL's link write too), while the trap (leg 4) or
+    // halt (halt_req_trigger_t0) still fires at retire. Timing-1 triggers
+    // leave CANCEL clear (the donor's ldst_cancel is !timing && match) --
+    // the side effects happen, then the action.
+    wire ex1_wb_cancel = ex1_halt_info[TDT_HINFO_CANCEL];
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wb0_vld_r  <= 1'b0;
             wb0_preg_r <= {GPR_IDX_WIDTH{1'b0}};
             wb0_data_r <= 64'd0;
         end else begin
-            wb0_vld_r  <= rbus_wb_vld;
+            wb0_vld_r  <= rbus_wb_vld && !ex1_wb_cancel;
             wb0_preg_r <= rbus_wb_preg;
             wb0_data_r <= rbus_wb_data;
         end
@@ -1305,6 +1416,18 @@ module RTU (
     // retire_vld (donor :1227-1228, minus the split qualifier rv906 never
     // sets): one pulse per retiring instruction.
     assign rtu_dtu_retire_vld = ex2_retire_vld;
+    // M7 Task 2: the retiring instruction's halt_info fed back to the DTU
+    // (donor rtu_dtu_retire_halt_info, aq_rtu_retire.v:1188). rv906's basic
+    // pending design has no per-instruction PENDING_HALT record, so the
+    // donor's "rewrite the PENDING_HALT bit with the t1 halt request" trick
+    // is unnecessary -- the raw ex2 bundle goes back (the DTU's own
+    // gen_pending_halt uses it to latch a timing-1 action-1 match into its
+    // pending_halt_r).
+    assign rtu_dtu_retire_halt_info = ex2_halt_info;
+    // M7 Task 2: the ack that clears the DTU's pending_halt_r -- the pulse
+    // on the retire boundary where the pending halt is actually taken
+    // (donor `pending_halt && rtu_pending_ack` clear term).
+    assign rtu_dtu_pending_ack = halt_req_pending;
     // Debug-mode exception pulse (donor :1229-1231): an exception while
     // dbgon -- no architectural trap taken (retire_trap_vld is gated by
     // !dbg_mode_on above); the DM turns this into abstract-cmd cmderr=3.

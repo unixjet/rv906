@@ -146,6 +146,13 @@ module IDU (
     // dispatch exactly like an illegal decode does.
     input  wire                     ifu_idu_id_fault_pgflt,
     input  wire                     ifu_idu_id_fault_accflt,
+    // M7 Task 2: the DTU's execute-trigger halt_info for the delivered
+    // instruction (IFU.v's ifu_idu_id_halt_info -- the DTU's live verdict
+    // on the ibuf-head instruction, same sideband-at-head pattern as
+    // ifu_idu_id_bht_pred). Latched into ex1_halt_info_r
+    // like the other EX1 context bits and piped to the RTU via the IU
+    // (see idu_iu_ex1_halt_info below). 0 for a trigger-free fetch.
+    input  wire [TDT_HINFO_WIDTH-1:0] ifu_idu_id_halt_info,
     output wire                     idu_ifu_id_stall,
 
     //=========================================================================
@@ -177,6 +184,13 @@ module IDU (
     // source) and aq_idu_id_dp.v's ex1_t. Closes the IU.v header's
     // documented "fixed +4" scope gap (see that file's Task 7.3 note).
     output wire                     idu_iu_ex1_inst_len,
+    // M7 Task 2: the EX1-resident instruction's execute-trigger halt_info,
+    // piped to the RTU through the IU (the IDU has no direct RTU port).
+    // The IU passes it through combinationally (like the ALU's own
+    // dispatch-operand style); it is stable for multi-cycle IU residency
+    // because ctrl_ex1_eu_full (above) holds the EX1 reload, so the
+    // IDU's ex1_halt_info_r keeps the RESIDENT op's value every dp cycle.
+    output wire [TDT_HINFO_WIDTH-1:0] idu_iu_ex1_halt_info,
 
     //=========================================================================
     // IDU -> LSU : EX1 dispatch, LSU's slice of id_ex1_t (matches LSU.v's
@@ -2014,6 +2028,11 @@ module IDU (
     // same cycle the EX1 data registers load. Feeds idu_iu_ex1_inst_len /
     // idu_lsu_ex1_inst_len / idu_cp0_ex1_inst_len below.
     reg                     ex1_inst_len_r;
+    // M7 Task 2: the EX1-resident instruction's execute-trigger halt_info
+    // (the 22-bit TDT_HINFO bundle the IFU delivers live at the ibuf head;
+    // donor aq_idu_id_dp.v's ex1_halt_info). Latched/reloaded with the
+    // rest of the EX1 context; feeds idu_iu_ex1_halt_info below.
+    reg [TDT_HINFO_WIDTH-1:0] ex1_halt_info_r;
 
     // EX1 issue-gate stall terms (ctrl.v:669-692, M2-simplified per header:
     // M2-simplified per header: no lsu_idu_global_full port exists; the CP0
@@ -2105,6 +2124,7 @@ module IDU (
             ex1_fetch_accflt_r <= 1'b0;
             ex1_inst_len_r  <= 1'b0;
             ex1_rm_r        <= 3'b000;
+            ex1_halt_info_r <= {TDT_HINFO_WIDTH{1'b0}};
         end else if (adv) begin
             ex1_func_r      <= dis_func;
             ex1_src0_data_r <= dis_src0_data; ex1_src0_rdy_r <= dis_src0_rdy; ex1_src0_reg_r <= dis_src0_reg5;
@@ -2119,6 +2139,7 @@ module IDU (
             ex1_fetch_accflt_r <= dis_fetch_accflt;
             ex1_inst_len_r  <= is32;
             ex1_rm_r        <= dis_rm;
+            ex1_halt_info_r <= ifu_idu_id_halt_info;
         end else begin
             if (lf0_hit) begin ex1_src0_data_r <= lf0_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src0_rdy_r <= 1'b1; end
             if (lf1_hit) begin ex1_src1_data_r <= lf1_wb0 ? rtu_idu_wb0_data : rtu_idu_wb1_data; ex1_src1_rdy_r <= 1'b1; end
@@ -2244,6 +2265,7 @@ module IDU (
     assign idu_iu_ex1_src0_reg   = {1'b0, ex1_src0_reg_r};
     assign idu_iu_ex1_src1_reg   = {1'b0, ex1_src1_reg_r};
     assign idu_iu_ex1_inst_len   = ex1_inst_len_r;
+    assign idu_iu_ex1_halt_info  = ex1_halt_info_r;
 
     assign idu_lsu_ex1_func       = ex1_func_r;
     assign idu_lsu_ex1_src0_data  = ex1_src0_data_r;

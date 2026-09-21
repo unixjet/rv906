@@ -93,6 +93,12 @@ module IFU (
     // the illegal-instruction path, and CSR.v traps vec 12/1.
     output wire                     ifu_idu_id_fault_pgflt,
     output wire                     ifu_idu_id_fault_accflt,
+    // M7 Task 2: the DTU's execute-trigger halt_info for the instruction
+    // currently at IFU's output, riding exactly the way
+    // ifu_idu_id_bht_pred does (live sideband at the ibuf head -- the
+    // donor's aq_ifu_pred.v PRED-stage position, see the feed note at the
+    // file end). 0 when the DTU saw no execute-trigger match this cycle.
+    output wire [TDT_HINFO_WIDTH-1:0] ifu_idu_id_halt_info,
     input  wire                     idu_ifu_id_stall,
 
     //=========================================================================
@@ -198,7 +204,26 @@ module IFU (
     input  wire                     dtu_ifu_debug_inst_vld,
     input  wire                     rtu_yy_xx_dbgon,
     input  wire                     dtu_ifu_halt_on_reset,
-    output wire                     ifu_rtu_reset_halt_req
+    output wire                     ifu_rtu_reset_halt_req,
+
+    //=========================================================================
+    // M7 Task 2: DTU execute-trigger channel. ifu_dtu_exe_addr[_vld] is the
+    // PC of the instruction currently at the ibuf head (the one about to be
+    // delivered to IDU this cycle), fed to the DTU's mcontrol execute
+    // comparators. dtu_ifu_halt_info[_vld] is the DTU's single-cycle match
+    // verdict, delivered live to IDU as ifu_idu_id_halt_info the same cycle
+    // (the same sideband pattern as ifu_idu_id_bht_pred / the fault tags).
+    // Matching at the head -- one stage behind the icache fetch -- is what
+    // places the check at the donor's aq_ifu_pred.v:745-758 PRED-stage
+    // position: a trigger armed while an instruction is still in flight
+    // (fetched but not yet delivered) catches it at the head, which the
+    // stock rv64mi-p-breakpoint test relies on (tdata1 write and tripwire
+    // are 16 bytes apart in the same fetch burst).
+    //=========================================================================
+    output wire [PC_WIDTH-1:0]      ifu_dtu_exe_addr,
+    output wire                     ifu_dtu_exe_addr_vld,
+    input  wire [TDT_HINFO_WIDTH-1:0] dtu_ifu_halt_info,
+    input  wire                     dtu_ifu_halt_info_vld
 );
 
     //=========================================================================
@@ -664,6 +689,39 @@ module IFU (
         end
     end
 
+    // M7 Task 2: per-entry PC tracking for the execute-trigger comparator
+    // feed (the head-PC read out below rides the ibuf like ibuf_tag[]).
+    // Each PC latches with its entry's OWN create_en -- the exact same
+    // clocked pairing as the entryN_inst registers above (same no-reset
+    // discipline: read only while the entry's vld is set).
+    //   entry1: fetch word's LOW half  -> base PC (icache_pcgen_addr)
+    //   entry2: fetch word's HIGH half -> base PC + 2 -- EXCEPT an unaligned
+    //           fetch (branch target with bit1 set): icache_pcgen_addr then
+    //           holds the UNALIGNED target itself (pcgen_fetch_pc is passed
+    //           raw, ICache.v:268,584), the icache aligns DOWN for the read,
+    //           and the stream starts at the word's HIGH half -- which sits
+    //           AT icache_pcgen_addr, not +2. (The low half is 2B BEFORE the
+    //           target and is never created: ipack_align_create's own
+    //           !icache_ipack_unalign gate, line above.)
+    //   entry0: straddle carry = this word's entry2 (see entry0_upd_inst
+    //           above) -> entry2_pc_r
+    // The pushed halfwords are always 2B-consecutive in program order
+    // (the halfword queue's own invariant), so the push PC needs only the
+    // OLDEST half's PC (+2/+4 for tail1/tail2).
+    reg [PC_WIDTH-1:0] entry0_pc_r, entry1_pc_r, entry2_pc_r;
+    always @(posedge clk) begin
+        if (entry1_create_en) entry1_pc_r <= icache_pcgen_addr;
+    end
+    always @(posedge clk) begin
+        if (entry2_create_en)
+            entry2_pc_r <= icache_pcgen_addr
+                         + (icache_ipack_unalign ? {PC_WIDTH{1'b0}}
+                                                  : {{(PC_WIDTH-2){1'b0}}, 2'd2});
+    end
+    always @(posedge clk) begin
+        if (entry0_create_en) entry0_pc_r <= entry2_pc_r;
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)                     entry2_vld <= 1'b0;
         else if (ipack_buf_flush)       entry2_vld <= 1'b0;
@@ -833,6 +891,12 @@ module IFU (
     // own push/pop indexing exactly (pushed at tail0 alongside the fault
     // marker's low half, read out at ibuf_head alongside ifu_idu_id_bht_pred).
     reg  [1:0]  ibuf_fault_tag [0:5];
+    // M7 Task 2: per-halfword PC, mirroring ibuf_tag[]'s push/pop indexing
+    // (pushed at each tail with the halfword's own PC, read out at
+    // ibuf_head). Feeds the DTU execute comparators at the HEAD (the donor's
+    // aq_ifu_pred.v:745-758 PRED-stage position) -- see the entry0/1/2_pc_r
+    // block above and the ifu_dtu_exe_addr assignment at the file end.
+    reg  [PC_WIDTH-1:0] ibuf_pc [0:5];
     reg  [2:0]  ibuf_head;     // 0..5, head-of-queue (oldest halfword) pointer
     reg  [2:0]  ibuf_count;    // 0..6, occupancy
 
@@ -926,6 +990,16 @@ module IFU (
         end
     end
 
+    // M7 Task 2: the pushed halfwords' PCs. tail0 is ALWAYS instr0's low
+    // half (same source priority as the DATA mux above, ipack_first_inst:
+    // h0-carry shapes push entry0 -- the previous word's carried low half --
+    // otherwise entry1, and the unaligned entry2-only shape pushes entry2).
+    // tail1/tail2 sit 2B further along (the queue's own consecutive-
+    // halfword invariant).
+    wire [PC_WIDTH-1:0] ibuf_push_pc0 = entry0_vld ? entry0_pc_r
+                                   : entry1_vld ? entry1_pc_r
+                                                : entry2_pc_r;
+
     always @(posedge clk) begin
         if (ibuf_push_count >= 2'd1) begin
             ibuf_mem[ibuf_tail0] <= ipack_ibuf_inst[15:0];
@@ -935,6 +1009,8 @@ module IFU (
             // (ipack_one_32bit_vld), whose tail0 is entry1's own low half,
             // exactly where entry1_fault_pgflt_r/_accflt_r were latched.
             ibuf_fault_tag[ibuf_tail0] <= {ipack_ibuf_fault_pgflt, ipack_ibuf_fault_accflt};
+            // M7 Task 2: the halfword's own PC, tail0..tail2 at +0/+2/+4.
+            ibuf_pc[ibuf_tail0] <= ibuf_push_pc0;
         end
         if (ibuf_push_count >= 2'd2) begin
             ibuf_mem[ibuf_tail1] <= ipack_ibuf_inst[31:16];
@@ -943,11 +1019,13 @@ module IFU (
             // h0's own slot) -- written 0 anyway, matching this array's own
             // no-stale-garbage discipline (see ibuf_tag[]'s own precedent).
             ibuf_fault_tag[ibuf_tail1] <= 2'b00;
+            ibuf_pc[ibuf_tail1] <= ibuf_push_pc0 + {{(PC_WIDTH-2){1'b0}}, 2'd2};
         end
         if (ibuf_push_count >= 2'd3) begin
             ibuf_mem[ibuf_tail2] <= ipack_ibuf_inst[47:32];
             ibuf_tag[ibuf_tail2] <= pred_ibuf_br_taken1;      // only reachable via ipack_ibuf_inst_all: tail2 is instr1
             ibuf_fault_tag[ibuf_tail2] <= 2'b00;              // never read, see tail1's own note
+            ibuf_pc[ibuf_tail2] <= ibuf_push_pc0 + {{(PC_WIDTH-3){1'b0}}, 3'd4};
         end
     end
 
@@ -980,5 +1058,38 @@ module IFU (
     // is about to be delivered to IDU.
     assign ifu_idu_id_fault_pgflt  = ibuf_fault_tag[ibuf_head][1];
     assign ifu_idu_id_fault_accflt = ibuf_fault_tag[ibuf_head][0];
+    // M7 Task 2: the execute-trigger halt_info is the DTU's LIVE verdict on
+    // the head instruction (computed this cycle, see the feed below) -- the
+    // same sideband-at-head pattern as ifu_idu_id_bht_pred, latched by IDU
+    // on its own adv. 0 unless the DTU matched an execute trigger against
+    // the head PC this cycle. (The donor's equivalent is aq_ifu_pred.v's
+    // pred_ibuf_halt_info0/1: the PRED stage's verdict riding into IBUF;
+    // rv906 has no separate pred register stage, so the head-of-ibuf read
+    // IS the pred position -- one stage behind the icache fetch, which is
+    // what lets a trigger armed while the tripwire is still in flight
+    // catch it, as the stock rv64mi-p-breakpoint test requires.)
+    assign ifu_idu_id_halt_info = dtu_ifu_halt_info_vld ? dtu_ifu_halt_info
+                                                        : {TDT_HINFO_WIDTH{1'b0}};
+
+    //=========================================================================
+    // M7 Task 2: DTU execute-trigger feed. The instruction at the ibuf head
+    // (the one delivered to IDU this cycle, if the pop fires): its PC is
+    // ibuf_pc[ibuf_head] (latched at push time, SECTION IBUF above). The
+    // DTU compares it combinationally against its mcontrol execute
+    // comparators and returns dtu_ifu_halt_info[_vld] live (no latching --
+    // the IDU captures the verdict on its own adv, exactly like
+    // ifu_idu_id_bht_pred). pop_entry_vld is the right vld: it is set only
+    // while a COMPLETE instruction (16-bit, or 32-bit with both halves
+    // queued) sits at the head, so a 32-bit instruction is compared at its
+    // own low-half PC, matching the donor's pred_inst0_bkpt_pc (the low
+    // half's PC, aq_ifu_pred.v:747-748). The DM-injected debug instruction
+    // (dtu_dbg_inst_deliver above) is deliberately NOT fed -- it never
+    // enters the ibuf and must not arm an execute breakpoint (the old
+    // fetch-PC feed had the same exclusion; it also fixes a latent stale-
+    // readout: the old ibuf_halt_info[] array kept pre-flush garbage at the
+    // head during a debug-mode delivery).
+    //=========================================================================
+    assign ifu_dtu_exe_addr     = ibuf_pc[ibuf_head];
+    assign ifu_dtu_exe_addr_vld = pop_entry_vld;
 
 endmodule

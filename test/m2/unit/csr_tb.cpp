@@ -64,6 +64,15 @@ static const uint32_t CSR_DCSR      = 0x7B0;
 static const uint32_t CSR_DPC       = 0x7B1;
 static const uint32_t CSR_DSCRATCH0 = 0x7B2;
 static const uint32_t CSR_DSCRATCH1 = 0x7B3;
+// M7 Task 2 (rvproc_pkg.sv) -- the trigger CSR file, storage in DTU.v.
+static const uint32_t CSR_TSELECT   = 0x7A0;
+static const uint32_t CSR_TDATA1    = 0x7A1;
+static const uint32_t CSR_TDATA2    = 0x7A2;
+static const uint32_t CSR_TDATA3    = 0x7A3;
+static const uint32_t CSR_TINFO     = 0x7A4;
+static const uint32_t CSR_TCONTROL  = 0x7A5;
+static const uint32_t CSR_MCONTEXT  = 0x7A8;
+static const uint32_t CSR_SCONTEXT  = 0x7AA;
 // dcsr bit positions (0.13 layout, DTU.v SECTION DCSR):
 // [31:28]xdebugver, [15]ebreakm, [13]ebreaks, [12]ebreaku, [11]stepie,
 // [10]stopcount, [8:6]cause, [4]mprven, [2]step, [1:0]prv.
@@ -1600,6 +1609,59 @@ static void test_debug_dret_and_xret_gating(void) {
     test_result("T30 M7 dret declare + xret/ebreak gating in debug mode");
 }
 
+// M7 Task 2 -- trigger CSR routing (0x7A0-0x7AA): the read mux arms and the
+// write strobe. The DTU module is NOT instantiated in this bench, so this
+// tests CSR.v's OWN contract (the trigger CSRs route exactly like the
+// 0x7B0-0x7B3 debug CSRs); the DTU-side storage behavior is covered by
+// dtu_tb's T13-T16.
+static void test_trigger_csr_read_routing(void) {
+    const uint64_t S0 = 0x5555555555555555ULL;
+    const uint64_t S1 = 0x6666666666666666ULL;
+    dut->dtu_cp0_rdata = S0;
+    check(csr_read(CSR_TSELECT)  == S0, "tselect read routed to dtu_cp0_rdata", csr_read(CSR_TSELECT), S0);
+    check(csr_read(CSR_TDATA1)   == S0, "tdata1 read routed to dtu_cp0_rdata", csr_read(CSR_TDATA1), S0);
+    check(csr_read(CSR_TDATA2)   == S0, "tdata2 read routed to dtu_cp0_rdata", csr_read(CSR_TDATA2), S0);
+    check(csr_read(CSR_TDATA3)   == S0, "tdata3 read routed to dtu_cp0_rdata", csr_read(CSR_TDATA3), S0);
+    check(csr_read(CSR_TINFO)    == S0, "tinfo read routed to dtu_cp0_rdata", csr_read(CSR_TINFO), S0);
+    dut->dtu_cp0_rdata = S1;
+    check(csr_read(CSR_TCONTROL) == S1, "tcontrol read routed to dtu_cp0_rdata", csr_read(CSR_TCONTROL), S1);
+    check(csr_read(CSR_MCONTEXT) == S1, "mcontext read routed to dtu_cp0_rdata", csr_read(CSR_MCONTEXT), S1);
+    check(csr_read(CSR_SCONTEXT) == S1, "scontext read routed to dtu_cp0_rdata", csr_read(CSR_SCONTEXT), S1);
+    // A non-trigger CSR must NOT read the DTU bus.
+    dut->dtu_cp0_rdata = 0xDEADBEEFDEADBEEFULL;
+    csr_write(CSR_MSCRATCH, 0x4343);
+    check(csr_read(CSR_MSCRATCH) == 0x4343, "mscratch read NOT hijacked by trigger CSR arms",
+          csr_read(CSR_MSCRATCH), 0x4343);
+    dut->dtu_cp0_rdata = 0;   // teardown
+    test_result("T31 M7 trigger CSR read routing: 0x7A0-0x7AA -> dtu_cp0_rdata");
+}
+
+static void test_trigger_csr_write_strobe(void) {
+    DebugWriteProbe p;
+    p = debug_write_probe(CSR_TSELECT, 0x1);
+    check(p.wreg && p.addr == CSR_TSELECT && p.wdata == 0x1,
+          "tselect write: wreg/addr/wdata correct", p.addr, CSR_TSELECT);
+    p = debug_write_probe(CSR_TDATA1, 0x2000000000000044ULL);
+    check(p.wreg && p.addr == CSR_TDATA1 && p.wdata == 0x2000000000000044ULL,
+          "tdata1 write: wreg/addr/wdata correct", p.wdata, 0x2000000000000044ULL);
+    p = debug_write_probe(CSR_TDATA2, 0x80000040);
+    check(p.wreg && p.addr == CSR_TDATA2 && p.wdata == 0x80000040,
+          "tdata2 write: wreg/addr/wdata correct", p.addr, CSR_TDATA2);
+    p = debug_write_probe(CSR_TCONTROL, 0x8);
+    check(p.wreg && p.addr == CSR_TCONTROL && p.wdata == 0x8,
+          "tcontrol write: wreg/addr/wdata correct", p.addr, CSR_TCONTROL);
+    p = debug_write_probe(CSR_MCONTEXT, 0x1FFF);
+    check(p.wreg && p.addr == CSR_MCONTEXT && p.wdata == 0x1FFF,
+          "mcontext write: wreg/addr/wdata correct", p.addr, CSR_MCONTEXT);
+    p = debug_write_probe(CSR_SCONTEXT, 0x3FFFF);
+    check(p.wreg && p.addr == CSR_SCONTEXT && p.wdata == 0x3FFFF,
+          "scontext write: wreg/addr/wdata correct", p.addr, CSR_SCONTEXT);
+    // A non-trigger CSR write must NOT strobe the DTU port.
+    p = debug_write_probe(CSR_MSCRATCH, 0x77);
+    check(!p.wreg, "mscratch write: cp0_dtu_wreg does NOT strobe for non-trigger CSR", p.wreg);
+    test_result("T32 M7 trigger CSR write strobe: 0x7A0-0x7AA -> cp0_dtu_wreg/addr/wdata");
+}
+
 //=============================================================================
 // Mutation-check discipline note (plan task 2.2): the mutation itself is
 // applied by hand to rtl/CSR.v (NOT left as code here), the bench re-run to
@@ -1669,6 +1731,10 @@ int main(int argc, char **argv) {
     test_debug_csr_write_strobe();
     test_debug_ebreak_halt();
     test_debug_dret_and_xret_gating();
+
+    // M7 Task 2: trigger CSR (0x7A0-0x7AA) routing to the DTU.
+    test_trigger_csr_read_routing();
+    test_trigger_csr_write_strobe();
 
     printf("[csr_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

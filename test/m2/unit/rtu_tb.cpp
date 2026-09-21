@@ -140,6 +140,11 @@ static void tie_idle_inputs(void) {
     dut->cp0_rtu_ebreak_halt    = 0;
     dut->cp0_rtu_ex1_inst_dret  = 0;
     dut->ifu_rtu_reset_halt_req = 0;
+    // M7 Task 2: trigger halt_info carriers + DTU pending level, idle =
+    // "no trigger match" (all zeros -> no leg-4 trap, no trigger halt).
+    dut->iu_rtu_ex1_halt_info   = 0;
+    dut->lsu_rtu_ex1_halt_info  = 0;
+    dut->dtu_rtu_pending_halt   = 0;
 }
 
 static void tick(void) {
@@ -1212,6 +1217,249 @@ static void test_m7_debug_mode_exception(void) {
 }
 
 //=============================================================================
+// M7 Task 2 -- trigger halt/trap legs (RTU.v leg 4 + halt section).
+//
+// halt_info encoding (rvproc_pkg.sv TDT_HINFO_*): CANCEL[0] MATCH[1]
+// LDST[2] CHAIN[3] ACTION[4] ACTION01[5] TIMING[6] PENDING_HALT[7]
+// CAUSE[11:8] TRIGGER[21:12]. Bundles driven on iu_rtu_ex1_halt_info are
+// latched into ex2_halt_info at the dp cycle, exactly as the IFU/LSU
+// carriers are in the full core.
+//
+//   t0 bp     = 0x3   (CANCEL|MATCH, ACTION=0, TIMING=0)
+//   t0 halt   = 0x13  (CANCEL|MATCH|ACTION)
+//   t1 bp     = 0x42  (MATCH|TIMING, ACTION=0, CANCEL=0)
+//   t1 halt   = 0x52  (MATCH|ACTION|TIMING, CANCEL=0)
+//=============================================================================
+
+static void test_m7_trigger_breakpoint_t0(void) {
+    // Baseline: a plain ALU wb instruction commits wb0 one cycle later.
+    tie_idle_inputs();
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    dut->iu_rtu_ex1_alu_wb_dp    = 1;
+    dut->iu_rtu_ex1_alu_wb_vld   = 1;
+    dut->iu_rtu_ex1_alu_data     = 0x1234;
+    dut->iu_rtu_ex1_alu_preg     = 5;
+    dut->iu_rtu_ex1_cur_pc       = 0xA000;
+    dut->iu_rtu_ex1_next_pc      = 0xA004;
+    tick();
+    check(dut->rtu_idu_wb0_vld && dut->rtu_idu_wb0_data == 0x1234,
+          "t0 bp baseline: untriggered ALU wb commits wb0");
+    tie_idle_inputs();
+    tick();
+
+    // Triggered: the SAME instruction with a t0 breakpoint bundle.
+    tie_idle_inputs();
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    dut->iu_rtu_ex1_alu_wb_dp    = 1;
+    dut->iu_rtu_ex1_alu_wb_vld   = 1;
+    dut->iu_rtu_ex1_alu_data     = 0x1234;
+    dut->iu_rtu_ex1_alu_preg     = 5;
+    dut->iu_rtu_ex1_cur_pc       = 0xA000;
+    dut->iu_rtu_ex1_next_pc      = 0xA004;
+    dut->iu_rtu_ex1_halt_info    = 0x3;   // CANCEL|MATCH, ACTION=0
+    tick();   // -> T+1: ex2_retire_vld, leg 4 fires
+    dut->iu_rtu_ex1_alu_cmplt    = 0;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 0;
+    dut->iu_rtu_ex1_alu_wb_dp    = 0;
+    dut->iu_rtu_ex1_alu_wb_vld   = 0;
+    dut->iu_rtu_ex1_halt_info    = 0;
+    dut->eval();
+    check(dut->rtu_yy_xx_expt_vld == 1, "t0 bp: trap declared at retire",
+          dut->rtu_yy_xx_expt_vld, 1);
+    check(dut->rtu_yy_xx_expt_vec == 3, "t0 bp: vec 3 (breakpoint)",
+          dut->rtu_yy_xx_expt_vec, 3);
+    check(dut->rtu_cp0_epc == 0xA000, "t0 bp: epc == trigger's cur_pc",
+          dut->rtu_cp0_epc, 0xA000);
+    check(dut->rtu_cp0_tval == 0, "t0 bp: tval == 0", dut->rtu_cp0_tval, 0);
+    check(dut->rtu_dtu_halt_ack == 0, "t0 bp: NO halt (action 0)");
+    check(dut->rtu_idu_wb0_vld == 0, "t0 bp: wb0 CANCELLED (CANCEL bit)",
+          dut->rtu_idu_wb0_vld, 0);
+    check(dut->rtu_dtu_retire_halt_info == 0x3,
+          "t0 bp: rtu_dtu_retire_halt_info feeds back the latched bundle",
+          dut->rtu_dtu_retire_halt_info, 0x3);
+    // Settle the flush (the trap redirects), then resume if any halt —
+    // none here; just drain the flush FSM.
+    tie_idle_inputs();
+    for (int i = 0; i < 5; i++) tick();
+    test_result("T26 M7 trigger breakpoint (t0 action0): vec3/epc=cur_pc/tval0, wb0 cancelled, no halt");
+}
+
+static void test_m7_trigger_halt_t0(void) {
+    // A t0 action-1 trigger HALTS (cause 2) instead of trapping.
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->iu_rtu_ex1_cur_pc    = 0xB000;
+    dut->iu_rtu_ex1_next_pc   = 0xB004;
+    dut->iu_rtu_ex1_halt_info = 0x13;   // CANCEL|MATCH|ACTION
+    tick();   // -> ex2_retire_vld, halt_req_trigger_t0
+    dut->cp0_rtu_ex1_cmplt_dp = 0;
+    dut->iu_rtu_ex1_halt_info = 0;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "t0 halt: halt_ack at the retire boundary");
+    check(dut->rtu_dtu_halt_cause == 2, "t0 halt: cause == 2 (trigger)",
+          dut->rtu_dtu_halt_cause, 2);
+    check(dut->rtu_dtu_dpc == 0xB000, "t0 halt: dpc == trigger's cur_pc",
+          dut->rtu_dtu_dpc, 0xB000);
+    check(dut->rtu_yy_xx_expt_vld == 0, "t0 halt: NO architectural trap (halt instead)",
+          dut->rtu_yy_xx_expt_vld, 0);
+    check(dut->rtu_yy_xx_dbgon == 0, "t0 halt: dbgon not yet (flush not at BE)");
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "t0 halt: dbgon=1 after flush BE");
+    // Resume out.
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "t0 halt: resumed out of debug");
+    test_result("T27 M7 trigger halt (t0 action1): cause2, dpc=cur_pc, no trap, dbgon after flush");
+}
+
+static void test_m7_trigger_timing1(void) {
+    // (a) t1 action-1 (after-completion): the instruction's side effects
+    // commit (CANCEL=0 -> wb0 NOT cancelled), THEN the halt takes the
+    // boundary (cause 2).
+    tie_idle_inputs();
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    dut->iu_rtu_ex1_alu_wb_dp    = 1;
+    dut->iu_rtu_ex1_alu_wb_vld   = 1;
+    dut->iu_rtu_ex1_alu_data     = 0x9999;
+    dut->iu_rtu_ex1_alu_preg     = 6;
+    dut->iu_rtu_ex1_cur_pc       = 0xC000;
+    dut->iu_rtu_ex1_next_pc      = 0xC004;
+    dut->iu_rtu_ex1_halt_info    = 0x52;   // MATCH|ACTION|TIMING, CANCEL=0
+    tick();   // -> ex2_retire_vld, halt_req_trigger_t1
+    dut->iu_rtu_ex1_alu_cmplt    = 0;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 0;
+    dut->iu_rtu_ex1_alu_wb_dp    = 0;
+    dut->iu_rtu_ex1_alu_wb_vld   = 0;
+    dut->iu_rtu_ex1_halt_info    = 0;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "t1 halt: halt_ack at the boundary");
+    check(dut->rtu_dtu_halt_cause == 2, "t1 halt: cause == 2 (trigger)",
+          dut->rtu_dtu_halt_cause, 2);
+    check(dut->rtu_idu_wb0_vld == 1 && dut->rtu_idu_wb0_data == 0x9999,
+          "t1 halt: side effect COMMITTED (CANCEL=0 -> wb0 not cancelled)");
+    check(dut->rtu_yy_xx_expt_vld == 0, "t1 halt: no architectural trap");
+    tick();
+    tie_idle_inputs();
+    tick();
+    tick();
+    check(dut->rtu_yy_xx_dbgon == 1, "t1 halt: dbgon=1 after flush");
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "t1 halt: resumed out of debug");
+
+    // (b) t1 action-0 (after-completion breakpoint): the instruction
+    // commits (wb0 fires), THEN the trap (vec 3, epc=cur_pc) lands.
+    tie_idle_inputs();
+    dut->iu_rtu_ex1_alu_cmplt    = 1;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 1;
+    dut->iu_rtu_ex1_alu_wb_dp    = 1;
+    dut->iu_rtu_ex1_alu_wb_vld   = 1;
+    dut->iu_rtu_ex1_alu_data     = 0x7777;
+    dut->iu_rtu_ex1_alu_preg     = 7;
+    dut->iu_rtu_ex1_cur_pc       = 0xC100;
+    dut->iu_rtu_ex1_next_pc      = 0xC104;
+    dut->iu_rtu_ex1_halt_info    = 0x42;   // MATCH|TIMING, ACTION=0
+    tick();
+    dut->iu_rtu_ex1_alu_cmplt    = 0;
+    dut->iu_rtu_ex1_alu_cmplt_dp = 0;
+    dut->iu_rtu_ex1_alu_wb_dp    = 0;
+    dut->iu_rtu_ex1_alu_wb_vld   = 0;
+    dut->iu_rtu_ex1_halt_info    = 0;
+    dut->eval();
+    check(dut->rtu_yy_xx_expt_vld == 1, "t1 bp: trap at the boundary",
+          dut->rtu_yy_xx_expt_vld, 1);
+    check(dut->rtu_yy_xx_expt_vec == 3, "t1 bp: vec 3 (breakpoint)",
+          dut->rtu_yy_xx_expt_vec, 3);
+    check(dut->rtu_cp0_epc == 0xC100, "t1 bp: epc == trigger's cur_pc",
+          dut->rtu_cp0_epc, 0xC100);
+    check(dut->rtu_idu_wb0_vld == 1 && dut->rtu_idu_wb0_data == 0x7777,
+          "t1 bp: side effect COMMITTED first (CANCEL=0)");
+    check(dut->rtu_dtu_halt_ack == 0, "t1 bp: no halt (action 0)");
+    tie_idle_inputs();
+    for (int i = 0; i < 5; i++) tick();
+    test_result("T28 M7 trigger timing-1: halt(cause2)+bp(vec3) after side effects commit");
+}
+
+static void test_m7_trigger_cause_priority_and_pending(void) {
+    // (a) Cause priority: a t0 trigger halt (cause 2) and an ebreak halt
+    // (cause 1) land on the SAME retire boundary -> trigger wins (RTU
+    // cause ladder: trigger > ebreak > reset > dm_sync > step).
+    //
+    // NOTE the stimulus timing: cp0_rtu_ebreak_halt is a level, not a
+    // latched record -- in the full core the CSR only asserts it when the
+    // ebreak itself retires (RTU.v:1045-1048), i.e. at the same boundary.
+    // Driving it BEFORE the boundary would take the ebreak halt t0-style
+    // on the earlier edge and set dbg_mode_on_after_req, masking the
+    // trigger leg -- not the scenario under test.
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->iu_rtu_ex1_cur_pc    = 0xD000;
+    dut->iu_rtu_ex1_next_pc   = 0xD004;
+    dut->iu_rtu_ex1_halt_info = 0x13;
+    tick();
+    dut->cp0_rtu_ex1_cmplt_dp = 0;
+    dut->cp0_rtu_ebreak_halt  = 1;   // ebreak level lands on the SAME boundary
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "priority: halt taken at the boundary");
+    check(dut->rtu_dtu_halt_cause == 2, "priority: trigger(2) beats ebreak(1)",
+          dut->rtu_dtu_halt_cause, 2);
+    dut->cp0_rtu_ebreak_halt  = 0;
+    dut->iu_rtu_ex1_halt_info = 0;
+    tick();   // -> dbg_mode_on_after_req latched at the boundary edge, flush FE
+    tie_idle_inputs();
+    tick();   // -> flush BE
+    tick();   // -> dbgon=1
+    check(dut->rtu_yy_xx_dbgon == 1, "priority: halted in debug after flush");
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "priority: resumed out of debug");
+
+    // (b) The DTU pending-halt LEVEL: a normal retire boundary with
+    // dtu_rtu_pending_halt=1 (no match bits) -> halt (cause 2) and the
+    // ack releases the level.
+    tie_idle_inputs();
+    dut->cp0_rtu_ex1_cmplt_dp = 1;
+    dut->iu_rtu_ex1_cur_pc    = 0xE000;
+    dut->iu_rtu_ex1_next_pc   = 0xE004;
+    dut->dtu_rtu_pending_halt = 1;
+    tick();
+    dut->cp0_rtu_ex1_cmplt_dp = 0;
+    dut->eval();
+    check(dut->rtu_dtu_halt_ack == 1, "pending: halt at the boundary");
+    check(dut->rtu_dtu_halt_cause == 2, "pending: cause == 2 (trigger class)",
+          dut->rtu_dtu_halt_cause, 2);
+    check(dut->rtu_dtu_pending_ack == 1, "pending: rtu_dtu_pending_ack releases the level");
+    dut->dtu_rtu_pending_halt = 0;   // the DTU drops the level on the ack
+    tick();
+    check(dut->rtu_dtu_pending_ack == 0, "pending: ack falls with the level");
+    tie_idle_inputs();
+    tick();
+    tick();
+    dut->dtu_rtu_resume_req = 1;
+    dut->eval();
+    tick();
+    tie_idle_inputs();
+    for (int i = 0; i < 3; i++) tick();
+    check(dut->rtu_yy_xx_dbgon == 0, "pending: resumed out of debug");
+    test_result("T29 M7 trigger cause priority (trigger>ebreak) + pending-halt level ack");
+}
+
+//=============================================================================
 // main
 //=============================================================================
 int main(int argc, char **argv) {
@@ -1249,6 +1497,12 @@ int main(int argc, char **argv) {
     test_m7_step_halt_and_int_mask();
     test_m7_exit_debug_resume_and_dret();
     test_m7_debug_mode_exception();
+
+    // M7 Task 2: trigger halt/trap legs (halt_info from the DTU).
+    test_m7_trigger_breakpoint_t0();
+    test_m7_trigger_halt_t0();
+    test_m7_trigger_timing1();
+    test_m7_trigger_cause_priority_and_pending();
 
     printf("[rtu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

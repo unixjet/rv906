@@ -30,6 +30,16 @@ static const uint32_t CSR_DPC       = 0x7B1;
 static const uint32_t CSR_DSCRATCH0 = 0x7B2;
 static const uint32_t CSR_DSCRATCH1 = 0x7B3;
 
+// Trigger CSR addresses (rvproc_pkg.sv, M7 Task 2)
+static const uint32_t CSR_TSELECT  = 0x7A0;
+static const uint32_t CSR_TDATA1   = 0x7A1;
+static const uint32_t CSR_TDATA2   = 0x7A2;
+static const uint32_t CSR_TDATA3   = 0x7A3;
+static const uint32_t CSR_TINFO    = 0x7A4;
+static const uint32_t CSR_TCONTROL = 0x7A5;
+static const uint32_t CSR_MCONTEXT = 0x7A8;
+static const uint32_t CSR_SCONTEXT = 0x7AA;
+
 // dcsr layout (0.13, DTU.v): xdebugver[31:28]=0100, ebreakm[15], ebreaks[13],
 // ebreaku[12], stepie[11], stopcount[10], cause[8:6], mprven[4], step[2],
 // prv[1:0].
@@ -452,6 +462,148 @@ static void test_dm_passthrough(void) {
 }
 
 //=============================================================================
+// M7 Task 2 -- trigger storage (tselect/tdata1/2/3/tinfo/tcontrol/
+// mcontext/scontext). The new IFU/LSU/RTU trigger-match ports are left
+// unconnected in this bench: Verilator 2-state leaves them 0, so the
+// comparators see no accesses and no matches (the OFF-path identity the
+// M7 gate set relies on).
+//=============================================================================
+
+// mcontrol tdata1 field encodings (standard 0.13 layout, DTU.v localparams)
+static const uint64_t MTYPE    = 0x2ULL << 60;   // type = 2 (mcontrol)
+static const uint64_t MT_MMODE = 0x1ULL << 6;
+static const uint64_t MT_EXE   = 0x1ULL << 2;
+static const uint64_t MT_LD    = 0x1ULL << 0;
+static const uint64_t MT_ST    = 0x1ULL << 1;
+
+static void test_trigger_reset_state(void) {
+    reset_dut();
+    check(dtu_read(CSR_TSELECT)  == 0, "trig reset: tselect == 0", dtu_read(CSR_TSELECT), 0);
+    check(dtu_read(CSR_TDATA1)   == 0, "trig reset: tdata1(slot0) == 0", dtu_read(CSR_TDATA1), 0);
+    check(dtu_read(CSR_TDATA2)   == 0, "trig reset: tdata2 == 0");
+    check(dtu_read(CSR_TDATA3)   == 0, "trig reset: tdata3 == 0");
+    check(dtu_read(CSR_TCONTROL) == 0, "trig reset: tcontrol == 0 (MTE/MPTE clear)",
+          dtu_read(CSR_TCONTROL), 0);
+    check(dtu_read(CSR_MCONTEXT) == 0, "trig reset: mcontext == 0");
+    check(dtu_read(CSR_SCONTEXT) == 0, "trig reset: scontext == 0");
+    // tinfo: slot 0 is an mcontrol slot (tinfo[9:4]=001000 -> 0x10),
+    // slots 8/9 are iie (0x30).
+    check(dtu_read(CSR_TINFO) == 0x10, "trig reset: tinfo(slot0) == 0x10 (mcontrol)",
+          dtu_read(CSR_TINFO), 0x10);
+    test_result("T13 trigger reset: all storage 0, tinfo 0x10");
+}
+
+static void test_tselect_clamp(void) {
+    reset_dut();
+    // 0..8 pass through; 9 and above (or any high bit) clamp to 9.
+    dtu_cp0_write(CSR_TSELECT, 0x4);
+    check(dtu_read(CSR_TSELECT) == 4, "tselect: 4 passes", dtu_read(CSR_TSELECT), 4);
+    dtu_cp0_write(CSR_TSELECT, 0x8);
+    check(dtu_read(CSR_TSELECT) == 8, "tselect: 8 (iie slot) passes", dtu_read(CSR_TSELECT), 8);
+    dtu_cp0_write(CSR_TSELECT, 0x9);
+    check(dtu_read(CSR_TSELECT) == 9, "tselect: 9 clamps to 9", dtu_read(CSR_TSELECT), 9);
+    dtu_cp0_write(CSR_TSELECT, 0xA);
+    check(dtu_read(CSR_TSELECT) == 9, "tselect: 10 clamps to 9", dtu_read(CSR_TSELECT), 9);
+    dtu_cp0_write(CSR_TSELECT, 0xFFFF);
+    check(dtu_read(CSR_TSELECT) == 9, "tselect: 0xFFFF clamps to 9", dtu_read(CSR_TSELECT), 9);
+    // tinfo follows the selected slot: 0x30 for iie slots 8/9.
+    dtu_cp0_write(CSR_TSELECT, 0x9);
+    check(dtu_read(CSR_TINFO) == 0x30, "tinfo(iie slot 9) == 0x30", dtu_read(CSR_TINFO), 0x30);
+    dtu_cp0_write(CSR_TSELECT, 0x0);
+    test_result("T14 tselect WARL clamp at 9 + tinfo slot select");
+}
+
+static void test_tdata1_readback(void) {
+    reset_dut();
+    // (a) Bit-exact readback for the stock-breakpoint.S encodings
+    // (2 << (XLEN-4) | M | {EXE,LD,ST}):
+    // 0x2000000000000044 / 0x2000000000000041 / 0x2000000000000042.
+    const uint64_t exe = MTYPE | MT_MMODE | MT_EXE;   // 0x2000000000000044
+    const uint64_t ld  = MTYPE | MT_MMODE | MT_LD;    // 0x2000000000000041
+    const uint64_t st  = MTYPE | MT_MMODE | MT_ST;    // 0x2000000000000042
+    dtu_cp0_write(CSR_TSELECT, 0x0);
+    dtu_cp0_write(CSR_TDATA1, exe);
+    check(dtu_read(CSR_TDATA1) == exe, "tdata1: execute enc bit-exact",
+          dtu_read(CSR_TDATA1), exe);
+    dtu_cp0_write(CSR_TDATA1, ld);
+    check(dtu_read(CSR_TDATA1) == ld, "tdata1: load enc bit-exact", dtu_read(CSR_TDATA1), ld);
+    dtu_cp0_write(CSR_TDATA1, st);
+    check(dtu_read(CSR_TDATA1) == st, "tdata1: store enc bit-exact", dtu_read(CSR_TDATA1), st);
+
+    // (b) A second slot is independent.
+    dtu_cp0_write(CSR_TSELECT, 0x1);
+    dtu_cp0_write(CSR_TDATA1, st);
+    check(dtu_read(CSR_TDATA1) == st, "tdata1: slot1 stores independently", dtu_read(CSR_TDATA1), st);
+    dtu_cp0_write(CSR_TSELECT, 0x0);
+    check(dtu_read(CSR_TDATA1) == st, "tdata1: slot0 unchanged by slot1 write",
+          dtu_read(CSR_TDATA1), st);
+
+    // (c) WARL: unsupported type (4) -> type field reads back 0 (slot
+    // disabled; a match requires type==2, D-M7-5).
+    dtu_cp0_write(CSR_TDATA1, (0x4ULL << 60) | MT_MMODE | MT_EXE);
+    check((dtu_read(CSR_TDATA1) >> 60) == 0,
+          "tdata1: type 4 unsupported -> type field reads 0",
+          dtu_read(CSR_TDATA1) >> 60, 0);
+    dtu_cp0_write(CSR_TDATA1, (0x5ULL << 60) | MT_MMODE | MT_EXE);
+    check((dtu_read(CSR_TDATA1) >> 60) == 0,
+          "tdata1: type 5 unsupported -> type field reads 0",
+          dtu_read(CSR_TDATA1) >> 60, 0);
+
+    // (d) WARL: match > 5 clamps to 0; action > 1 clamps to 0; timing is
+    // forced 0 for an execute trigger.
+    dtu_cp0_write(CSR_TDATA1, MTYPE | MT_MMODE | MT_EXE | (0x9ULL << 7));
+    check(((dtu_read(CSR_TDATA1) >> 7) & 0xFULL) == 0, "tdata1: match 9 clamps to 0",
+          (dtu_read(CSR_TDATA1) >> 7) & 0xFULL, 0);
+    dtu_cp0_write(CSR_TDATA1, MTYPE | MT_MMODE | MT_EXE | (0x3ULL << 12));
+    check(((dtu_read(CSR_TDATA1) >> 12) & 0x3FULL) == 0, "tdata1: action 3 clamps to 0",
+          (dtu_read(CSR_TDATA1) >> 12) & 0x3FULL, 0);
+    dtu_cp0_write(CSR_TDATA1, MTYPE | MT_MMODE | MT_EXE | (1ULL << 18));
+    check(((dtu_read(CSR_TDATA1) >> 18) & 1ULL) == 0, "tdata1: timing forced 0 for execute",
+          (dtu_read(CSR_TDATA1) >> 18) & 1ULL, 0);
+    // but timing IS kept for a load trigger.
+    dtu_cp0_write(CSR_TDATA1, MTYPE | MT_MMODE | MT_LD | (1ULL << 18));
+    check(((dtu_read(CSR_TDATA1) >> 18) & 1ULL) == 1, "tdata1: timing kept for load",
+          (dtu_read(CSR_TDATA1) >> 18) & 1ULL, 1);
+
+    // (e) tdata2/tdata3 plain storage.
+    dtu_cp0_write(CSR_TDATA2, 0x80000040);
+    check(dtu_read(CSR_TDATA2) == 0x80000040, "tdata2 plain storage", dtu_read(CSR_TDATA2), 0x80000040);
+    dtu_cp0_write(CSR_TDATA3, 0xDEADBEEF);
+    check(dtu_read(CSR_TDATA3) == 0xDEADBEEF, "tdata3 plain storage", dtu_read(CSR_TDATA3), 0xDEADBEEF);
+    dtu_cp0_write(CSR_TSELECT, 0x0);
+    test_result("T15 tdata1 bit-exact + WARL (type/match/action/timing) + tdata2/3");
+}
+
+static void test_tcontrol_mcontext_scontext(void) {
+    reset_dut();
+    // tcontrol: MTE (bit 3) + MPTE (bit 7) stored and read back.
+    dtu_cp0_write(CSR_TCONTROL, (1 << 3));
+    check(dtu_read(CSR_TCONTROL) == (1 << 3), "tcontrol: MTE stored",
+          dtu_read(CSR_TCONTROL), (1 << 3));
+    dtu_cp0_write(CSR_TCONTROL, (1 << 7));
+    check(dtu_read(CSR_TCONTROL) == (1 << 7), "tcontrol: MPTE stored",
+          dtu_read(CSR_TCONTROL), (1 << 7));
+    dtu_cp0_write(CSR_TCONTROL, 0);
+
+    // mcontext: low 13 bits plain storage.
+    dtu_cp0_write(CSR_MCONTEXT, 0x1FFF);
+    check(dtu_read(CSR_MCONTEXT) == 0x1FFF, "mcontext: low 13b stored",
+          dtu_read(CSR_MCONTEXT), 0x1FFF);
+    dtu_cp0_write(CSR_MCONTEXT, 0x12345);
+    check(dtu_read(CSR_MCONTEXT) == (0x12345 & 0x1FFF), "mcontext: high bits dropped",
+          dtu_read(CSR_MCONTEXT), 0x12345 & 0x1FFF);
+
+    // scontext: low 34 bits plain storage.
+    dtu_cp0_write(CSR_SCONTEXT, 0x3FFFFFFF);
+    check(dtu_read(CSR_SCONTEXT) == 0x3FFFFFFF, "scontext: low 34b stored",
+          dtu_read(CSR_SCONTEXT), 0x3FFFFFFF);
+    dtu_cp0_write(CSR_SCONTEXT, 0xFFFFFFFFFFFF);
+    check(dtu_read(CSR_SCONTEXT) == (0xFFFFFFFFFFFFULL & 0x3FFFFFFFFULL),
+          "scontext: high bits dropped", dtu_read(CSR_SCONTEXT), 0xFFFFFFFFFFFFULL & 0x3FFFFFFFFULL);
+    test_result("T16 tcontrol MTE/MPTE + mcontext(13b)/scontext(34b) storage");
+}
+
+//=============================================================================
 // main
 //=============================================================================
 int main(int argc, char **argv) {
@@ -472,6 +624,10 @@ int main(int argc, char **argv) {
     test_wr_rx_dscratch0();
     test_halted_and_havereset();
     test_dm_passthrough();
+    test_trigger_reset_state();
+    test_tselect_clamp();
+    test_tdata1_readback();
+    test_tcontrol_mcontext_scontext();
 
     printf("[dtu_tb] %llu cycles, %d failure(s)\n",
            (unsigned long long)g_cycles, g_fail);

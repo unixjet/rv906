@@ -1349,35 +1349,30 @@ module CSR #(
     assign cp0_lsu_mpp       = mpp_field;
 
     //=========================================================================
-    // SECTION DEBUG TRIGGERS (M4 Task 1: zero-trigger escape hatch, D-M4-5;
-    // real triggers arrive at M7). tselect/tdata1/tdata2/tdata3/tcontrol are
-    // the ZERO-TRIGGER configuration of the debug spec: tselect hardwired 0
-    // and tdata* read back 0, so rv64mi-p-breakpoint's "unsupported type"
-    // skip fires (csrr tdata1 returns 0 != the written mcontrol value). The
-    // addresses exist (writes are accepted-but-ignored, no illegal trap, so
-    // the test's "csrs tcontrol may trap" branch is free to fall through);
-    // the real trigger registers are built at M7. Donor aq_cp0_regs.v:826-831
-    // (addresses 0x7A0-0x7A5).
+    // SECTION DEBUG TRIGGERS (M7 Task 2: real triggers, D-M7-5). The M4
+    // zero-trigger escape hatch (tselect/tdata* hardwired 0) is replaced by
+    // cp0<->dtu routing, same style as the 0x7B0-0x7B3 debug-mode CSRs below:
+    // 0x7A0-0x7AA route through the cp0_dtu_* port to rtl/DTU.v, which owns
+    // the trigger storage/comparators and returns the readback on
+    // dtu_cp0_rdata. Donor aq_cp0_regs.v:826-831 / aq_dtu_trigger_module.v.
     //=========================================================================
-    wire [63:0] tselect_value  = 64'd0;
-    wire [63:0] tdata1_value   = 64'd0;
-    wire [63:0] tdata2_value   = 64'd0;
-    wire [63:0] tdata3_value   = 64'd0;
-    wire [63:0] tcontrol_value = 64'd0;
 
     //=========================================================================
     // SECTION DEBUG-MODE CSRs (M7 Task 1): dcsr/dpc/dscratch0/dscratch1
-    // (0x7B0-0x7B3) route through the cp0<->dtu port to rtl/DTU.v (donor
-    // aq_cp0_iui.v:858-860's cp0_dtu_* fan-out + aq_dtu_ctrl.v:581-606's
-    // read mux). The DTU does the debug-mode (dbgon) write gating itself
-    // (aq_dtu_ctrl.v:314-317); the [9:8]==11 privilege check is the existing
-    // csr_priv_bad below (M-only), unchanged. Reads return the DTU's value
-    // in ANY privilege mode that passes csr_priv_bad (the 0.13 "accessible
-    // in debug mode only" rule bites as "writes dropped, reads of
-    // reset-value 0/xdebugver outside debug", exactly the donor).
+    // (0x7B0-0x7B3) + debug triggers (M7 Task 2: 0x7A0-0x7AA) route through
+    // the cp0<->dtu port to rtl/DTU.v (donor aq_cp0_iui.v:858-860's
+    // cp0_dtu_* fan-out + aq_dtu_ctrl.v:581-606's read mux). The DTU does the
+    // debug-mode (dbgon) write gating itself (aq_dtu_ctrl.v:314-317); the
+    // [9:8]==11 privilege check is the existing csr_priv_bad below (M-only),
+    // unchanged. Reads return the DTU's value in ANY privilege mode that
+    // passes csr_priv_bad.
     //=========================================================================
     wire csr_dtu_addr = (csr_addr == CSR_DCSR) || (csr_addr == CSR_DPC)
-                     || (csr_addr == CSR_DSCRATCH0) || (csr_addr == CSR_DSCRATCH1);
+                     || (csr_addr == CSR_DSCRATCH0) || (csr_addr == CSR_DSCRATCH1)
+                     || (csr_addr == CSR_TSELECT) || (csr_addr == CSR_TDATA1)
+                     || (csr_addr == CSR_TDATA2) || (csr_addr == CSR_TDATA3)
+                     || (csr_addr == CSR_TINFO)   || (csr_addr == CSR_TCONTROL)
+                     || (csr_addr == CSR_MCONTEXT) || (csr_addr == CSR_SCONTEXT);
     assign cp0_dtu_addr  = csr_addr;
     assign cp0_dtu_wdata = csr_wdata;
     assign cp0_dtu_wreg  = csr_wen && csr_dtu_addr;
@@ -1655,11 +1650,17 @@ module CSR #(
             CSR_CYCLE:      csr_read_mux = mcycle_reg;
             CSR_TIME:       csr_read_mux = mtime;
             CSR_INSTRET:    csr_read_mux = minstret_reg;
-            CSR_TSELECT:    csr_read_mux = tselect_value;
-            CSR_TDATA1:     csr_read_mux = tdata1_value;
-            CSR_TDATA2:     csr_read_mux = tdata2_value;
-            CSR_TDATA3:     csr_read_mux = tdata3_value;
-            CSR_TCONTROL:   csr_read_mux = tcontrol_value;
+            // M7 Task 2: trigger CSRs (0x7A0-0x7AA) read from the DTU, same
+            // style as the debug-mode arms below; the M4 zero-trigger
+            // tselect_value/tdata*_value/tcontrol_value wires are gone.
+            CSR_TSELECT:    csr_read_mux = dtu_cp0_rdata;
+            CSR_TDATA1:     csr_read_mux = dtu_cp0_rdata;
+            CSR_TDATA2:     csr_read_mux = dtu_cp0_rdata;
+            CSR_TDATA3:     csr_read_mux = dtu_cp0_rdata;
+            CSR_TINFO:      csr_read_mux = dtu_cp0_rdata;
+            CSR_TCONTROL:   csr_read_mux = dtu_cp0_rdata;
+            CSR_MCONTEXT:   csr_read_mux = dtu_cp0_rdata;
+            CSR_SCONTEXT:   csr_read_mux = dtu_cp0_rdata;
             // M7 Task 1: debug-mode CSRs read from the DTU (aq_dtu_ctrl.v
             // :599-606 read mux). All four share the same dtu_cp0_rdata bus;
             // the DTU's own addr-mux picks the register.

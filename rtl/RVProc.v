@@ -285,6 +285,7 @@ module RVProc #(
     wire [1:0]               ifu_idu_id_bht_pred;
     wire                     ifu_idu_id_fault_pgflt;    // M4 Task 6
     wire                     ifu_idu_id_fault_accflt;   // M4 Task 6
+    wire [TDT_HINFO_WIDTH-1:0] ifu_idu_id_halt_info;    // M7 Task 2
     wire                     idu_ifu_id_stall;
 
     //=========================================================================
@@ -496,6 +497,8 @@ module RVProc #(
     wire [63:0]              lsu_rtu_tval;
     wire                     lsu_rtu_async_expt_vld;
     wire                     lsu_rtu_async_ld_inst;
+    wire                     lsu_rtu_lr_vld_unused;   // M3 lr/sc export, no RTU consumer
+    wire [4:0]               lsu_rtu_sc_res_unused;   // M3 lr/sc export, no RTU consumer
 
     wire                     rtu_lsu_expt_ack;
     wire                     rtu_lsu_expt_exit;
@@ -596,7 +599,42 @@ module RVProc #(
     wire [63:0]              tdt_dm_dtu_wdata          = 64'd0;
     // DTU -> HPCP (no HPCP in rv906; dangling, D-M7-10)
     wire                     dtu_hpcp_dcsr_stopcount;
-    wire                     dtu_rtu_pending_tval_unused;
+    wire [63:0]              dtu_rtu_pending_tval_unused;
+
+    //=========================================================================
+    // M7 Task 2: trigger-channel nets (DTU <-> IFU/IDU/IU/LSU/RTU).
+    // Execute path: IFU feeds the fetch PC to the DTU, the DTU's verdict
+    // latches onto the ibuf entry, rides IDU EX1 -> (IU pass-through) ->
+    // RTU ex2_halt_info. Ldst path: LSU feeds the AG access to the DTU,
+    // the DTU's verdict latches onto the DC transaction and rides the
+    // LSU's cmplt_dp back to the RTU. All reset-constant 0 at reset
+    // (no triggers armed -> no matches -> off-path identity).
+    //=========================================================================
+    // DTU <-> IFU (execute)
+    wire [PC_WIDTH-1:0]      ifu_dtu_exe_addr;
+    wire                     ifu_dtu_exe_addr_vld;
+    wire [TDT_HINFO_WIDTH-1:0] dtu_ifu_halt_info;
+    wire                     dtu_ifu_halt_info_vld;
+    // IDU -> IU -> RTU (execute carrier)
+    wire [TDT_HINFO_WIDTH-1:0] idu_iu_ex1_halt_info;
+    wire [TDT_HINFO_WIDTH-1:0] iu_rtu_ex1_halt_info;
+    // DTU <-> LSU (ldst)
+    wire [PC_WIDTH-1:0]      lsu_dtu_ldst_addr;
+    wire                     lsu_dtu_ldst_addr_vld;
+    wire [63:0]              lsu_dtu_ldst_data;
+    wire                     lsu_dtu_ldst_data_vld;
+    wire [1:0]               lsu_dtu_ldst_type;
+    wire [15:0]              lsu_dtu_ldst_bytes_vld;
+    wire [2:0]               lsu_dtu_mem_access_size;
+    wire [TDT_HINFO_WIDTH-1:0] dtu_lsu_halt_info;
+    wire                     dtu_lsu_halt_info_vld;
+    wire                     dtu_lsu_addr_trig_en;
+    wire                     dtu_lsu_data_trig_en;
+    wire [TDT_HINFO_WIDTH-1:0] lsu_rtu_ex1_halt_info;
+    // RTU <-> DTU (pending + retire feedback)
+    wire                     dtu_rtu_pending_halt;
+    wire [TDT_HINFO_WIDTH-1:0] rtu_dtu_retire_halt_info;
+    wire                     rtu_dtu_pending_ack;
 
     //=========================================================================
     // RTU <-> IDU : the exclusive bypass network (fwd0/1/2 + wb0/1, IDU
@@ -739,6 +777,7 @@ module RVProc #(
         .ifu_idu_id_bht_pred     (ifu_idu_id_bht_pred),
         .ifu_idu_id_fault_pgflt  (ifu_idu_id_fault_pgflt),
         .ifu_idu_id_fault_accflt (ifu_idu_id_fault_accflt),
+        .ifu_idu_id_halt_info    (ifu_idu_id_halt_info),
         .idu_ifu_id_stall        (idu_ifu_id_stall),
 
         .pcgen_icache_va         (pcgen_icache_va),
@@ -796,6 +835,12 @@ module RVProc #(
         .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon),
         .dtu_ifu_halt_on_reset   (dtu_ifu_halt_on_reset),
         .ifu_rtu_reset_halt_req  (ifu_rtu_reset_halt_req),
+
+        // M7 Task 2: DTU execute-trigger channel
+        .ifu_dtu_exe_addr        (ifu_dtu_exe_addr),
+        .ifu_dtu_exe_addr_vld    (ifu_dtu_exe_addr_vld),
+        .dtu_ifu_halt_info       (dtu_ifu_halt_info),
+        .dtu_ifu_halt_info_vld   (dtu_ifu_halt_info_vld),
 
         .cp0_xx_mrvbr            (cp0_xx_mrvbr)
     );
@@ -922,6 +967,7 @@ module RVProc #(
         .ifu_idu_id_bht_pred     (ifu_idu_id_bht_pred),
         .ifu_idu_id_fault_pgflt  (ifu_idu_id_fault_pgflt),
         .ifu_idu_id_fault_accflt (ifu_idu_id_fault_accflt),
+        .ifu_idu_id_halt_info    (ifu_idu_id_halt_info),
         .idu_ifu_id_stall        (idu_ifu_id_stall),
 
         .idu_iu_ex1_inst_vld     (idu_iu_ex1_inst_vld),
@@ -943,6 +989,7 @@ module RVProc #(
         .idu_iu_ex1_src0_reg     (idu_iu_ex1_src0_reg),
         .idu_iu_ex1_src1_reg     (idu_iu_ex1_src1_reg),
         .idu_iu_ex1_inst_len     (idu_iu_ex1_inst_len),
+        .idu_iu_ex1_halt_info    (idu_iu_ex1_halt_info),
 
         .idu_lsu_ex1_dp_sel      (idu_lsu_ex1_dp_sel),
         .idu_lsu_ex1_sel         (idu_lsu_ex1_sel),
@@ -1053,6 +1100,7 @@ module RVProc #(
         .idu_iu_ex1_src0_reg     (idu_iu_ex1_src0_reg),
         .idu_iu_ex1_src1_reg     (idu_iu_ex1_src1_reg),
         .idu_iu_ex1_inst_len     (idu_iu_ex1_inst_len),
+        .idu_iu_ex1_halt_info    (idu_iu_ex1_halt_info),
 
         .iu_idu_mult_issue_stall (iu_idu_mult_issue_stall),
         .iu_idu_mult_full        (iu_idu_mult_full),
@@ -1080,6 +1128,7 @@ module RVProc #(
         .iu_rtu_ex1_branch_inst  (iu_rtu_ex1_branch_inst),
         .iu_rtu_ex1_cur_pc       (iu_rtu_ex1_cur_pc),
         .iu_rtu_ex1_next_pc      (iu_rtu_ex1_next_pc),
+        .iu_rtu_ex1_halt_info    (iu_rtu_ex1_halt_info),
         .iu_rtu_ex2_bju_ras_mispred (iu_rtu_ex2_bju_ras_mispred),
         .iu_rtu_depd_lsu_chgflow_vld (iu_rtu_depd_lsu_chgflow_vld),
         .iu_rtu_depd_lsu_chgflow_next_pc (iu_rtu_depd_lsu_chgflow_next_pc),
@@ -1216,6 +1265,7 @@ module RVProc #(
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
         .lsu_rtu_ex1_cur_pc      (lsu_rtu_ex1_cur_pc),
         .lsu_rtu_ex1_next_pc     (lsu_rtu_ex1_next_pc),
+        .lsu_rtu_ex1_halt_info   (lsu_rtu_ex1_halt_info),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
@@ -1228,6 +1278,21 @@ module RVProc #(
         .lsu_rtu_tval            (lsu_rtu_tval),
         .lsu_rtu_async_expt_vld  (lsu_rtu_async_expt_vld),
         .lsu_rtu_async_ld_inst   (lsu_rtu_async_ld_inst),
+        .lsu_rtu_lr_vld          (lsu_rtu_lr_vld_unused),
+        .lsu_rtu_sc_res          (lsu_rtu_sc_res_unused),
+
+        // M7 Task 2: LSU <-> DTU (ldst triggers)
+        .lsu_dtu_ldst_addr        (lsu_dtu_ldst_addr),
+        .lsu_dtu_ldst_addr_vld    (lsu_dtu_ldst_addr_vld),
+        .lsu_dtu_ldst_data        (lsu_dtu_ldst_data),
+        .lsu_dtu_ldst_data_vld    (lsu_dtu_ldst_data_vld),
+        .lsu_dtu_ldst_type        (lsu_dtu_ldst_type),
+        .lsu_dtu_ldst_bytes_vld   (lsu_dtu_ldst_bytes_vld),
+        .lsu_dtu_mem_access_size  (lsu_dtu_mem_access_size),
+        .dtu_lsu_halt_info        (dtu_lsu_halt_info),
+        .dtu_lsu_halt_info_vld    (dtu_lsu_halt_info_vld),
+        .dtu_lsu_addr_trig_en     (dtu_lsu_addr_trig_en),
+        .dtu_lsu_data_trig_en     (dtu_lsu_data_trig_en),
 
         .rtu_lsu_expt_ack        (rtu_lsu_expt_ack),
         .rtu_lsu_expt_exit       (rtu_lsu_expt_exit),
@@ -1326,6 +1391,7 @@ module RVProc #(
         .iu_rtu_ex1_branch_inst  (iu_rtu_ex1_branch_inst),
         .iu_rtu_ex1_cur_pc       (iu_rtu_ex1_cur_pc),
         .iu_rtu_ex1_next_pc      (iu_rtu_ex1_next_pc),
+        .iu_rtu_ex1_halt_info    (iu_rtu_ex1_halt_info),
         .iu_rtu_ex2_bju_ras_mispred (iu_rtu_ex2_bju_ras_mispred),
         .iu_rtu_depd_lsu_chgflow_vld (iu_rtu_depd_lsu_chgflow_vld),
         .iu_rtu_depd_lsu_chgflow_next_pc (iu_rtu_depd_lsu_chgflow_next_pc),
@@ -1358,6 +1424,7 @@ module RVProc #(
         .lsu_rtu_ex1_inst_len    (lsu_rtu_ex1_inst_len),
         .lsu_rtu_ex1_cur_pc      (lsu_rtu_ex1_cur_pc),
         .lsu_rtu_ex1_next_pc     (lsu_rtu_ex1_next_pc),
+        .lsu_rtu_ex1_halt_info   (lsu_rtu_ex1_halt_info),
         .lsu_rtu_wb_data         (lsu_rtu_wb_data),
         .lsu_rtu_wb_preg         (lsu_rtu_wb_preg),
         .lsu_rtu_wb_vld          (lsu_rtu_wb_vld),
@@ -1393,6 +1460,7 @@ module RVProc #(
         .dtu_rtu_int_mask        (dtu_rtu_int_mask),
         .dtu_rtu_ebreak_action   (),                    // not consumed by RTU (see RTU.v header)
         .dtu_rtu_dpc             (dtu_rtu_dpc),
+        .dtu_rtu_pending_halt    (dtu_rtu_pending_halt),
         .cp0_rtu_ebreak_halt     (cp0_rtu_ebreak_halt),
         .cp0_rtu_ex1_inst_dret   (cp0_rtu_ex1_inst_dret),
         .ifu_rtu_reset_halt_req  (ifu_rtu_reset_halt_req),
@@ -1402,6 +1470,8 @@ module RVProc #(
         .rtu_dtu_halt_cause      (rtu_dtu_halt_cause),
         .rtu_dtu_retire_vld      (rtu_dtu_retire_vld),
         .rtu_dtu_retire_debug_expt_vld (rtu_dtu_retire_debug_expt_vld),
+        .rtu_dtu_retire_halt_info (rtu_dtu_retire_halt_info),
+        .rtu_dtu_pending_ack     (rtu_dtu_pending_ack),
 
         // M6 Task 2: connect interrupt claim export to RTU consumer leg
         .cp0_rtu_int_sel         (cp0_rtu_int_sel),
@@ -1636,7 +1706,29 @@ module RVProc #(
         .dtu_rtu_int_mask             (dtu_rtu_int_mask),
         .dtu_rtu_ebreak_action        (dtu_rtu_ebreak_action),
         .dtu_rtu_dpc                  (dtu_rtu_dpc),
+        .dtu_rtu_pending_halt         (dtu_rtu_pending_halt),
         .dtu_rtu_pending_tval         (dtu_rtu_pending_tval_unused),
+        .rtu_dtu_retire_halt_info     (rtu_dtu_retire_halt_info),
+        .rtu_dtu_pending_ack          (rtu_dtu_pending_ack),
+
+        // M7 Task 2: IFU <-> DTU (execute triggers)
+        .ifu_dtu_exe_addr             (ifu_dtu_exe_addr),
+        .ifu_dtu_exe_addr_vld         (ifu_dtu_exe_addr_vld),
+        .dtu_ifu_halt_info            (dtu_ifu_halt_info),
+        .dtu_ifu_halt_info_vld        (dtu_ifu_halt_info_vld),
+
+        // M7 Task 2: LSU <-> DTU (ldst triggers)
+        .lsu_dtu_ldst_addr            (lsu_dtu_ldst_addr),
+        .lsu_dtu_ldst_addr_vld        (lsu_dtu_ldst_addr_vld),
+        .lsu_dtu_ldst_data            (lsu_dtu_ldst_data),
+        .lsu_dtu_ldst_data_vld        (lsu_dtu_ldst_data_vld),
+        .lsu_dtu_ldst_type            (lsu_dtu_ldst_type),
+        .lsu_dtu_ldst_bytes_vld       (lsu_dtu_ldst_bytes_vld),
+        .lsu_dtu_mem_access_size  (lsu_dtu_mem_access_size),
+        .dtu_lsu_halt_info            (dtu_lsu_halt_info),
+        .dtu_lsu_halt_info_vld        (dtu_lsu_halt_info_vld),
+        .dtu_lsu_addr_trig_en         (dtu_lsu_addr_trig_en),
+        .dtu_lsu_data_trig_en         (dtu_lsu_data_trig_en),
 
         // DTU -> IFU
         .dtu_ifu_debug_inst           (dtu_ifu_debug_inst),

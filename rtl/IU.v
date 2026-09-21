@@ -177,6 +177,12 @@ module IU (
     // in IDU's EX1. Drives BJU's RVC-aware PC increment and the real
     // iu_rtu_ex1_{alu,bju}_inst_len. Donor ref: aq_iu_bju.v:127.
     input  wire                     idu_iu_ex1_inst_len,
+    // M7 Task 2: the EX1-resident instruction's execute-trigger halt_info
+    // (IDU's ex1_halt_info_r). Pure pass-through to the RTU -- see the
+    // IDU-side note for why the combinational (unlatched) style is correct
+    // across multi-cycle IU residency (ctrl_ex1_eu_full holds the IDU's
+    // EX1 reload, so the value is stable every dp cycle).
+    input  wire [TDT_HINFO_WIDTH-1:0] idu_iu_ex1_halt_info,
 
     //=========================================================================
     // IU -> IDU : point-to-point stall/full signals (contract 8; confirmed
@@ -215,6 +221,10 @@ module IU (
     output wire                     iu_rtu_ex1_branch_inst,
     output wire [PC_WIDTH-1:0]      iu_rtu_ex1_cur_pc,
     output wire [PC_WIDTH-1:0]      iu_rtu_ex1_next_pc,
+    // M7 Task 2: the EX1-resident instruction's execute-trigger halt_info,
+    // piped to the RTU's EX1->EX2 retire packet (the donor's
+    // dp_ex1_halt_info, aq_rtu_dp.v). Pass-through of idu_iu_ex1_halt_info.
+    output wire [TDT_HINFO_WIDTH-1:0] iu_rtu_ex1_halt_info,
     output wire                     iu_rtu_ex2_bju_ras_mispred,
     output wire                     iu_rtu_depd_lsu_chgflow_vld,
     output wire [PC_WIDTH-1:0]      iu_rtu_depd_lsu_chgflow_next_pc,
@@ -972,6 +982,8 @@ module IU (
                                               || bju_entry_vld_r;
     assign iu_rtu_ex1_cur_pc               = bju_pcgen_pc;
     assign iu_rtu_ex1_next_pc              = bju_next_pc;
+    // M7 Task 2: halt_info pass-through (see the port note above).
+    assign iu_rtu_ex1_halt_info            = idu_iu_ex1_halt_info;
     assign iu_rtu_ex2_bju_ras_mispred      = 1'b0;   // no RAS-target-compare input, see header
     assign iu_rtu_depd_lsu_chgflow_vld     = bju_entry_pop && bju_cond_br_mispred;
     assign iu_rtu_depd_lsu_chgflow_next_pc = bju_not_pred_pc;

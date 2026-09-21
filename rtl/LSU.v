@@ -168,6 +168,14 @@ module LSU #(
     // always the dp'ing op's. Valid on every `lsu_rtu_ex1_cmplt_dp` leg.
     output wire [PC_WIDTH-1:0]      lsu_rtu_ex1_cur_pc,
     output wire [PC_WIDTH-1:0]      lsu_rtu_ex1_next_pc,
+    // M7 Task 2: the replying op's ldst-trigger halt_info (the DTU's 22-bit
+    // TDT_HINFO bundle), valid on every `lsu_rtu_ex1_cmplt_dp` leg -- the
+    // AG-issue match for a trap-at-issue op, the issue-time latch
+    // (dc_halt_info_r) for a normal ST_REPLY, 0 for LFB-retire/drain/prefetch
+    // and for the AG-fault legs (misalign/MMU-fault keep their own
+    // exceptions; see the assign below). The RTU latches it into its
+    // ex2_halt_info retire packet.
+    output wire [TDT_HINFO_WIDTH-1:0] lsu_rtu_ex1_halt_info,
     output wire [63:0]              lsu_rtu_wb_data,
     output wire [GPR_IDX_WIDTH-1:0] lsu_rtu_wb_preg,
     output wire                     lsu_rtu_wb_vld,
@@ -186,6 +194,35 @@ module LSU #(
     // M3 Task 1: LR.W / SC.W foundation outputs
     output wire                     lsu_rtu_lr_vld,
     output wire [4:0]               lsu_rtu_sc_res,   // 0=success(commit), 1=fail
+
+    //=========================================================================
+    // M7 Task 2: DTU ldst-trigger channel. OUT (LSU -> DTU): the AG-stage
+    // access the DTU's mcontrol load/store comparators must judge -- the
+    // physical address (ag_pa), the store data (for select=1 data-matching
+    // triggers; loads present 0 with data_vld=0), the 2-bit type (donor
+    // aq_dtu_trigger_module.v:247-250: bit0=store, bit1=load), the 16-bit
+    // byte-enable map and the access size. IN (DTU -> LSU): the DTU's
+    // verdict bundle (dtu_lsu_halt_info[_vld] -- asserted on ANY ldst
+    // trigger match, either timing) plus the two store-suppression enables
+    // (dtu_lsu_addr_trig_en/_data_trig_en: a timing-0 matched store trigger,
+    // address- or data-matching) that gate the store commit points below.
+    // The timing-0 match's primary suppression is the trap-at-issue
+    // exception (trig_fault_issue, SECTION AG below -- the donor's own
+    // ag_pipe_dt_cancel mechanism, aq_lsu_ag.v:1372-1374,1432: the access
+    // traps at AG and never enters the DC FSM), the trig_en gates are the
+    // donor's commit-side CANCEL consumption kept as defense-in-depth.
+    //=========================================================================
+    output wire [PC_WIDTH-1:0]      lsu_dtu_ldst_addr,
+    output wire                     lsu_dtu_ldst_addr_vld,
+    output wire [63:0]              lsu_dtu_ldst_data,
+    output wire                     lsu_dtu_ldst_data_vld,
+    output wire [1:0]               lsu_dtu_ldst_type,
+    output wire [15:0]              lsu_dtu_ldst_bytes_vld,
+    output wire [2:0]               lsu_dtu_mem_access_size,
+    input  wire [TDT_HINFO_WIDTH-1:0] dtu_lsu_halt_info,
+    input  wire                     dtu_lsu_halt_info_vld,
+    input  wire                     dtu_lsu_addr_trig_en,
+    input  wire                     dtu_lsu_data_trig_en,
 
     //=========================================================================
     // RTU -> LSU : "point of no return" acks (RTU note S6) -- also the
@@ -601,6 +638,30 @@ module LSU #(
     wire [7:0]  ag_byte_mask = ag_byte_mask_raw << ag_byte_off;
     wire [63:0] ag_store_data_positioned = ag_src2_data_eff << ({61'b0, ag_byte_off} * 8);
 
+    // M7 Task 2: DTU ldst-trigger feed (see the DTU port group note). The
+    // DTU judges the access on issue_real -- the SAME cycle AG actually
+    // issues it (the cycle misalign_issue/mmu_fault_issue fire) -- and the
+    // verdict latches onto the transaction with the dc_*_r latches below.
+    // Forward wire reference to issue_real (declared in the FSM section
+    // below), the same convention this file's own IFU sibling uses.
+    assign lsu_dtu_ldst_addr        = ag_pa;
+    assign lsu_dtu_ldst_addr_vld    = issue_real;
+    assign lsu_dtu_ldst_data        = ag_store_data_positioned;
+    assign lsu_dtu_ldst_data_vld    = issue_real && ag_is_store;
+    // Donor aq_dtu_trigger_module.v:247-250: type bit0=store, bit1=load;
+    // aq_lsu_dtif.v:517-519: an AMO presents BOTH bits (2'b11) at the addr
+    // check so either an ld- or st-trigger can match it. (ag_func_eff[0] is
+    // not a reliable store flag for AMOs -- funct3[0] encodes the AMO op --
+    // hence the explicit ag_is_amo_c term.)
+    assign lsu_dtu_ldst_type        = ag_is_amo_c ? 2'b11 : (ag_is_store ? 2'b01 : 2'b10);
+    // 16-bit byte-enable map (the donor's vector width); scalar ops use
+    // the low 8 (little-endian, byte 0 in the low bits). Not consumed by
+    // the DTU's scalar comparators in this build.
+    assign lsu_dtu_ldst_bytes_vld   = {8'b0, ag_byte_mask};
+    // Forwarded as-is (not consumed by the DTU in this build); ag_size is
+    // the LSU-local 00=B/01=H/10=W/11=D encoding.
+    assign lsu_dtu_mem_access_size  = {1'b0, ag_size};
+
     //-------------------------------------------------------------------------
     // BYTE-MASK EXPANSION (LSU note A4/A5 -- shared by store-into-STB merge
     // and STB-forward-into-load merge).
@@ -667,6 +728,16 @@ module LSU #(
     // here using the already-latched dc_hit_r/dc_way_vld_r/dc_way_dirty_r
     // and retry once the background refill's miss_state frees up.
     reg            dc_wait_lfb_r;
+    // M7 Task 2: the in-flight op's ldst-trigger halt_info bundle, latched
+    // at the ST_IDLE->ST_DCS issue alongside dc_pc_full_r; read back on the
+    // ST_REPLY leg of lsu_rtu_ex1_halt_info below (the timing-1 trigger's
+    // action fires at the completion, so the verdict must survive the
+    // multi-cycle DC pipe).
+    reg  [TDT_HINFO_WIDTH-1:0] dc_halt_info_r;
+    // M7 Task 2: the in-flight op's store-suppression flag from the DTU's
+    // dtu_lsu_{addr,data}_trig_en enables (see the dc_store_cancel_r reset
+    // comment for why it is provably 0 with the trap-at-issue path).
+    reg  dc_store_cancel_r;
 
     //-------------------------------------------------------------------------
     // SECTION LR/SC (M3 Task 1) -- 1-entry load-reserved buffer for LR.W / SC.W
@@ -1090,7 +1161,24 @@ module LSU #(
     wire mmu_fault_issue = issue_real && !ag_misalign
                           && (mmu_lsu_page_fault || mmu_lsu_access_fault);
 
-    wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign && !mmu_fault_issue)
+    // M7 Task 2 (donor ag_pipe_dt_cancel, aq_lsu_ag.v:1372-1374,1432): a
+    // timing-0 ldst trigger match traps at ISSUE exactly like a misaligned
+    // access or a DTLB fault -- the access never enters the DC FSM, so no
+    // array/STB/AXI state is ever created for it. That IS the store
+    // suppression (a triggered store commits nothing), and it is what keeps
+    // a triggered load's data from ever reaching the writeback. The CANCEL
+    // bit (DTU bundle, donor ldst_cancel) is set for exactly these matches
+    // (timing-0, either access type, either action), so no ACTION decode is
+    // needed here: action-0 takes the vec-3 trap (RTU leg 4), action-1
+    // takes the timing-0 trigger halt (RTU halt_req_trigger_t0), which
+    // outranks the trap (RTU retire_trap_vld is gated by !halt_req).
+    // misalign/MMU-fault keep their own exceptions (checked first in the
+    // vec ladder) -- a faulting access is not ALSO a trigger.
+    wire trig_fault_issue = issue_real && !ag_misalign && !mmu_fault_issue
+                           && dtu_lsu_halt_info_vld
+                           && dtu_lsu_halt_info[TDT_HINFO_CANCEL];
+
+    wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign && !mmu_fault_issue && !trig_fault_issue)
                         : issue_drain ? stb_was_hit[drain_pick]
                         : 1'b0;
 
@@ -1138,13 +1226,28 @@ module LSU #(
             frz_is_direct_r <= 1'b0;
             dc_touched_array_r <= 1'b0;
             dc_wait_lfb_r   <= 1'b0;
+            // M7 Task 2: the op's ldst-trigger verdict, latched at issue
+            // (the DTU's CANCEL/timing/action bits) so the LATE ST_REPLY
+            // leg of lsu_rtu_ex1_halt_info carries it to the RTU's retire
+            // packet (a timing-1 trigger's action fires at completion).
+            dc_halt_info_r    <= {TDT_HINFO_WIDTH{1'b0}};
+            // M7 Task 2: store-suppression latch from the DTU's trig_en
+            // enables. With the trap-at-issue path above a timing-0 store
+            // trigger never REACHES ST_DCS, so this is provably 0 on the
+            // primary path -- it exists as the donor's commit-side CANCEL
+            // consumption (defense-in-depth gate on the store commit
+            // points below, see the u_dc_req_wr/frz/STB notes).
+            dc_store_cancel_r <= 1'b0;
         end else begin
             case (state)
                 ST_IDLE: begin
                     // M4 Task 5: a DTLB fault (mmu_fault_issue) traps at
                     // issue exactly like a misaligned access -- excluded
                     // here so it never enters ST_DCS/touches the array.
-                    if (issue_real && !ag_misalign && !mmu_fault_issue) begin
+                    // M7 Task 2: a timing-0 trigger match (trig_fault_issue)
+                    // the same way -- it traps at issue (vec 3 via the RTU)
+                    // and the access never reaches the array/STB/AXI.
+                    if (issue_real && !ag_misalign && !mmu_fault_issue && !trig_fault_issue) begin
                         dc_is_store_r   <= ag_is_store;
                         dc_plain_ld_r   <= ag_is_plain_ld;
                         dc_sign_ext_r   <= ag_sign_ext;
@@ -1170,6 +1273,9 @@ module LSU #(
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
                         dc_touched_array_r <= touches_array;
+                        dc_halt_info_r    <= dtu_lsu_halt_info_vld ? dtu_lsu_halt_info
+                                                                   : {TDT_HINFO_WIDTH{1'b0}};
+                        dc_store_cancel_r <= dtu_lsu_addr_trig_en || dtu_lsu_data_trig_en;
                         state <= ST_DCS;
                     end else if (issue_drain) begin
                         dc_is_store_r   <= 1'b1;
@@ -1181,6 +1287,12 @@ module LSU #(
                         dc_is_drain_r   <= 1'b1;
                         dc_drain_idx_r  <= drain_pick;
                         dc_touched_array_r <= touches_array;
+                        // M7 Task 2: a drain is not an instruction -- no
+                        // trigger verdict of its own (its ST_REPLY leg never
+                        // fires lsu_rtu_ex1_cmplt_dp, but zero anyway so no
+                        // stale verdict can leak into lsu_rtu_ex1_halt_info).
+                        dc_halt_info_r    <= {TDT_HINFO_WIDTH{1'b0}};
+                        dc_store_cancel_r <= 1'b0;
                         state <= ST_DCS;
                     end
                 end
@@ -2405,7 +2517,13 @@ module LSU #(
                                 : (issue_drain ? stb_way[drain_pick] : {WAYS{1'b0}}));
     assign u_dc_req_wr        = frz_issue_commit ? 1'b1 : ((frz_issue_lfb_peek || frz_issue_vpeek) ? 1'b0
                                 : (ptw_sv_probe_fire ? 1'b0
-                                : (issue_drain ? 1'b1 : ag_is_store)));
+                                // M7 Task 2: the DTU's store-suppression latch
+                                // (provably 0 with the trap-at-issue path --
+                                // a triggered store never reaches ST_DCS --
+                                // kept as the donor's commit-side CANCEL
+                                // consumption, see the dc_store_cancel_r
+                                // reset comment).
+                                : (issue_drain ? 1'b1 : (ag_is_store && !dc_store_cancel_r))));
     assign u_dc_req_alloc     = frz_issue_commit;
     assign u_dc_req_wdata      = frz_issue_commit ? frz_rdata_r
                                 : (issue_drain ? ({448'b0, stb_data[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 64))
@@ -2414,7 +2532,7 @@ module LSU #(
                                 : (issue_drain ? ({56'b0, stb_byte_vld[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 8))
                                 : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8)));
     assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (ptw_sv_probe_fire ? 1'b0
-                                : (issue_drain ? 1'b1 : ag_is_store));
+                                : (issue_drain ? 1'b1 : (ag_is_store && !dc_store_cancel_r)));
     assign u_dc_req_index      = frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit ? frz_eff_index
                                 : clean_req ? clean_set
                                 : ptw_sv_probe_fire ? ptw_sv_req_index
@@ -2850,8 +2968,15 @@ module LSU #(
             // back payload (SC data / amo_new_c) first exists at REPLY
             // and rides the drain as its only memory path (uncached
             // included).
-            if ((reply_is_store && !reply_is_misalign && store_line_resident)
-                || reply_is_sc_commit || reply_is_amo_commit) begin
+            // M7 Task 2: dc_store_cancel_r (the DTU's store-suppression
+            // latch) gates this STB create-or-merge too -- the last of the
+            // three store commit points (array write, this STB entry, and
+            // the FRZ direct-AXI write, which is gated upstream by the
+            // trap-at-issue path keeping a triggered store out of ST_FRZ
+            // entirely). Provably 0 here with the trap-at-issue path; kept
+            // for the donor's commit-side CANCEL parity.
+            if (((reply_is_store && !reply_is_misalign && store_line_resident)
+                 || reply_is_sc_commit || reply_is_amo_commit) && !dc_store_cancel_r) begin
                 if (stb_match_here) begin
                     stb_data[stb_match_idx]     <= (expand_byte_mask(commit_mask) & commit_data)
                                                   | (~expand_byte_mask(commit_mask) & stb_data[stb_match_idx]);
@@ -2897,7 +3022,8 @@ module LSU #(
     assign lsu_rtu_ex1_cmplt_dp   = ((state == ST_REPLY) && reply_can_complete && !dc_is_drain_r)
                                     || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx])   // M3b: deferred-load
                                     || misalign_issue   // M4: misalign traps at AG-issue
-                                    || mmu_fault_issue;  // M4 Task 5: DTLB fault, same shape
+                                    || mmu_fault_issue  // M4 Task 5: DTLB fault, same shape
+                                    || trig_fault_issue;  // M7 Task 2: timing-0 trigger, same shape
                                     // completion; a PREFETCH entry drains silently (no instruction)
     assign lsu_rtu_ex1_cmplt      = lsu_rtu_ex1_cmplt_dp;
     // Task 9.7: the EARLY "for pcgen" completion (donor aq_lsu_ag.v:1675
@@ -2946,17 +3072,31 @@ module LSU #(
     //     ST_REPLY leg: it needs state==ST_IDLE/dc_wait_lfb_r.)
     //   ST_REPLY (the rest): the in-flight DC op's latched pc/len.
     wire [PC_WIDTH-1:0] lsu_reply_pc =
-          (misalign_issue || mmu_fault_issue) ? iu_lsu_ex1_pc
+          (misalign_issue || mmu_fault_issue || trig_fault_issue) ? iu_lsu_ex1_pc
           : lfb_cmplt_fire                    ? lfb_pc[lfb_head_idx]
           :                                     dc_pc_full_r;
     wire lsu_reply_len =
-          (misalign_issue || mmu_fault_issue) ? ag_inst_len_eff
+          (misalign_issue || mmu_fault_issue || trig_fault_issue) ? ag_inst_len_eff
           : lfb_cmplt_fire                    ? lfb_len[lfb_head_idx]
           :                                     dc_inst_len_r;
     assign lsu_rtu_ex1_cur_pc  = lsu_reply_pc;
     assign lsu_rtu_ex1_next_pc = lsu_reply_pc
                                + (lsu_reply_len ? {{(PC_WIDTH-3){1'b0}}, 3'd4}
                                                 : {{(PC_WIDTH-3){1'b0}}, 3'd2});
+    // M7 Task 2: the replying op's trigger verdict, per cmplt_dp leg:
+    //   trig_fault_issue: the LIVE bundle (the op is in AG right now);
+    //   misalign/MMU-fault: 0 -- the fault keeps its own exception (the
+    //     dc_*_r latches hold the PREVIOUS op, and passing this op's live
+    //     match here would make the RTU's leg 4 pre-empt the fault's vec);
+    //   lfb_cmplt_fire: 0 (documented basic gap: a timing-1 trigger match
+    //     on a load that deferred into the LFB is not carried to the
+    //     LFB entry -- no gate test exercises it);
+    //   ST_REPLY: dc_halt_info_r, latched at this op's own AG issue.
+    assign lsu_rtu_ex1_halt_info = trig_fault_issue
+                             ? dtu_lsu_halt_info
+                             : (misalign_issue || mmu_fault_issue || lfb_cmplt_fire)
+                             ? {TDT_HINFO_WIDTH{1'b0}}
+                             : dc_halt_info_r;
 
     assign lsu_rtu_wb_vld  = (reply_is_load && !reply_is_misalign)
                              || (lfb_cmplt_fire && !lfb_pf[lfb_head_idx]);   // prefetch drains silently
@@ -3020,7 +3160,7 @@ module LSU #(
     // M3 Task 1: LR.W / SC.W foundation outputs
     // (lsu_rtu_sc_res is assigned near the SC-match latch above)
 
-    assign lsu_rtu_expt_vld = misalign_issue || mmu_fault_issue
+    assign lsu_rtu_expt_vld = misalign_issue || mmu_fault_issue || trig_fault_issue
                              || (reply_fire && dc_misalign_r);
     // Misaligned SC/AMO/store take the STORE-misalign vector (cause 6 is
     // "Store/AMO address misaligned"); loads/LR take cause 4. At AG-issue the
@@ -3044,10 +3184,17 @@ module LSU #(
                             ? ((ag_is_store || ag_is_amo_c || ag_is_sc_c) ? 5'd6 : 5'd4)
                             : mmu_fault_issue
                             ? mmu_fault_vec
+                            : trig_fault_issue
+                            ? 5'd3   // M7 Task 2: trigger breakpoint (donor's
+                                     // ag_pipe_dt_cancel exception -- the
+                                     // vec-3 the RTU's leg-4 chain agrees
+                                     // with; tval 0 below)
                             : ((dc_is_store_r || sc_addr_set || amo_active) ? 5'd6 : 5'd4);
     // tval = the faulting VA for both trap-at-issue exceptions (design doc
-    // S4.2: "LSU encodes data causes... tval = faulting VA").
-    assign lsu_rtu_tval     = (misalign_issue || mmu_fault_issue) ? ag_addr : dc_addr_r;
+    // S4.2: "LSU encodes data causes... tval = faulting VA"); a trigger
+    // breakpoint carries no tval.
+    assign lsu_rtu_tval     = trig_fault_issue      ? 64'd0
+                            : (misalign_issue || mmu_fault_issue) ? ag_addr : dc_addr_r;
 
     // No async bus-error path is modeled for M2 (the behavioral AXI slave
     // in this test harness never returns a non-OKAY response) -- wired but

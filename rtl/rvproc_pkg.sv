@@ -314,12 +314,42 @@ parameter [11:0] CSR_MCOUNTEREN = 12'h306;
 parameter [11:0] CSR_CYCLE      = 12'hC00;
 parameter [11:0] CSR_TIME       = 12'hC01;   // M6 Task 3: live (CLINT mtime mirror, D-M4-9 discharged)
 parameter [11:0] CSR_INSTRET    = 12'hC02;
-// Debug triggers (M4: zero-trigger escape hatch, D-M4-5; real triggers M7)
+// Debug triggers (M7 Task 2: real triggers, D-M7-5). CSR addresses are the
+// standard RISC-V Debug 0.13 trigger CSRs; storage and comparators live in
+// rtl/DTU.v, CSR.v routes 0x7A0-0x7AA through the cp0<->dtu port.
 parameter [11:0] CSR_TSELECT    = 12'h7A0;
 parameter [11:0] CSR_TDATA1     = 12'h7A1;
 parameter [11:0] CSR_TDATA2     = 12'h7A2;
 parameter [11:0] CSR_TDATA3     = 12'h7A3;
+parameter [11:0] CSR_TINFO      = 12'h7A4;
 parameter [11:0] CSR_TCONTROL   = 12'h7A5;
+parameter [11:0] CSR_MCONTEXT   = 12'h7A8;
+parameter [11:0] CSR_SCONTEXT   = 12'h7AA;
+// M7 Task 2: 22-bit halt_info bundle latched onto an in-flight instruction
+// and delivered to RTU at retire (donor aq_dtu_cfig.h TDT_HINFO_* positions;
+// donor also carries it in the packed id_ex1_t DIS_INT_HINFO field, but the
+// rv906 id_ex1_t drops it -- see the D-M7 note there -- so it rides as
+// separate scalar regs: IFU->IDU->RTU (execute path) and LSU->RTU (ld/st
+// path); RTU ORs the two like donor aq_rtu_dp.v:399-401).
+parameter TDT_HINFO_WIDTH = 22;
+parameter TDT_HINFO_CANCEL      = 0;  // ldst matched AND store: suppress commit
+parameter TDT_HINFO_MATCH       = 1;  // any trigger matched this instruction
+parameter TDT_HINFO_LDST        = 2;  // match came from a load/store trigger
+parameter TDT_HINFO_CHAIN       = 3;  // matched via a chained trigger
+parameter TDT_HINFO_ACTION      = 4;  // action of the matched trigger
+parameter TDT_HINFO_ACTION01    = 5;  // action == 1 (enter debug / halt)
+parameter TDT_HINFO_TIMING      = 6;  // timing bit of the matched trigger
+parameter TDT_HINFO_PENDING_HALT= 7;  // timing-1 halt already armed, waiting
+parameter TDT_HINFO_CAUSE_HI    = 11; // [11:8] exception/cause code when the
+parameter TDT_HINFO_CAUSE_LO    = 8;  //  matched trigger's action is a trap
+parameter TDT_HINFO_TRIGGER_HI  = 21; // [21:12] index of the matched trigger
+parameter TDT_HINFO_TRIGGER_LO  = 12; //  (10 bits, covers all 10 triggers)
+// M7 Task 2: trigger count (donor cpu/rtl/cpu_cfig.h:477-496
+// TDT_TM_MCONTROL_TRI_NUM=8 / TDT_TM_OTHER_TRI_NUM=2). Slots 0-7 are
+// mcontrol (type 2), slots 8-9 are iie (type 3, icount-only, count=1).
+parameter TDT_TM_MCONTROL_TRI_NUM = 8;
+parameter TDT_TM_OTHER_TRI_NUM    = 2;
+parameter TDT_TM_TRI_NUM          = TDT_TM_MCONTROL_TRI_NUM + TDT_TM_OTHER_TRI_NUM;
 // M7 Task 1: core-side debug-mode CSRs (RISC-V debug spec 0.13; donor
 // aq_dtu_ctrl.v:314-317 / read mux :581-606). Storage lives in rtl/DTU.v;
 // CSR.v routes 0x7B0-0x7B3 accesses through the cp0<->dtu port.
