@@ -43,6 +43,10 @@ module RVProcAXI (
     /* M6 Task 6: UART interrupt level (C++ device model) -> PLIC source 7 */
     G_io_pins_uart_irq,
 
+    /* M7 Task 5: JTAG debug pads (D-M7-2: 4 pins, no trst_n) +
+       DM reset (D-M7-3, mirrors donor ciu_rst_b) */
+    jtag_tck, jtag_tms, jtag_tdi, tdt_rst_n,
+
     /* Memory controller outputs */
     G_io_pins_mpin_addr, G_io_pins_mpin_din_data_0, G_io_pins_mpin_din_data_1,
     G_io_pins_mpin_din_data_2, G_io_pins_mpin_din_data_3, G_io_pins_mpin_din_data_4,
@@ -61,6 +65,10 @@ module RVProcAXI (
     G_axi_bus_s_ch_2_wdat_m_data_data_6, G_axi_bus_s_ch_2_wdat_m_data_data_7,
     G_axi_bus_s_ch_2_wdat_m_strobe, G_axi_bus_s_ch_2_wdat_m_valid, G_axi_bus_s_ch_2_wdat_m_last,
     G_axi_bus_s_ch_2_wres_m_ready,
+
+    /* M7 Task 5: JTAG TDO + DM chip-level reset outputs (chip outputs
+       in the donor; dangling in the rv906 harness, documented) */
+    jtag_tdo, ndmreset_n, hartreset_n,
 
     /* Return value */
     G_RVProcAXI_OUT
@@ -101,6 +109,14 @@ module RVProcAXI (
     // M6 Task 6: UART interrupt level (from the C++ device model), routed to
     // the PLIC as external source 7 (see u_plic below).
     input        G_io_pins_uart_irq;
+
+    // M7 Task 5: JTAG pads (D-M7-2) + DM reset (D-M7-3). tdt_rst_n is the
+    // DM's async reset, independent of the core rst_n (donor ciu_rst_b):
+    // the DM survives a core reset (attach-after-crash / ndmreset flow).
+    input        jtag_tck;
+    input        jtag_tms;
+    input        jtag_tdi;
+    input        tdt_rst_n;
 
     //=========================================================================
     // Output Ports
@@ -144,6 +160,15 @@ module RVProcAXI (
     output        G_axi_bus_s_ch_2_wdat_m_valid;
     output        G_axi_bus_s_ch_2_wdat_m_last;
     output        G_axi_bus_s_ch_2_wres_m_ready;
+
+    // M7 Task 5: JTAG TDO + DM chip-level reset outputs (donor
+    // tdt_dm_pad_ndmreset_n / tdt_dm_pad_hartreset_n, tdt_top.v:74-75;
+    // dangling in the rv906 harness -- the testbench reads them, nothing
+    // consumes them yet).
+    output       jtag_tdo;
+    output       ndmreset_n;
+    output       hartreset_n;
+
     output        G_RVProcAXI_OUT;
 
     //=========================================================================
@@ -233,7 +258,10 @@ module RVProcAXI (
     //=========================================================================
     // Crossbar Master Ports (2D packed arrays)
     //=========================================================================
-    localparam N_MASTERS = 2;
+    // M7 Task 5: N_MASTERS 2->3 -- m[0]=ICache, m[1]=DCache,
+    // m[2]=SBA (via SBA_AxiUp, D-M7-4). AXICrossbar.v is parameterized
+    // over N_MASTERS (MASTER_ID_BITS = $clog2(N_MASTERS) = 2 for 3).
+    localparam N_MASTERS = 3;
     localparam M_ADDR_WIDTH = 64;
     localparam M_DATA_WIDTH = 512;
 
@@ -326,6 +354,230 @@ module RVProcAXI (
     assign axi_d_rdata  = m_rdata[1];
     assign axi_d_rresp  = m_rresp[1];
     assign axi_d_rlast  = m_rlast[1];
+
+    //=========================================================================
+    // M7 Task 5: Debug unit (TDT_DTM + TDT_DM + SBA)
+    //
+    // TDT_DTM (tck domain): 4 JTAG pads + tdt_rst_n (D-M7-2/3); its DMI
+    // -> APB bridge drives the TDT_DM APB slave (donor tdt_top.v wiring:
+    // the DMI APB bus lands on the DM, tdt_top.v:179-186).
+    // TDT_DM (clk domain): the Debug Module; its core interface crosses
+    // into the RVProc instance as new module ports (M7 Task 5); its
+    // SBA 128-bit AXI master goes through SBA_AxiUp to crossbar m[2]
+    // (D-M7-4). ndmreset_n/hartreset_n are chip-level outputs (donor
+    // tdt_dm_pad_* pads, tdt_top.v:74-75), dangling in the harness.
+    //
+    // OFF-path identity: with JTAG idle (tck=0 -> TAP in
+    // Test-Logic-Reset, no scans, DTM APB master idle) and dmactive=0
+    // (DM reset value) every DM core-side output sits at its tdt_rst_n
+    // reset constant and the SBA master drives no AXI requests, so all
+    // existing behavior is bit-identical (design doc OFF-path argument).
+    //=========================================================================
+    // TDT_DTM <-> TDT_DM APB (donor tdt_dmi_* bus)
+    wire        dtm_dm_psel;
+    wire        dtm_dm_penable;
+    wire        dtm_dm_pwrite;
+    wire [11:0] dtm_dm_paddr;
+    wire [31:0] dtm_dm_pwdata;
+    wire        dtm_dm_pready;
+    wire [31:0] dtm_dm_prdata;
+    wire        dtm_dm_pslverr;
+
+    // TDT_DM <-> core (DTU) -- crosses into the RVProc instance
+    wire        dm_core_halt_req;
+    wire        dm_core_resume_req;
+    wire        dm_core_halt_on_reset;
+    wire        dm_core_ack_havereset;
+    wire [31:0] dm_core_itr;
+    wire        dm_core_itr_vld;
+    wire        dm_core_wr_vld;
+    wire [1:0]  dm_core_wr_flg;
+    wire [63:0] dm_core_wdata;
+    wire        core_dm_halted;
+    wire        core_dm_havereset;
+    wire        core_dm_itr_done;
+    wire        core_dm_retire_debug_expt;
+    wire        core_dm_wr_ready;
+    wire [63:0] core_dm_rx_data;
+
+    // TDT_DM SBA AXI4 master (128-bit) -> SBA_AxiUp -> crossbar m[2]
+    wire [39:0] sba_awaddr;
+    wire [3:0]  sba_awlen;
+    wire [2:0]  sba_awsize;
+    wire [1:0]  sba_awburst;
+    wire [2:0]  sba_awprot;
+    wire        sba_awvalid;
+    wire        sba_awready;
+    wire [127:0] sba_wdata;
+    wire [15:0] sba_wstrb;
+    wire        sba_wvalid;
+    wire        sba_wlast;
+    wire        sba_wready;
+    wire        sba_bready;
+    wire [1:0]  sba_bresp;
+    wire        sba_bvalid;
+    wire [39:0] sba_araddr;
+    wire [3:0]  sba_arlen;
+    wire [2:0]  sba_arsize;
+    wire [1:0]  sba_arburst;
+    wire [2:0]  sba_arprot;
+    wire        sba_arvalid;
+    wire        sba_arready;
+    wire [127:0] sba_rdata;
+    wire        sba_rvalid;
+    wire        sba_rlast;
+    wire [1:0]  sba_rresp;
+    wire        sba_rready;
+
+    TDT_DTM u_tdt_dtm (
+        // JTAG pads (D-M7-2: 4 pins, no trst_n)
+        .tck          (jtag_tck),
+        .tms          (jtag_tms),
+        .tdi          (jtag_tdi),
+        .tdo          (jtag_tdo),
+        // pclk domain (single-clock rv906: pclk = clk, D-M7-1)
+        .pclk         (clk),
+        .preset_n     (tdt_rst_n),
+        // APB master to the Debug Module (donor DMI APB bus)
+        .apbm_psel    (dtm_dm_psel),
+        .apbm_penable (dtm_dm_penable),
+        .apbm_pwrite  (dtm_dm_pwrite),
+        .apbm_paddr   (dtm_dm_paddr),
+        .apbm_pwdata  (dtm_dm_pwdata),
+        .apbm_pready  (dtm_dm_pready),
+        .apbm_prdata  (dtm_dm_prdata),
+        .apbm_pslverr (dtm_dm_pslverr)
+    );
+
+    TDT_DM u_tdt_dm (
+        .clk                  (clk),
+        .tdt_rst_n            (tdt_rst_n),
+        // APB slave (from the TDT_DTM DMI bridge)
+        .dm_paddr             (dtm_dm_paddr),
+        .dm_pwrite            (dtm_dm_pwrite),
+        .dm_psel              (dtm_dm_psel),
+        .dm_penable           (dtm_dm_penable),
+        .dm_pwdata            (dtm_dm_pwdata),
+        .dm_prdata            (dtm_dm_prdata),
+        .dm_pready            (dtm_dm_pready),
+        .dm_pslverr           (dtm_dm_pslverr),
+        // Core interface (to the RVProc instance below)
+        .dm_core_halt_req_o   (dm_core_halt_req),
+        .dm_core_resume_req_o (dm_core_resume_req),
+        .dm_core_halt_on_reset_o (dm_core_halt_on_reset),
+        .dm_core_ack_havereset_o (dm_core_ack_havereset),
+        .dm_core_itr_o        (dm_core_itr),
+        .dm_core_itr_vld_o    (dm_core_itr_vld),
+        .dm_core_wr_vld_o     (dm_core_wr_vld),
+        .dm_core_wr_flg_o     (dm_core_wr_flg),
+        .dm_core_wdata_o      (dm_core_wdata),
+        .dm_core_rstn_o       (hartreset_n),
+        .dm_core_ndmreset_n_o (ndmreset_n),
+        .core_dm_halted_i     (core_dm_halted),
+        .core_dm_havereset_i  (core_dm_havereset),
+        .core_dm_itr_done_i   (core_dm_itr_done),
+        .core_dm_retire_debug_expt_i (core_dm_retire_debug_expt),
+        .core_dm_wr_ready_i   (core_dm_wr_ready),
+        .core_dm_rx_data_i    (core_dm_rx_data),
+        // SBA AXI4 master (128-bit) -> SBA_AxiUp. Donor-shape ID/cache/
+        // lock ports have no rv906 consumer and are left unconnected
+        // (the rv906 crossbar has no ID channels and ignores cache/lock);
+        // bid/rid are tied 0 (the crossbar never drives them).
+        .dm_pad_awid          (),
+        .dm_pad_awaddr        (sba_awaddr),
+        .dm_pad_awlen         (sba_awlen),
+        .dm_pad_awsize        (sba_awsize),
+        .dm_pad_awvalid       (sba_awvalid),
+        .pad_dm_awready       (sba_awready),
+        .dm_pad_wdata         (sba_wdata),
+        .dm_pad_wvalid        (sba_wvalid),
+        .dm_pad_wlast         (sba_wlast),
+        .dm_pad_wstrb         (sba_wstrb),
+        .pad_dm_wready        (sba_wready),
+        .dm_pad_bready        (sba_bready),
+        .pad_dm_bid           (4'b0),
+        .pad_dm_bresp         (sba_bresp),
+        .pad_dm_bvalid        (sba_bvalid),
+        .dm_pad_arid          (),
+        .dm_pad_araddr        (sba_araddr),
+        .dm_pad_arlen         (sba_arlen),
+        .dm_pad_arsize        (sba_arsize),
+        .dm_pad_arvalid       (sba_arvalid),
+        .pad_dm_arready       (sba_arready),
+        .pad_dm_rid           (4'b0),
+        .pad_dm_rdata         (sba_rdata),
+        .pad_dm_rvalid        (sba_rvalid),
+        .pad_dm_rlast         (sba_rlast),
+        .pad_dm_rresp         (sba_rresp),
+        .dm_pad_rready        (sba_rready),
+        .dm_pad_awburst       (sba_awburst),
+        .dm_pad_awcache       (),
+        .dm_pad_awlock        (),
+        .dm_pad_awprot        (sba_awprot),
+        .dm_pad_arburst       (sba_arburst),
+        .dm_pad_arcache       (),
+        .dm_pad_arlock        (),
+        .dm_pad_arprot        (sba_arprot)
+    );
+
+    SBA_AxiUp u_sba_axiup (
+        // 128-bit side (TDT_DM SBA master)
+        .m_awaddr  (sba_awaddr),
+        .m_awlen   (sba_awlen),
+        .m_awsize  (sba_awsize),
+        .m_awburst (sba_awburst),
+        .m_awprot  (sba_awprot),
+        .m_awvalid (sba_awvalid),
+        .m_awready (sba_awready),
+        .m_wdata   (sba_wdata),
+        .m_wstrb   (sba_wstrb),
+        .m_wvalid  (sba_wvalid),
+        .m_wlast   (sba_wlast),
+        .m_wready  (sba_wready),
+        .m_bready  (sba_bready),
+        .m_bresp   (sba_bresp),
+        .m_bvalid  (sba_bvalid),
+        .m_araddr  (sba_araddr),
+        .m_arlen   (sba_arlen),
+        .m_arsize  (sba_arsize),
+        .m_arburst (sba_arburst),
+        .m_arprot  (sba_arprot),
+        .m_arvalid (sba_arvalid),
+        .m_arready (sba_arready),
+        .m_rdata   (sba_rdata),
+        .m_rvalid  (sba_rvalid),
+        .m_rlast   (sba_rlast),
+        .m_rresp   (sba_rresp),
+        .m_rready  (sba_rready),
+        // 512-bit side (crossbar master port m[2])
+        .s_awaddr  (m_awaddr[2]),
+        .s_awlen   (m_awlen[2]),
+        .s_awsize  (m_awsize[2]),
+        .s_awburst (m_awburst[2]),
+        .s_awprot  (m_awprot[2]),
+        .s_awvalid (m_awvalid[2]),
+        .s_awready (m_awready[2]),
+        .s_wdata   (m_wdata[2]),
+        .s_wstrb   (m_wstrb[2]),
+        .s_wvalid  (m_wvalid[2]),
+        .s_wlast   (m_wlast[2]),
+        .s_wready  (m_wready[2]),
+        .s_bvalid  (m_bvalid[2]),
+        .s_bready  (m_bready[2]),
+        .s_bresp   (m_bresp[2]),
+        .s_araddr  (m_araddr[2]),
+        .s_arlen   (m_arlen[2]),
+        .s_arsize  (m_arsize[2]),
+        .s_arburst (m_arburst[2]),
+        .s_arprot  (m_arprot[2]),
+        .s_arvalid (m_arvalid[2]),
+        .s_arready (m_arready[2]),
+        .s_rdata   (m_rdata[2]),
+        .s_rvalid  (m_rvalid[2]),
+        .s_rlast   (m_rlast[2]),
+        .s_rresp   (m_rresp[2]),
+        .s_rready  (m_rready[2])
+    );
 
     //=========================================================================
     // Crossbar Slave Ports (2D packed arrays)
@@ -899,6 +1151,23 @@ module RVProcAXI (
         .msip               (clint_msip),
         .meip               (plic_meip),
         .mtime              (clint_mtime),
+
+        // M7 Task 5: DM <-> DTU core interface (from the TDT_DM instance)
+        .tdt_dm_dtu_halt_req      (dm_core_halt_req),
+        .tdt_dm_dtu_resume_req    (dm_core_resume_req),
+        .tdt_dm_dtu_halt_on_reset (dm_core_halt_on_reset),
+        .tdt_dm_dtu_ack_havereset (dm_core_ack_havereset),
+        .tdt_dm_dtu_itr           (dm_core_itr),
+        .tdt_dm_dtu_itr_vld       (dm_core_itr_vld),
+        .tdt_dm_dtu_wr_vld        (dm_core_wr_vld),
+        .tdt_dm_dtu_wr_flg        (dm_core_wr_flg),
+        .tdt_dm_dtu_wdata         (dm_core_wdata),
+        .dtu_tdt_dm_halted        (core_dm_halted),
+        .dtu_tdt_dm_havereset     (core_dm_havereset),
+        .dtu_tdt_dm_itr_done      (core_dm_itr_done),
+        .dtu_tdt_dm_retire_debug_expt_vld (core_dm_retire_debug_expt),
+        .dtu_tdt_dm_wr_ready      (core_dm_wr_ready),
+        .dtu_tdt_dm_rx_data       (core_dm_rx_data),
 
         .quitted            (quitted)
     );

@@ -39,6 +39,18 @@ void DUT::init(RV_AType pc, RV_UType sp, RV_UType dtb) {
 #endif
 
     // Reset sequence
+    // M7 Task 5: JTAG debug pad stubs (TASK 6 REPLACES THE INPUT STUBS WITH
+    // THE C++ JTAG DRIVER -- keep this comment as the replacement point).
+    // JTAG idle: tck/tms/tdi tied 0 -> TAP in Test-Logic-Reset, no scans,
+    // DTM APB master idle, dmactive stays 0 -> DM off-path identity.
+    // tdt_rst_n is the DM's own async reset (D-M7-3); held 1 (released) so
+    // the DM is powered but inactive (all core-side outputs at reset
+    // constants, SBA master driving no AXI requests).
+    vdut->jtag_tck   = 0;
+    vdut->jtag_tms   = 0;
+    vdut->jtag_tdi   = 0;
+    vdut->tdt_rst_n  = 1;
+
     vdut->rst_n = 0;
     vdut->clk = 0;
     vdut->eval();
@@ -97,6 +109,16 @@ bool DUT::step(MEMCTLPin *mpin, UINT32 uart_irq) {
 #ifdef VERISIM_TRACE
     if (tfp) tfp->dump(trace_tick++);
 #endif
+
+    // M7 Task 5: read the dangling debug outputs into unused variables
+    // (chip-level outputs, no consumer in the rv906 harness yet; the
+    // Task 6 JTAG driver will make use of jtag_tdo).
+    {
+        volatile uint32_t dbg_tdo    = vdut->jtag_tdo;
+        volatile uint32_t dbg_ndmrst = vdut->ndmreset_n;
+        volatile uint32_t dbg_hrst   = vdut->hartreset_n;
+        (void)dbg_tdo; (void)dbg_ndmrst; (void)dbg_hrst;
+    }
 
     // Read memory request signals (from CPU)
     mpin->addr = vdut->G_io_pins_mpin_addr;

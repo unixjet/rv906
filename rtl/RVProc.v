@@ -134,6 +134,29 @@ module RVProc #(
     input  wire [63:0]          mtime,              // M6 Task 3: CLINT mtime -> `time` CSR (0xC01)
 
     //=========================================================================
+    // M7 Task 5: Debug Module (DM) side of the DTU interface. The SoC
+    // wrapper (RVProcAXI) drives the inputs from the TDT_DM instance and
+    // consumes the outputs (pre-Task-5 the inputs were inline reset
+    // constants in this module and the outputs floated, M7 Task 1).
+    // Names kept identical to the u_dtu connections below.
+    //=========================================================================
+    input  wire                 tdt_dm_dtu_halt_req,      // level (spec haltreq)
+    input  wire                 tdt_dm_dtu_resume_req,    // pulse
+    input  wire                 tdt_dm_dtu_halt_on_reset, // level
+    input  wire                 tdt_dm_dtu_ack_havereset, // pulse
+    input  wire [31:0]          tdt_dm_dtu_itr,
+    input  wire                 tdt_dm_dtu_itr_vld,       // pulse
+    input  wire                 tdt_dm_dtu_wr_vld,        // pulse
+    input  wire [1:0]           tdt_dm_dtu_wr_flg,        // 00=rd dscratch0 / 01=wr dscratch0
+    input  wire [63:0]          tdt_dm_dtu_wdata,
+    output wire                 dtu_tdt_dm_halted,        // = dbgon
+    output wire                 dtu_tdt_dm_havereset,     // level until ack
+    output wire                 dtu_tdt_dm_itr_done,      // pulse per retired debug inst
+    output wire                 dtu_tdt_dm_retire_debug_expt_vld, // pulse through from RTU
+    output wire                 dtu_tdt_dm_wr_ready,      // pulse, wr/rd accepted
+    output wire [63:0]          dtu_tdt_dm_rx_data,       // readback: dscratch0
+
+    //=========================================================================
     // Control/Status
     //=========================================================================
     output wire                 quitted
@@ -553,8 +576,10 @@ module RVProc #(
 
     //=========================================================================
     // M7 Task 1: core-side debug nets (DTU <-> CSR/RTU/IFU). The DM side
-    // (tdt_dm_dtu_*) is tied to reset constants until Task 3 lands TDT_DM.v;
-    // the DTU -> SoC side is REAL (it feeds CSR/RTU/IFU). All the
+    // (tdt_dm_dtu_*) is REAL since Task 5 (module ports driven by the
+    // TDT_DM instance in RVProcAXI); at reset with the DM inactive they
+    // carry reset constants (off-path identity). The DTU -> SoC side is
+    // REAL (it feeds CSR/RTU/IFU). All the
     // rtu_yy_xx_dbgon consumers see 0 at reset (off-path identity).
     //=========================================================================
     // DTU <-> CP0 (dtu_cp0_* = DTU outputs; cp0_dtu_* = CSR outputs)
@@ -587,16 +612,10 @@ module RVProc #(
     wire                     dtu_ifu_debug_inst_vld;
     wire                     dtu_ifu_halt_on_reset;
     wire                     ifu_rtu_reset_halt_req;
-    // DTU <-> TDT_DM (tied constants; Task 3 wires the real DM)
-    wire                     tdt_dm_dtu_halt_req       = 1'b0;
-    wire                     tdt_dm_dtu_resume_req     = 1'b0;
-    wire                     tdt_dm_dtu_halt_on_reset  = 1'b0;
-    wire                     tdt_dm_dtu_ack_havereset  = 1'b1;  // drain havereset
-    wire [31:0]              tdt_dm_dtu_itr            = 32'd0;
-    wire                     tdt_dm_dtu_itr_vld        = 1'b0;
-    wire                     tdt_dm_dtu_wr_vld         = 1'b0;
-    wire [1:0]               tdt_dm_dtu_wr_flg         = 2'b00;
-    wire [63:0]              tdt_dm_dtu_wdata          = 64'd0;
+    // DTU <-> TDT_DM: the DM-side inputs (tdt_dm_dtu_*) and the six
+    // DTU-side outputs (dtu_tdt_dm_*) are module ports (M7 Task 5);
+    // they are driven/consumed by the TDT_DM instance in RVProcAXI and
+    // connected to u_dtu below under the same names.
     // DTU -> HPCP (no HPCP in rv906; dangling, D-M7-10)
     wire                     dtu_hpcp_dcsr_stopcount;
     wire [63:0]              dtu_rtu_pending_tval_unused;
@@ -1676,7 +1695,8 @@ module RVProc #(
         .dtu_cp0_dcsr_mprven          (dtu_cp0_dcsr_mprven),
         .dtu_cp0_wake_up              (dtu_cp0_wake_up),
 
-        // TDT_DM <-> DTU (tied; Task 3 wires the real DM)
+        // TDT_DM <-> DTU (M7 Task 5: real nets, driven by the TDT_DM
+        // instance in RVProcAXI via the module ports above)
         .tdt_dm_dtu_halt_req          (tdt_dm_dtu_halt_req),
         .tdt_dm_dtu_resume_req        (tdt_dm_dtu_resume_req),
         .tdt_dm_dtu_halt_on_reset     (tdt_dm_dtu_halt_on_reset),
@@ -1686,12 +1706,12 @@ module RVProc #(
         .tdt_dm_dtu_wr_vld            (tdt_dm_dtu_wr_vld),
         .tdt_dm_dtu_wr_flg            (tdt_dm_dtu_wr_flg),
         .tdt_dm_dtu_wdata             (tdt_dm_dtu_wdata),
-        .dtu_tdt_dm_halted            (),
-        .dtu_tdt_dm_havereset         (),
-        .dtu_tdt_dm_itr_done          (),
-        .dtu_tdt_dm_retire_debug_expt_vld (),
-        .dtu_tdt_dm_wr_ready          (),
-        .dtu_tdt_dm_rx_data           (),
+        .dtu_tdt_dm_halted            (dtu_tdt_dm_halted),
+        .dtu_tdt_dm_havereset         (dtu_tdt_dm_havereset),
+        .dtu_tdt_dm_itr_done          (dtu_tdt_dm_itr_done),
+        .dtu_tdt_dm_retire_debug_expt_vld (dtu_tdt_dm_retire_debug_expt_vld),
+        .dtu_tdt_dm_wr_ready          (dtu_tdt_dm_wr_ready),
+        .dtu_tdt_dm_rx_data           (dtu_tdt_dm_rx_data),
 
         // RTU <-> DTU
         .rtu_dtu_dpc                  (rtu_dtu_dpc),
