@@ -446,6 +446,10 @@ struct M7JTAG {
     }
 };
 
+// M7 Task 8: trigger e2e (steps i-v); defined after m7_debug_extended and
+// called from its tail. Forward-declared here.
+static bool m7_debug_triggers(M7JTAG &j);
+
 //=============================================================================
 // M7 Task 7: the extended debug e2e (deliverable 3, steps a-h) against the
 // spin ELF. Runs against a RUNNING core (called from m7_debug_smoke after
@@ -494,12 +498,18 @@ static bool m7_debug_extended(M7JTAG &j)
     //   x9  = 0xDEAD0000  (abstract write target)
     //   x10 = loop counter, +1 per iteration (step oracle)
     //   x13 = 0           (ITR target: addi x13,x13,1)
+    //   x12 = 0x80001000 (B): the loop's load/store word (Task 8)
+    //   x14 = load target; loop `lw x14,0(x12)` (Task 8 load oracle)
+    //   x15 = 0x11111111 (C): loop store value (Task 8 store source)
     //   x6/x7 (0x1006/0x1007) are the pb scratch registers (donor pb path);
     //   the spin loop never touches them.
-    //   LOOP = 0x80000020: addi x10,x10,1 ; j LOOP  (RVC-free, +4 stride).
+    //   LOOP = 0x80000040: addi x10,x10,1 ; lw x14,0(x12) ; sw x15,0(x12) ;
+    //   j LOOP  (RVC-free, +4 stride; Task 8 added the load/store + a
+    //   breakpoint handler at 0x80000050). The loop converges B = C and
+    //   x14 = C.
     // A dpc-range / step check therefore assumes every advance is +4.
-    const uint64_t LOOP   = 0x80000020ULL;
-    const uint64_t LOOPEN = 0x80000028ULL;
+    const uint64_t LOOP   = 0x80000040ULL;
+    const uint64_t LOOPEN = 0x80000050ULL;
     const uint32_t X8_VAL = 0x5A5A0000U;
     const uint32_t R_X8   = 0x1008, R_X9   = 0x1009;
     const uint32_t R_X10  = 0x100A, R_X13  = 0x100D;
@@ -761,6 +771,338 @@ static bool m7_debug_extended(M7JTAG &j)
                inloop ? "ok" : "FAIL",
                (x10post > x10pre) ? "ok" : "FAIL");
         ok = ok && okh;
+    }
+
+    // M7 Task 8: trigger e2e (mcontrol execute/load/store, action 1 and 0,
+    // store suppression, second trigger via tselect=1). The core is halted
+    // here (from (h)'s re-halt); each step resumes to let the trigger fire,
+    // then re-halts and reads the resulting state. Gated by M7-DEBUG-PASS.
+    ok = ok && m7_debug_triggers(j);
+
+    return ok;
+}
+
+//=============================================================================
+// M7 Task 8: trigger e2e (deliverable 1, steps i-v) against the spin ELF.
+//
+// The spin ELF's loop (test/m7/directed/debug_spin.S) now has a load +
+// store on a fixed memory word B (0x80001000) and an M-mode breakpoint
+// handler (mepc += 4; mret -- it does NOT disarm the trigger, so an armed
+// trigger keeps firing each lap, giving a stable suppression/cancellation
+// oracle). Layout (objdump-verified):
+//   LOOP     = 0x80000040  addi x10,x10,1   (execute-trigger target)
+//   LOAD_PC  = 0x80000044  lw   x14,0(x12)  (load-trigger target)
+//   STORE_PC = 0x80000048  sw   x15,0(x12)  (store-trigger target)
+//   (j LOOP) = 0x8000004C
+//   handler  = 0x80000050  csrr x17,mepc; addi x17,x17,4; csrw mepc,x17; mret
+//   B        = 0x80001000  (x12)  C = 0x11111111 (x15)
+//
+// Trigger RTL (rtl/DTU.v, unit-passed Task 2):
+//   tdata1 WARL (DTU.v:561-590): type must be 2 (else type=0/disabled);
+//   dmode preserved when written while halted; action legal if <=1; timing
+//   forced 0 for execute triggers; M/S/U + execute/store/load preserved.
+//   Per-slot enable (DTU.v:721-728): needs type=2, priv (M in M-mode),
+//   !dbgon (normal mode), dmode=0, and for action=0 in M-mode,
+//   tcontrol.MTE (bit3). So every action-0 step sets tcontrol=0x8 first.
+//   execute match on fetch PC (DTU.v:730-732); ldst match on access
+//   address (DTU.v:734-740); timing-0 ldst match CANCELs the access (load
+//   not committed, DTU.v:751) and SUPPRESSES a store (DTU.v:756).
+//
+// mcontrol tdata1 encodings (64-bit):
+//   type=2 -> 0x2<<60 = 0x2000000000000000 ; M -> bit6=0x40
+//   execute -> bit2=0x4 ; store -> bit1=0x2 ; load -> bit0=0x1
+//   action=1 -> 1<<12=0x1000 (bits[17:12]); action=0 -> 0
+//   (i)  exec a1: 0x2000000000001044  (ii) exec a0: 0x2000000000000044
+//   (iii)load a0: 0x2000000000000041  (iv) st a0: 0x2000000000000042
+//
+// Halt/trigger causes (rtl/RTU.v:1126-1137): trigger=2, ebreak=1,
+// reset=5, dm_sync=3, step=4. dcsr.cause is the trigger cause (2) for an
+// action=1 halt; a breakpoint TRAP (action=0) is mcause=3 (not a halt).
+//
+// mepc note: at the trap instant mepc == the trigger PC (trap BEFORE
+// execution). The spin-ELF handler then skips (mepc += 4), so in the
+// running trap loop mepc oscillates between the trigger PC (at the trap)
+// and trigger PC + 4 (after the handler). We assert mepc in that 2-value
+// set and print the observed value; trigger PC + 4 additionally proves
+// the handler skipped the (not executed) triggered instruction.
+//=============================================================================
+static bool m7_debug_triggers(M7JTAG &j)
+{
+    const uint64_t LOOP     = 0x80000040ULL;
+    const uint64_t LOAD_PC  = 0x80000044ULL;
+    const uint64_t STORE_PC = 0x80000048ULL;
+    const uint64_t B_ADDR   = 0x80001000ULL;
+    const uint32_t X15_C    = 0x11111111U;   // C: store value the loop converged to
+    const uint32_t X14_W    = 0x22222222U;   // W: x14 set for the load-cancellation test
+    const uint32_t X15_D    = 0x33333333U;   // D: x15 set for the store-suppression test
+    const uint32_t R_X14    = 0x100E, R_X15  = 0x100F;
+    const uint32_t CSR_TSELECT   = 0x7A0, CSR_TDATA1 = 0x7A1, CSR_TDATA2 = 0x7A2;
+    const uint32_t CSR_TCONTROL  = 0x7A5;
+    const uint32_t CSR_MCAUSE    = 0x342, CSR_MEPC = 0x341, CSR_MTVAL = 0x343;
+    const uint32_t CSR_DCSR      = 0x7B0, CSR_DPC  = 0x7B1;
+    const uint32_t TCONTROL_MTE  = 0x8;
+    const uint32_t CAUSE_TRIGGER = 2, MCAUSE_BREAKPOINT = 3;
+    const uint64_t TD_EXEC_A1   = 0x2000000000001044ULL; // type|M|execute|action1
+    const uint64_t TD_EXEC_A0   = 0x2000000000000044ULL; // type|M|execute|action0
+    const uint64_t TD_LOAD_A0   = 0x2000000000000041ULL; // type|M|load|action0
+    const uint64_t TD_STORE_A0  = 0x2000000000000042ULL; // type|M|store|action0
+
+    bool ok = true;
+    uint32_t dmstatus = 0;
+
+    printf("[m7] === M7 Task 8 trigger e2e (mcontrol execute/load/store; "
+           "action 1/0; store suppression; 2nd trigger) ===\n");
+
+    // ---- (i) execute trigger, action=1 (enter debug / halt) ----
+    // tselect=0, tcontrol.MTE=1, tdata1 = exec action=1, tdata2 = LOOP.
+    // Bit-exact tdata1 readback, then resume -> the core HALTS AT the
+    // trigger PC (anyhalted, dpc == LOOP, dcsr.cause == 2 = trigger).
+    {
+        bool o1 = j.abstract_reg_write(CSR_TCONTROL, TCONTROL_MTE, "tcontrol MTE=1");
+        bool o2 = j.abstract_reg_write(CSR_TSELECT, 0, "tselect=0");
+        bool o3 = j.abstract_reg_write(CSR_TDATA1, TD_EXEC_A1, "tdata1 exec a1");
+        bool o4 = j.abstract_reg_write(CSR_TDATA2, LOOP, "tdata2=LOOP");
+        uint64_t td1 = 0;
+        bool or1 = j.abstract_reg_read(CSR_TDATA1, td1, "tdata1 readback (i)");
+        bool bitexact = (td1 == TD_EXEC_A1);
+        // Decode the readback fields for the report.
+        uint32_t r_type   = (uint32_t)(td1 >> 60);
+        uint32_t r_dmode  = (uint32_t)((td1 >> 59) & 1);
+        uint32_t r_m      = (uint32_t)((td1 >> 6) & 1);
+        uint32_t r_exe    = (uint32_t)((td1 >> 2) & 1);
+        uint32_t r_act    = (uint32_t)((td1 >> 12) & 0x3F);
+        uint32_t r_match  = (uint32_t)((td1 >> 7) & 0xF);
+        printf("[m7] (i) tdata1 exec action=1: wrote 0x%016llx readback "
+               "0x%016llx (type=%u dmode=%u M=%u exe=%u action=%u match=%u "
+               "timing=%u; bit-exact=%s)\n",
+               (unsigned long long)TD_EXEC_A1, (unsigned long long)td1,
+               r_type, r_dmode, r_m, r_exe, r_act, r_match,
+               (uint32_t)((td1 >> 18) & 1), bitexact ? "ok" : "FAIL");
+        ok = ok && o1 && o2 && o3 && o4 && or1 && bitexact;
+        bool o5   = j.abstract_reg_write(CSR_DPC, LOOP, "dpc=LOOP (i)");
+        bool ores = j.resume_req(dmstatus, "resume (i)");
+        bool oh   = j.wait_halted(dmstatus, "trigger halt (i)");
+        uint64_t dpc = 0, dcsr64 = 0;
+        bool od  = j.abstract_reg_read(CSR_DPC,  dpc,    "dpc (i)");
+        bool ods = j.abstract_reg_read(CSR_DCSR, dcsr64, "dcsr (i)");
+        uint32_t cause     = (uint32_t)(dcsr64 >> 6) & 7;
+        uint32_t anyhalted = (dmstatus >> 8) & 1;
+        printf("[m7] (i) after resume: dmstatus=0x%08x (anyhalted=%u) "
+               "dpc=0x%llx (expect 0x%llx) dcsr=0x%08x (cause=%u; expect "
+               "2=trigger)\n",
+               dmstatus, anyhalted, (unsigned long long)dpc,
+               (unsigned long long)LOOP, (uint32_t)dcsr64, cause);
+        bool oki = o5 && ores && oh && od && ods && (anyhalted == 1) &&
+                   (dpc == LOOP) && (cause == CAUSE_TRIGGER);
+        printf("[m7] (i) check: anyhalted=%s dpc==LOOP=%s cause==2=%s\n",
+               (anyhalted == 1) ? "ok" : "FAIL",
+               (dpc == LOOP) ? "ok" : "FAIL",
+               (cause == CAUSE_TRIGGER) ? "ok" : "FAIL");
+        ok = ok && oki;
+    }
+
+    // ---- (ii) execute trigger, action=0 (breakpoint TRAP) ----
+    // Reconfigure tdata1 = exec action=0. Resume -> the core takes a
+    // BREAKPOINT TRAP (mcause=3), the handler skips (mepc+=4), and it
+    // re-loops (re-traps). Halt and read mcause==3 and mepc in {LOOP,
+    // LOOP+4}.
+    {
+        bool o1   = j.abstract_reg_write(CSR_TDATA1, TD_EXEC_A0, "tdata1 exec a0");
+        bool o2   = j.abstract_reg_write(CSR_DPC, LOOP, "dpc=LOOP (ii)");
+        bool ores = j.resume_req(dmstatus, "resume (ii)");
+        bool oh   = j.halt_req(dmstatus, "halt (ii)");
+        uint64_t mcause = 0, mepc = 0, mtval = 0;
+        bool omc   = j.abstract_reg_read(CSR_MCAUSE, mcause, "mcause (ii)");
+        bool omepc = j.abstract_reg_read(CSR_MEPC,   mepc,   "mepc (ii)");
+        bool omtv  = j.abstract_reg_read(CSR_MTVAL,  mtval,  "mtval (ii)");
+        bool mepc_ok = (mepc == LOOP) || (mepc == LOOP + 4);
+        printf("[m7] (ii) exec action=0: mcause=0x%llx (expect 3=breakpoint) "
+               "mepc=0x%llx (expect 0x%llx or 0x%llx) mtval=0x%llx\n",
+               (unsigned long long)mcause, (unsigned long long)mepc,
+               (unsigned long long)LOOP, (unsigned long long)(LOOP + 4),
+               (unsigned long long)mtval);
+        bool okii = o1 && o2 && ores && oh && omc && omepc && omtv &&
+                    (mcause == MCAUSE_BREAKPOINT) && mepc_ok;
+        printf("[m7] (ii) check: mcause==3=%s mepc in {LOOP,LOOP+4}=%s\n",
+               (mcause == MCAUSE_BREAKPOINT) ? "ok" : "FAIL",
+               mepc_ok ? "ok" : "FAIL");
+        ok = ok && okii;
+    }
+
+    // ---- (iii) load trigger, action=0 (trap + load CANCELLED) ----
+    // x14 := W (so a committed load would change it). tdata1 = load
+    // action=0, tdata2 = B. Resume from dpc=LOAD_PC -> the load is
+    // CANCELLED (x14 stays W) and the core traps (mcause=3). The handler
+    // skips to STORE_PC. Halt and read x14==W, mcause==3,
+    // mepc in {LOAD_PC, LOAD_PC+4}.
+    {
+        bool o1 = j.abstract_reg_write(R_X14, X14_W, "x14=W (iii)");
+        uint64_t x14_setup = 0;
+        bool orx14s = j.abstract_reg_read(R_X14, x14_setup, "x14 setup rb (iii)");
+        bool o2 = j.abstract_reg_write(CSR_TDATA1, TD_LOAD_A0, "tdata1 load a0");
+        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_ADDR, "tdata2=B (iii)");
+        uint64_t td2_setup = 0;
+        bool ortd2s = j.abstract_reg_read(CSR_TDATA2, td2_setup, "tdata2 setup rb (iii)");
+        bool o4 = j.abstract_reg_write(CSR_DPC, LOAD_PC, "dpc=LOAD_PC (iii)");
+        bool ores = j.resume_req(dmstatus, "resume (iii)");
+        bool oh   = j.halt_req(dmstatus, "halt (iii)");
+        uint64_t x14 = 0, mcause = 0, mepc = 0, mtval = 0;
+        bool ox14  = j.abstract_reg_read(R_X14,    x14,    "x14 (iii)");
+        bool omc   = j.abstract_reg_read(CSR_MCAUSE, mcause, "mcause (iii)");
+        bool omepc = j.abstract_reg_read(CSR_MEPC,   mepc,   "mepc (iii)");
+        bool omtv  = j.abstract_reg_read(CSR_MTVAL,  mtval,  "mtval (iii)");
+        bool x14_ok  = (x14 == X14_W);   // load NOT committed
+        bool mepc_ok = (mepc == LOAD_PC) || (mepc == LOAD_PC + 4);
+        printf("[m7] (iii) setup: x14 written=0x%llx readback=0x%llx (expect "
+               "0x%llx) tdata2 readback=0x%llx (expect 0x%llx)\n",
+               (unsigned long long)X14_W, (unsigned long long)x14_setup,
+               (unsigned long long)X14_W, (unsigned long long)td2_setup,
+               (unsigned long long)B_ADDR);
+        printf("[m7] (iii) load action=0: x14=0x%llx (expect 0x%llx=W, load "
+               "not committed) mcause=0x%llx (expect 3) mepc=0x%llx (expect "
+               "0x%llx or 0x%llx) mtval=0x%llx\n",
+               (unsigned long long)x14, (unsigned long long)X14_W,
+               (unsigned long long)mcause, (unsigned long long)mepc,
+               (unsigned long long)LOAD_PC, (unsigned long long)(LOAD_PC + 4),
+               (unsigned long long)mtval);
+        bool okiii = o1 && orx14s && (x14_setup == X14_W) && o2 && o3 &&
+                     ortd2s && (td2_setup == B_ADDR) && o4 && ores && oh &&
+                     ox14 && omc &&
+                     omepc && omtv && x14_ok &&
+                     (mcause == MCAUSE_BREAKPOINT) && mepc_ok;
+        printf("[m7] (iii) check: x14==W (load cancelled)=%s mcause==3=%s "
+               "mepc in {LOAD,LOAD+4}=%s\n",
+               x14_ok ? "ok" : "FAIL",
+               (mcause == MCAUSE_BREAKPOINT) ? "ok" : "FAIL",
+               mepc_ok ? "ok" : "FAIL");
+        ok = ok && okiii;
+    }
+
+    // ---- (iv) store trigger, action=0 (trap + store SUPPRESSED) ----
+    // x15 := D (so a committed store would change B to D). tdata1 = store
+    // action=0, tdata2 = B. Resume from dpc=STORE_PC -> the store is
+    // SUPPRESSED (B stays C) and the core traps (mcause=3). The trigger is
+    // NOT disarmed, so every subsequent store is also suppressed (B stays
+    // C) and the loop's load keeps x14 = C. Halt and read x14==C (B
+    // unchanged -> store suppressed), mcause==3, mepc in
+    // {STORE_PC, STORE_PC+4}.
+    {
+        bool o1 = j.abstract_reg_write(R_X15, X15_D, "x15=D (iv)");
+        uint64_t x15_setup = 0;
+        bool orx15s = j.abstract_reg_read(R_X15, x15_setup, "x15 setup rb (iv)");
+        bool o2 = j.abstract_reg_write(CSR_TDATA1, TD_STORE_A0, "tdata1 store a0");
+        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_ADDR, "tdata2=B (iv)");
+        uint64_t td2s = 0;
+        bool ortd2s = j.abstract_reg_read(CSR_TDATA2, td2s, "tdata2 setup rb (iv)");
+        bool o4 = j.abstract_reg_write(CSR_DPC, STORE_PC, "dpc=STORE_PC (iv)");
+        bool ores = j.resume_req(dmstatus, "resume (iv)");
+        bool oh   = j.halt_req(dmstatus, "halt (iv)");
+        uint64_t x14 = 0, mcause = 0, mepc = 0, mtval = 0;
+        bool ox14  = j.abstract_reg_read(R_X14,    x14,    "x14 (iv)");
+        bool omc   = j.abstract_reg_read(CSR_MCAUSE, mcause, "mcause (iv)");
+        bool omepc = j.abstract_reg_read(CSR_MEPC,   mepc,   "mepc (iv)");
+        bool omtv  = j.abstract_reg_read(CSR_MTVAL,  mtval,  "mtval (iv)");
+        bool x14_ok  = (x14 == X15_C);   // B unchanged -> store suppressed
+        bool mepc_ok = (mepc == STORE_PC) || (mepc == STORE_PC + 4);
+        printf("[m7] (iv) setup: x15 written=0x%llx readback=0x%llx (expect "
+               "0x%llx) tdata2 readback=0x%llx (expect 0x%llx)\n",
+               (unsigned long long)X15_D, (unsigned long long)x15_setup,
+               (unsigned long long)X15_D, (unsigned long long)td2s,
+               (unsigned long long)B_ADDR);
+        printf("[m7] (iv) store action=0: x14=0x%llx (expect 0x%llx=C, B "
+               "unchanged -> store suppressed) mcause=0x%llx (expect 3) "
+               "mepc=0x%llx (expect 0x%llx or 0x%llx) mtval=0x%llx\n",
+               (unsigned long long)x14, (unsigned long long)X15_C,
+               (unsigned long long)mcause, (unsigned long long)mepc,
+               (unsigned long long)STORE_PC, (unsigned long long)(STORE_PC + 4),
+               (unsigned long long)mtval);
+        bool okiv = o1 && orx15s && (x15_setup == X15_D) && o2 && o3 &&
+                    ortd2s && (td2s == B_ADDR) && o4 && ores && oh && ox14 &&
+                    omc &&
+                    omepc && omtv && x14_ok &&
+                    (mcause == MCAUSE_BREAKPOINT) && mepc_ok;
+        printf("[m7] (iv) check: x14==C (store suppressed)=%s mcause==3=%s "
+               "mepc in {STORE,STORE+4}=%s\n",
+               x14_ok ? "ok" : "FAIL",
+               (mcause == MCAUSE_BREAKPOINT) ? "ok" : "FAIL",
+               mepc_ok ? "ok" : "FAIL");
+        ok = ok && okiv;
+    }
+
+    // ---- (v) second trigger (tselect=1): arm + verify, then fire at its
+    // own PC (in isolation) ----
+    // tselect=1 (readback==1); tdata1(slot1) = exec action=0 at LOAD_PC,
+    // tdata2(slot1) = LOAD_PC. Slot0 still holds the store trigger from (iv)
+    // (BOTH armed -- verified by readback). Then DISARM slot0 so slot1 fires
+    // in ISOLATION: with both armed, the handler's mepc+=4 skip advances mepc
+    // into the OTHER trigger's PC, so a single JTAG halt cannot tell which
+    // one fired (mepc oscillates and lands on STORE_PC+4 either way).
+    // Resume from dpc=LOAD_PC -> slot1 (exec at LOAD_PC) fires: mcause=3,
+    // mepc in {LOAD_PC, LOAD_PC+4} -- distinct from slot0's STORE_PC
+    // (slot0 verified in iv).
+    {
+        bool o1 = j.abstract_reg_write(CSR_TSELECT, 1, "tselect=1 (v)");
+        uint64_t tsel = 0;
+        bool ots = j.abstract_reg_read(CSR_TSELECT, tsel, "tselect readback (v)");
+        bool tsel_ok = (tsel == 1);
+        bool o2 = j.abstract_reg_write(CSR_TDATA1, TD_EXEC_A0, "tdata1(slot1) exec a0");
+        bool o3 = j.abstract_reg_write(CSR_TDATA2, LOAD_PC, "tdata2(slot1)=LOAD_PC");
+        uint64_t td1_1 = 0;
+        bool or1 = j.abstract_reg_read(CSR_TDATA1, td1_1, "tdata1(slot1) readback (v)");
+        bool bitexact1 = (td1_1 == TD_EXEC_A0);
+        uint64_t td2_1 = 0;
+        bool ortd2_1 = j.abstract_reg_read(CSR_TDATA2, td2_1, "tdata2(slot1) readback (v)");
+        // Confirm slot0 still holds the store trigger from (iv) -> BOTH armed.
+        bool o4  = j.abstract_reg_write(CSR_TSELECT, 0, "tselect=0 (v confirm)");
+        uint64_t td1_0 = 0;
+        bool or0 = j.abstract_reg_read(CSR_TDATA1, td1_0, "tdata1(slot0) readback (v)");
+        bool slot0_store = (td1_0 == TD_STORE_A0);
+        printf("[m7] (v) tselect=1 readback=0x%llx (expect 1); tdata1(slot1)="
+               "0x%016llx (bit-exact=%s); tdata2(slot1)=0x%llx (expect "
+               "0x%llx); tdata1(slot0)=0x%016llx (store trigger armed=%s "
+               "-> both armed)\n",
+               (unsigned long long)tsel, (unsigned long long)td1_1,
+               bitexact1 ? "ok" : "FAIL",
+               (unsigned long long)td2_1, (unsigned long long)LOAD_PC,
+               (unsigned long long)td1_0, slot0_store ? "ok" : "FAIL");
+        ok = ok && o1 && ots && tsel_ok && o2 && o3 && or1 && bitexact1 &&
+             ortd2_1 && (td2_1 == LOAD_PC) &&
+             o4 && or0 && slot0_store;
+        // Disarm slot0 (tdata1=0 -> type=0 -> slot inactive) so slot1 fires
+        // in isolation; see the mepc-oscillation note above.
+        bool o6  = j.abstract_reg_write(CSR_TDATA1, 0, "tdata1(slot0) disarm (v)");
+        uint64_t td1_0d = 0;
+        bool or0d = j.abstract_reg_read(CSR_TDATA1, td1_0d, "tdata1(slot0) disarm rb (v)");
+        bool slot0_disarmed = (td1_0d == 0);
+        printf("[m7] (v) slot0 disarmed: tdata1(slot0)=0x%016llx (expect 0x0 "
+               "= inactive)\n", (unsigned long long)td1_0d);
+        ok = ok && o6 && or0d && slot0_disarmed;
+        // Resume from dpc=LOAD_PC: slot1 (exec at LOAD_PC) fires.
+        bool o5   = j.abstract_reg_write(CSR_DPC, LOAD_PC, "dpc=LOAD_PC (v)");
+        uint64_t dpc_v = 0;
+        bool ordpc = j.abstract_reg_read(CSR_DPC, dpc_v, "dpc setup rb (v)");
+        printf("[m7] (v) dpc written=0x%llx readback=0x%llx (expect "
+               "0x%llx)\n",
+               (unsigned long long)LOAD_PC, (unsigned long long)dpc_v,
+               (unsigned long long)LOAD_PC);
+        ok = ok && o5 && ordpc && (dpc_v == LOAD_PC);
+        bool ores = j.resume_req(dmstatus, "resume (v)");
+        bool oh   = j.halt_req(dmstatus, "halt (v)");
+        uint64_t mcause = 0, mepc = 0;
+        bool omc   = j.abstract_reg_read(CSR_MCAUSE, mcause, "mcause (v)");
+        bool omepc = j.abstract_reg_read(CSR_MEPC,   mepc,   "mepc (v)");
+        bool mepc_ok = (mepc == LOAD_PC) || (mepc == LOAD_PC + 4);
+        printf("[m7] (v) slot1 isolated (slot0 disarmed), dpc=LOAD_PC: "
+               "mcause=0x%llx (expect 3) mepc=0x%llx (expect 0x%llx or "
+               "0x%llx -- slot1 exec fires at LOAD_PC)\n",
+               (unsigned long long)mcause, (unsigned long long)mepc,
+               (unsigned long long)LOAD_PC, (unsigned long long)(LOAD_PC + 4));
+        bool okv = o5 && ores && oh && omc && omepc &&
+                   (mcause == MCAUSE_BREAKPOINT) && mepc_ok;
+        printf("[m7] (v) check: tselect readback==1=%s slot1 fires at "
+               "LOAD_PC (isolated)=%s\n", tsel_ok ? "ok" : "FAIL",
+               ((mcause == MCAUSE_BREAKPOINT) && mepc_ok) ? "ok" : "FAIL");
+        ok = ok && okv;
     }
 
     return ok;
