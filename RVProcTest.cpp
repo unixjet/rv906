@@ -109,6 +109,16 @@ static M7Opts m7_opts;
 #define M7_IDCODE      0x10000B6FU // TDT_DTM.v IDCODE_REG_DEFINE
 #define M7_DM_DMCONTROL 0x10
 #define M7_DM_DMSTATUS  0x11
+// M7 Task 7: remaining DM word offsets (rtl/TDT_DM.v:116-138; donor
+// tdt_dm.v:171-227 -- the DMI addr field IS the word offset, TDT_DTM
+// shifts <<2 to paddr).
+#define M7_DM_DATA0     0x04
+#define M7_DM_DATA1     0x05
+#define M7_DM_ABSTRACTCS 0x16
+#define M7_DM_COMMAND   0x17
+#define M7_DM_ITR       0x1F   // custom instruction channel (TDT_DM.v:139)
+#define M7_DM_PB0       0x20   // progbuf0-3 = 0x20-0x23 (TDT_DM.v:126-129)
+#define M7_DM_HALTSUM0  0x40   // = {31'b0, core_dm_halted_i} (TDT_DM.v:893)
 
 struct M7JTAG {
     int idle_cycle_num = 7;        // from dtmcs.idle (initDTM :1077)
@@ -199,7 +209,562 @@ struct M7JTAG {
         }
         return true;
     }
+
+    //=============================================================
+    // M7 Task 7: DM-level method ports (donor ext_debug, JTAG_DRV.vh)
+    //=============================================================
+    // Thin DMI wrappers over dmi_rw_check (which already busy-polls the
+    // individual scan to completion).
+    bool dmi_read(uint32_t addr, uint32_t &data, const char *what)
+    { return dmi_rw_check(M7_DMI_READ, addr, data, what); }
+    bool dmi_write(uint32_t addr, uint32_t data, const char *what)
+    { return dmi_rw_check(M7_DMI_WRITE, addr, data, what); }
+
+    // abstract command word, donor access_register_by_abscmd
+    // (JTAG_DRV.vh:1471-1481): {cmdtype[31:24], aarsize[22:20],
+    // aarpostincrement[19], postexec[18], transfer[17], write[16],
+    // regno[15:0]}. aarsize=3 (XLEN=64) for the GPR/CSR access.
+    static uint32_t abs_cmd(uint32_t cmdtype, uint32_t aarsize,
+                            bool aarpi, bool postexec, bool transfer,
+                            bool wr, uint32_t regno)
+    {
+        return (cmdtype << 24) | (aarsize << 20) | (aarpi ? (1u << 19) : 0) |
+               (postexec ? (1u << 18) : 0) | (transfer ? (1u << 17) : 0) |
+               (wr ? (1u << 16) : 0) | regno;
+    }
+
+    // Issue an abstract command (write COMMAND 0x17, TDT_DM.v:134) and
+    // poll ABSTRACTCS 0x16 (busy bit 12) like the donor
+    // (JTAG_DRV.vh:1484-1494: a real DMI_READ of DM_ABSTRACTCS per round;
+    // the clone latches abstractcs.busy in TDT_DM.v:665-667).
+    // Returns the final ABSTRACTCS word; false on DMI error or busy
+    // timeout (the donor's "abstractcmd timeout" check).
+    bool abstract_cmd(uint32_t cmd, uint32_t &abstractcs, const char *what)
+    {
+        if (!dmi_write(M7_DM_COMMAND, cmd, what)) return false;
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            if (!dmi_read(M7_DM_ABSTRACTCS, abstractcs, what)) return false;
+            if ((abstractcs >> 12) & 1u) continue;   // busy
+            return true;                             // busy deasserted
+        }
+        printf("M7-DEBUG-FAIL: %s: abstractcmd busy timeout\n", what);
+        return false;
+    }
+
+    // DATA0/DATA1 (0x04/0x05): the abstract command data registers
+    // (TDT_DM.v:119-120; donor DM_DATA0/1). 64-bit value = {data1,data0}.
+    bool abscmd_data_wr(uint32_t lo, uint32_t hi, const char *what)
+    {
+        if (!dmi_write(M7_DM_DATA0, lo, what)) return false;
+        return dmi_write(M7_DM_DATA1, hi, what);
+    }
+    bool abscmd_data_rd(uint32_t &lo, uint32_t &hi, const char *what)
+    {
+        if (!dmi_read(M7_DM_DATA0, lo, what)) return false;
+        return dmi_read(M7_DM_DATA1, hi, what);
+    }
+
+    // Register read: command {aarsize=3, transfer=1, write=0, regno};
+    // result via DATA0/DATA1 (donor JTAG_DRV.vh:1496-1515: data_id==1 ->
+    // DATA0, ==2 -> DATA1). Fails on any nonzero cmderr.
+    bool abstract_reg_read(uint32_t regno, uint64_t &val, const char *what)
+    {
+        uint32_t acs = 0;
+        if (!abstract_cmd(abs_cmd(0, 3, false, false, true, false, regno),
+                          acs, what)) return false;
+        if (((acs >> 8) & 7) != 0) {
+            printf("M7-DEBUG-FAIL: %s: cmderr=%u after regno=0x%04x read\n",
+                   what, (acs >> 8) & 7, regno);
+            return false;
+        }
+        uint32_t lo, hi;
+        if (!abscmd_data_rd(lo, hi, what)) return false;
+        val = ((uint64_t)hi << 32) | lo;
+        return true;
+    }
+
+    // Register write: DATA0/DATA1 first, then command {aarsize=3,
+    // transfer=1, write=1, regno} (donor JTAG_DRV.vh:1516-1530). Fails on
+    // any nonzero cmderr.
+    bool abstract_reg_write(uint32_t regno, uint64_t val, const char *what)
+    {
+        if (!abscmd_data_wr((uint32_t)(val & 0xFFFFFFFFu),
+                            (uint32_t)(val >> 32), what)) return false;
+        uint32_t acs = 0;
+        if (!abstract_cmd(abs_cmd(0, 3, false, false, true, true, regno),
+                          acs, what)) return false;
+        if (((acs >> 8) & 7) != 0) {
+            printf("M7-DEBUG-FAIL: %s: cmderr=%u after regno=0x%04x write\n",
+                   what, (acs >> 8) & 7, regno);
+            return false;
+        }
+        return true;
+    }
+
+    // Same as abstract_reg_write but with an explicit postexec bit. The
+    // donor launches the program buffer with postexec=1 on the GPR write
+    // that sets the pb's last scratch register (JTAG_DRV.vh:2108-2120
+    // write_word_by_pb / :1996-2000 read_word_by_pb); pb_work_start then
+    // fires on (transfer && cmd_done && aarpostexec, TDT_DM.v:624-627).
+    bool abstract_reg_write_pe(uint32_t regno, uint64_t val, bool postexec,
+                               const char *what)
+    {
+        if (!abscmd_data_wr((uint32_t)(val & 0xFFFFFFFFu),
+                            (uint32_t)(val >> 32), what)) return false;
+        uint32_t acs = 0;
+        if (!abstract_cmd(abs_cmd(0, 3, false, postexec, true, true, regno),
+                          acs, what)) return false;
+        if (((acs >> 8) & 7) != 0) {
+            printf("M7-DEBUG-FAIL: %s: cmderr=%u after regno=0x%04x "
+                   "pe-write\n", what, (acs >> 8) & 7, regno);
+            return false;
+        }
+        return true;
+    }
+
+    // Custom instruction channel: write ITR (0x1F, TDT_DM.v:139), poll
+    // ABSTRACTCS busy (donor execute_itr, JTAG_DRV.vh:1404-1426: same
+    // write-then-poll shape; the clone clears busy on core_dm_itr_done_i,
+    // TDT_DM.v:302/789-813).
+    bool execute_itr(uint32_t inst, const char *what)
+    {
+        if (!dmi_write(M7_DM_ITR, inst, what)) return false;
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            uint32_t acs;
+            if (!dmi_read(M7_DM_ABSTRACTCS, acs, what)) return false;
+            if ((acs >> 12) & 1u) continue;   // busy
+            return true;
+        }
+        printf("M7-DEBUG-FAIL: %s: ITR busy timeout\n", what);
+        return false;
+    }
+
+    // Program buffer DMI access: word id 0-3 -> DM offset 0x20+id
+    // (TDT_DM.v:126-129; donor access_progbuf, JTAG_DRV.vh:1341-1354).
+    bool progbuf_wr(uint32_t id, uint32_t val, const char *what)
+    { return dmi_write(M7_DM_PB0 + id, val, what); }
+    bool progbuf_rd(uint32_t id, uint32_t &val, const char *what)
+    { return dmi_read(M7_DM_PB0 + id, val, what); }
+
+    // Donor write_word_by_pb (JTAG_DRV.vh:2071-2130): progbuf =
+    // {sw x7,0(x6); ebreak}. The address is written to x6 (0x1006) by a
+    // plain GPR write; the value is written to x7 (0x1007) by a GPR write
+    // with postexec=1, which launches the pb on (transfer && cmd_done &&
+    // aarpostexec) (TDT_DM.v:624-627). The core runs sw, then ebreak
+    // re-halts it (cause=1). SW_X7_0_X6=0x00732023, EBREAK=0x00100073.
+    bool write_word_by_pb(uint64_t addr, uint32_t val, const char *what)
+    {
+        if (!progbuf_wr(0, 0x00732023, what)) return false;  // sw x7,0(x6)
+        if (!progbuf_wr(1, 0x00100073, what)) return false;  // ebreak
+        if (!abstract_reg_write_pe(0x1006, addr, false, what))
+            return false;                              // x6 = addr
+        if (!abstract_reg_write_pe(0x1007, val, true, what))
+            return false;                              // x7 = val; launch pb
+        uint32_t hs = 0;
+        if (!dmi_read(M7_DM_HALTSUM0, hs, what)) return false;
+        if (hs != 1) {
+            printf("M7-DEBUG-FAIL: %s: pb ebreak did not re-halt\n", what);
+            return false;
+        }
+        return true;
+    }
+    // Donor read_word_by_pb (JTAG_DRV.vh:1959-2013): progbuf =
+    // {lw x7,0(x6); ebreak}; launched by the GPR write x6=addr with
+    // postexec=1; the loaded x7 is read back with a plain GPR read.
+    // LW_X7_0_X6=0x00032383, EBREAK=0x00100073.
+    bool read_word_by_pb(uint64_t addr, uint32_t &val, const char *what)
+    {
+        if (!progbuf_wr(0, 0x00032383, what)) return false;  // lw x7,0(x6)
+        if (!progbuf_wr(1, 0x00100073, what)) return false;  // ebreak
+        if (!abstract_reg_write_pe(0x1006, addr, true, what))
+            return false;                              // x6 = addr; launch pb
+        uint64_t v = 0;
+        if (!abstract_reg_read(0x1007, v, what)) return false;  // x7 = loaded
+        val = (uint32_t)(v & 0xFFFFFFFFu);
+        return true;
+    }
+
+    // halt_req: dmcontrol = haltreq(31)|dmactive(0) = 0x80000001, then
+    // poll HALTSUM0 (0x40) == 1 and check dmstatus.anyhalted (bit 8) --
+    // donor hart0_sync_halt_req (JTAG_DRV.vh:1281-1309).
+    bool halt_req(uint32_t &dmstatus, const char *what)
+    {
+        if (!dmi_write(M7_DM_DMCONTROL, 0x80000001u, what)) return false;
+        uint32_t hs = 0;
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            if (!dmi_read(M7_DM_HALTSUM0, hs, what)) return false;
+            if (hs == 1) break;
+        }
+        if (hs != 1) {
+            printf("M7-DEBUG-FAIL: %s: haltsum0 timeout\n", what);
+            return false;
+        }
+        if (!dmi_read(M7_DM_DMSTATUS, dmstatus, what)) return false;
+        return ((dmstatus >> 8) & 1u) == 1;   // anyhalted
+    }
+
+    // resume: dmcontrol = resumereq(30)|dmactive(0) = 0x40000001, poll
+    // dmstatus anyresumeack(16)/allresumeack(17) -- donor hart0_resume
+    // (JTAG_DRV.vh:1311-1338).
+    bool resume_req(uint32_t &dmstatus, const char *what)
+    {
+        if (!dmi_write(M7_DM_DMCONTROL, 0x40000001u, what)) return false;
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            if (!dmi_read(M7_DM_DMSTATUS, dmstatus, what)) return false;
+            if (((dmstatus >> 16) & 3u) != 0) break;
+        }
+        return ((dmstatus >> 16) & 3u) != 0;
+    }
+
+    // wait_halted: poll dmstatus until anyhalted(8)==1 (no dmcontrol
+    // write). Used to catch the step-halt / pb-ebreak re-halt that happens
+    // AFTER a resume was already issued.
+    bool wait_halted(uint32_t &dmstatus, const char *what)
+    {
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            if (!dmi_read(M7_DM_DMSTATUS, dmstatus, what)) return false;
+            if ((dmstatus >> 8) & 1u) return true;
+        }
+        printf("M7-DEBUG-FAIL: %s: wait_halted timeout (anyhalted stuck 0)\n",
+               what);
+        return false;
+    }
+
+    // wait_running: poll dmstatus until anyrunning(10)==1 && anyhalted(8)==0
+    // (no dmcontrol write). Used after a resume/dret to confirm the core is
+    // genuinely running.
+    bool wait_running(uint32_t &dmstatus, const char *what)
+    {
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            if (!dmi_read(M7_DM_DMSTATUS, dmstatus, what)) return false;
+            if (((dmstatus >> 10) & 1u) && !((dmstatus >> 8) & 1u))
+                return true;
+        }
+        printf("M7-DEBUG-FAIL: %s: wait_running timeout (anyrunning stuck 0)\n",
+               what);
+        return false;
+    }
 };
+
+//=============================================================================
+// M7 Task 7: the extended debug e2e (deliverable 3, steps a-h) against the
+// spin ELF. Runs against a RUNNING core (called from m7_debug_smoke after
+// the base 6 steps re-enabled the DM). The C++ testbench IS the debug host
+// (no OpenOCD): every operation is a DMI scan through the JTAG driver.
+//
+// Donor semantics are ported verbatim from JTAG_DRV.vh (ext_debug):
+//   halt        <- hart0_sync_halt_req (:1281-1309)  dmcontrol=0x80000001,
+//                  poll HALTSUM0==1 then dmstatus.anyhalted
+//   resume      <- hart0_resume        (:1311-1338)  dmcontrol=0x40000001,
+//                  poll dmstatus anyresumeack/allresumeack
+//   abstract    <- access_register_by_abscmd (:1455-1535)  COMMAND 0x17,
+//                  poll ABSTRACTCS 0x16 busy(12), cmderr=[10:8], data via
+//                  DATA0/DATA1 0x04/0x05
+//   ITR         <- execute_itr         (:1404-1426)  ITR 0x1F, poll ABSTRACTCS
+//   progbuf     <- access_progbuf      (:1341-1354)  + write/read_word_by_pb
+//                  (:2245-2300)
+//
+// Register map (rtl/TDT_DM.v): DMCONTROL 0x10 (haltreq=31, resumereq=30,
+// dmactive=0; :321-391), DMSTATUS 0x11 (version[3:0]=2, anyhalted=8,
+// anyrunning=10, anyresumeack=16, allresumeack=17; :427-431), ABSTRACTCS
+// 0x16 (busy=12, cmderr=[10:8]; :665-666), COMMAND 0x17 (:589), ITR 0x1F
+// (:789-844), PB0-3 0x20-0x23 (:126-129), HALTSUM0 0x40 (=halted; :893),
+// DATA0/1 0x04/0x05 (:116-117, :875-891).
+//
+// dcsr/dpc live in the DTU (rtl/DTU.v): dcsr 0x7B0 (xdebugver[31:28]=4,
+// cause[8:6] latch-only at halt_ack, step=2, prv[1:0]; :175-256), dpc 0x7B1
+// (cp0_write_dpc + halt_ack latch of rtu_dtu_dpc; :264-271). They are
+// reached through the abstract CSR path (aarsize=3, regno<0x1000), which
+// the DM's REGACC FSM implements by saving x6 through dscratch1 and
+// routing the access through dscratch0 (TDT_DM.v:682-756, :796-818).
+//
+// Halt causes (rtl/RTU.v:1126-1137): trigger=2, ebreak=1, reset=5,
+// dm_sync=3 (a dmcontrol.haltreq halt), step=4. dpc at a halt = the
+// retiring instruction's PC (rtu_dtu_dpc = ex2_cur_pc, :1409).
+//
+// NOTE vs the brief: the brief's step (a) says "dcsr.cause==1 haltreq" but
+// the RTL (donor aq_rtu_retire.v:768-795, cloned at RTU.v:1126-1137)
+// encodes a dmcontrol.haltreq halt as cause=3 (dm_sync), NOT 1 (ebreak).
+// We assert cause==3 here, per clone discipline (donor is the spec).
+//=============================================================================
+static bool m7_debug_extended(M7JTAG &j)
+{
+    // Spin-ELF layout (test/m7/directed/debug_spin.S, objdump-verified):
+    //   x8  = 0x5A5A0000  (loop never touches x8 -> abstract read oracle)
+    //   x9  = 0xDEAD0000  (abstract write target)
+    //   x10 = loop counter, +1 per iteration (step oracle)
+    //   x13 = 0           (ITR target: addi x13,x13,1)
+    //   x6/x7 (0x1006/0x1007) are the pb scratch registers (donor pb path);
+    //   the spin loop never touches them.
+    //   LOOP = 0x80000020: addi x10,x10,1 ; j LOOP  (RVC-free, +4 stride).
+    // A dpc-range / step check therefore assumes every advance is +4.
+    const uint64_t LOOP   = 0x80000020ULL;
+    const uint64_t LOOPEN = 0x80000028ULL;
+    const uint32_t X8_VAL = 0x5A5A0000U;
+    const uint32_t R_X8   = 0x1008, R_X9   = 0x1009;
+    const uint32_t R_X10  = 0x100A, R_X13  = 0x100D;
+    const uint32_t CSR_DCSR = 0x7B0, CSR_DPC = 0x7B1;
+    const uint32_t DCSR_STEP = 1u << 2;
+    const uint32_t CAUSE_HALTEQ = 3, CAUSE_STEP = 4, CAUSE_EBREAK = 1;
+    const uint32_t DRET = 0x7B200073;
+    const uint32_t ADDI_X13 = 0x00130693;   // addi x13, x13, 1  (rd=x13, rs1=x13, imm=1)
+
+    bool ok = true;
+    uint32_t dmstatus = 0, dcsr = 0, acs = 0;
+
+    printf("[m7] === M7 Task 7 extended e2e (spin ELF; "
+           "halt/abstract/ITR/progbuf/step/resume/dret) ===\n");
+
+    // (0) Re-enable the DM: the base smoke's step (6) cleared dmactive, and
+    // while dmactive=0 the DM sits in sync_rst with the command engine
+    // held at reset (TDT_DM.v). Re-assert dmactive=1 before any command.
+    {
+        bool o = j.dmi_write(M7_DM_DMCONTROL, 1, "dmactive re-enable");
+        printf("[m7] (0) dmactive=1 (re-enable after base-smoke clear): %s\n",
+               o ? "ok" : "FAIL");
+        ok = ok && o;
+    }
+
+    // (c1) cmderr=4: issue an abstract GPR READ while the core is RUNNING.
+    // TDT_DM.v:658-660: (cmd_start && !hartsum0[0] && ~busy) -> cmderr=4
+    // ("not halted"). The command is refused; the engine stays idle.
+    {
+        uint32_t cmd = M7JTAG::abs_cmd(0, 3, false, false, true, false, R_X8);
+        bool o = j.abstract_cmd(cmd, acs, "running-abstract probe");
+        uint32_t ce = (acs >> 8) & 7, busy = (acs >> 12) & 1;
+        printf("[m7] (c1) abstract GPR read x8 while RUNNING: cmd=0x%08x "
+               "abstractcs=0x%08x (busy=%u cmderr=%u; expect cmderr=4): %s\n",
+               cmd, acs, busy, ce, (o && ce == 4) ? "ok" : "FAIL");
+        ok = ok && o && (ce == 4) && (busy == 0);
+        // Clear cmderr (TDT_DM.v:649-651 / donor tdt_dm.v:2030):
+        // abstractcs.cmderr[10:8] is write-1-to-clear, so all three bits
+        // must be set = 0x700 (bits 8,9,10). The passing dm_tb uses the
+        // same value (test/m7/unit/dm_tb.cpp:405 clear_cmderr ->
+        // apb_write(0x16, 0x700), verified cmderr==0 at :640).
+        bool oc = j.dmi_write(M7_DM_ABSTRACTCS, 0x700, "cmderr clear");
+        uint32_t acs_after = 0;
+        j.dmi_read(M7_DM_ABSTRACTCS, acs_after, "cmderr clear readback");
+        printf("[m7] (c1) clear cmderr (abstractcs=0x700): %s; readback "
+               "abstractcs=0x%08x cmderr=%u (expect 0)\n",
+               oc ? "ok" : "FAIL", acs_after, (acs_after >> 8) & 7);
+        ok = ok && oc && ((acs_after >> 8) & 7) == 0;
+    }
+
+    // (a) halt: dmcontrol.haltreq -> poll anyhalted; dcsr.cause==3 (dm_sync),
+    // dpc in the loop region, x8 still intact (the loop never writes x8).
+    {
+        bool o = j.halt_req(dmstatus, "halt_req");
+        uint64_t dpc = 0, x8 = 0, dcsr64 = 0;
+        bool od  = j.abstract_reg_read(CSR_DPC,  dpc,    "dpc read");
+        bool ox8 = j.abstract_reg_read(R_X8,     x8,     "x8 read");
+        bool ods = j.abstract_reg_read(CSR_DCSR, dcsr64, "dcsr read");
+        dcsr = (uint32_t)dcsr64;
+        uint32_t cause = (dcsr >> 6) & 7;
+        bool inloop = (dpc >= LOOP && dpc < LOOPEN);
+        printf("[m7] (a) halted: dmstatus=0x%08x dpc=0x%llx "
+               "dcsr=0x%08x (cause=%u; expect 3=dm_sync) x8=0x%llx\n",
+               dmstatus, (unsigned long long)dpc, dcsr, cause,
+               (unsigned long long)x8);
+        bool oka = o && od && ox8 && ods && inloop &&
+                   (cause == CAUSE_HALTEQ) && (x8 == X8_VAL);
+        printf("[m7] (a) check: dpc in [0x%llx,0x%llx)=%s cause=3:%s "
+               "x8 intact:%s\n",
+               (unsigned long long)LOOP, (unsigned long long)LOOPEN,
+               inloop ? "ok" : "FAIL",
+               (cause == CAUSE_HALTEQ) ? "ok" : "FAIL",
+               (x8 == X8_VAL) ? "ok" : "FAIL");
+        ok = ok && oka;
+    }
+
+    // (b) abstract GPR read (x8, matches the loop invariant) + write (x9)
+    // + readback. The x9 write uses a full 64-bit value to exercise the
+    // DATA0+DATA1 path (donor reads data0 and data1 separately,
+    // JTAG_DRV.vh:402-411). Donor access_register_by_abscmd r/w path.
+    {
+        const uint64_t X9_WR = 0xDEADBEEF11223344ULL;
+        uint64_t x8r = 0, x9r = 0;
+        bool or1 = j.abstract_reg_read(R_X8, x8r, "abs read x8");
+        bool ow1 = j.abstract_reg_write(R_X9, X9_WR, "abs write x9");
+        bool or2 = j.abstract_reg_read(R_X9, x9r, "abs read x9 readback");
+        printf("[m7] (b) abstract GPR: x8 read=0x%016llx (expect "
+               "0x%016llx); x9 write=0x%016llx readback=0x%016llx\n",
+               (unsigned long long)x8r, (unsigned long long)X8_VAL,
+               (unsigned long long)X9_WR, (unsigned long long)x9r);
+        bool okb = or1 && ow1 && or2 && (x8r == X8_VAL) && (x9r == X9_WR);
+        printf("[m7] (b) check: %s\n", okb ? "ok" : "FAIL");
+        ok = ok && okb;
+    }
+
+    // (c2) unsupported abstract command while HALTED: cmdtype=1 (illegal)
+    // -> cmderr=2 (TDT_DM.v:652-655: apbw_abscmd && cmdtype!=0 && ~busy).
+    {
+        uint32_t cmd = M7JTAG::abs_cmd(1, 3, false, false, false, false, 0);
+        bool o = j.abstract_cmd(cmd, acs, "unsupported-cmd probe");
+        uint32_t ce = (acs >> 8) & 7;
+        printf("[m7] (c2) unsupported abstract cmd (cmdtype=1) while halted: "
+               "cmd=0x%08x abstractcs=0x%08x (cmderr=%u; expect 2): %s\n",
+               cmd, acs, ce, (o && ce == 2) ? "ok" : "FAIL");
+        ok = ok && o && (ce == 2);
+        // Clear cmderr (write-1-to-clear on [10:8] = 0x700; TDT_DM.v:649-651,
+        // dm_tb.cpp:405). Verify the clear took before the ITR step, which
+        // needs cmderr==0 for the pre/post register reads.
+        bool oc = j.dmi_write(M7_DM_ABSTRACTCS, 0x700, "cmderr clear (c2)");
+        uint32_t acs2 = 0;
+        j.dmi_read(M7_DM_ABSTRACTCS, acs2, "cmderr clear (c2) readback");
+        printf("[m7] (c2) clear cmderr (abstractcs=0x700): %s; readback cmderr=%u (expect 0)\n",
+               oc ? "ok" : "FAIL", (acs2 >> 8) & 7);
+        ok = ok && oc && ((acs2 >> 8) & 7) == 0;
+    }
+
+    // (d) ITR: inject `addi x13,x13,1` via the ITR register. x13 0 -> 1.
+    // dpc is NOT auto-advanced by an ITR retire (DTU.dpc has no +4 arm;
+    // it latches only on halt_ack or cp0_write_dpc) -- the observable
+    // effect is the register increment, which is what we assert.
+    {
+        uint64_t x13a = 0, x13b = 0, dpca = 0, dpcl = 0;
+        bool o1  = j.abstract_reg_read(R_X13, x13a, "x13 pre-ITR");
+        bool o2  = j.abstract_reg_read(CSR_DPC, dpca, "dpc pre-ITR");
+        bool oi  = j.execute_itr(ADDI_X13, "ITR addi x13");
+        bool o3  = j.abstract_reg_read(R_X13, x13b, "x13 post-ITR");
+        bool o4  = j.abstract_reg_read(CSR_DPC, dpcl, "dpc post-ITR");
+        printf("[m7] (d) ITR addi x13,x13,1: x13 0x%llx -> 0x%llx "
+               "(expect +1); dpc 0x%llx -> 0x%llx (expect unchanged)\n",
+               (unsigned long long)x13a, (unsigned long long)x13b,
+               (unsigned long long)dpca, (unsigned long long)dpcl);
+        bool okd = o1 && o2 && oi && o3 && o4 &&
+                   (x13b == x13a + 1) && (dpcl == dpca);
+        printf("[m7] (d) check: %s\n", okd ? "ok" : "FAIL");
+        ok = ok && okd;
+    }
+
+    // (e1) progbuf raw DMI r/w: write a 4-word pattern to progbuf[0..3]
+    // (DM offset 0x20-0x23, TDT_DM.v:126-129), read back byte-exact.
+    {
+        uint32_t pat[4] = {0xDEADBEEF, 0xCAFEBABE, 0x0BADF00D, 0x12345678};
+        uint32_t rb[4]  = {0, 0, 0, 0};
+        bool okw = true, okr = true;
+        for (int i = 0; i < 4; i++)
+            okw = okw && j.progbuf_wr(i, pat[i], "pb wr");
+        for (int i = 0; i < 4; i++)
+            okr = okr && j.progbuf_rd(i, rb[i], "pb rd");
+        bool match = okw && okr &&
+                     rb[0]==pat[0] && rb[1]==pat[1] &&
+                     rb[2]==pat[2] && rb[3]==pat[3];
+        printf("[m7] (e1) progbuf raw r/w: wrote {0x%08x,0x%08x,0x%08x,"
+               "0x%08x} readback {0x%08x,0x%08x,0x%08x,0x%08x}: %s\n",
+               pat[0],pat[1],pat[2],pat[3], rb[0],rb[1],rb[2],rb[3],
+               match ? "ok" : "FAIL");
+        ok = ok && match;
+    }
+
+    // (e2) progbuf EXECUTION on the real core is NOT exercised here. Launching
+    // the pb via a postexec GPR write (TDT_DM.v:624-627 pb_work_start ->
+    // pb_work -> itr_send_pb -> the core executes the pb word) aborts Verilator
+    // with "%Error: Active region did not converge" (a combinational loop) on
+    // the REAL core -- for BOTH a memory pb (donor write_word_by_pb `sw`) and
+    // a pure-ALU pb ({addi x13,x13,1; ebreak}). Classification:
+    //   * Driver-side: NO. The postexec GPR write is issued exactly as the
+    //     donor does (JTAG_DRV.vh write_word_by_pb :2071-2130 /
+    //     read_word_by_pb :1959-2013); the (d) single-ITR path (same
+    //     dm_core_itr channel, itr_work mode) passes; PB_ADDR 0x80001000 is a
+    //     valid SRAM address (AXIAddrDecode slave 0 base 0x80000000).
+    //   * RTL-side: YES. The DM's pb engine is unit-verified in isolation
+    //     (test/m7/unit/dm_tb.cpp t12_progbuf, with a fake core that pulses
+    //     core_dm_itr_done_i), and the single-ITR (itr_work) path passes
+    //     e2e -- so the loop is in the real-core interaction with pb_work
+    //     mode (back-to-back pb-injected instructions), not the DM FSM or the
+    //     driver. Reported, not fixed (no RTL edits in M7 Task 7).
+    // The required brief step (e) "progbuf DMI-write pattern + byte-exact
+    // readback" is (e1) above and passes. The write_word_by_pb /
+    // read_word_by_pb donor methods remain available (deliverable 2).
+
+    // (f) step: dpc=LOOP head, dcsr.step=1, resume -> the core executes
+    // EXACTLY one instruction (addi x10,x10,1) then re-halts (cause=4).
+    // x10 (the loop counter) must advance by exactly 1.
+    {
+        uint64_t x10a = 0, x10b = 0, dpcr = 0, dcsr64 = 0;
+        bool o1  = j.abstract_reg_read(R_X10, x10a, "x10 pre-step");
+        bool o2  = j.abstract_reg_write(CSR_DPC, LOOP, "dpc write (step)");
+        bool o3  = j.abstract_reg_read(CSR_DCSR, dcsr64, "dcsr read (step)");
+        bool o4  = j.abstract_reg_write(CSR_DCSR,
+                                        (uint64_t)((uint32_t)dcsr64 |
+                                                   DCSR_STEP),
+                                        "dcsr.step=1");
+        // resume (step armed): runs one inst from dpc, then step-halts.
+        bool ores = j.resume_req(dmstatus, "step resume");
+        bool oh   = j.wait_halted(dmstatus, "step halt");
+        bool o5  = j.abstract_reg_read(R_X10, x10b, "x10 post-step");
+        bool o6  = j.abstract_reg_read(CSR_DPC, dpcr, "dpc post-step");
+        bool o7  = j.abstract_reg_read(CSR_DCSR, dcsr64, "dcsr post-step");
+        uint32_t cause = ((uint32_t)dcsr64 >> 6) & 7;
+        printf("[m7] (f) step: x10 0x%llx -> 0x%llx (expect +1); "
+               "dpc=0x%llx (expect 0x%llx); dcsr=0x%08x (cause=%u; "
+               "expect 4=step)\n",
+               (unsigned long long)x10a, (unsigned long long)x10b,
+               (unsigned long long)dpcr, (unsigned long long)LOOP,
+               (uint32_t)dcsr64, cause);
+        bool okf = o1 && o2 && o3 && o4 && ores && oh && o5 && o6 && o7 &&
+                   (x10b == x10a + 1) && (dpcr == LOOP) &&
+                   (cause == CAUSE_STEP);
+        printf("[m7] (f) check: %s\n", okf ? "ok" : "FAIL");
+        ok = ok && okf;
+    }
+
+    // (g) resume (no step): clear dcsr.step=0 (still set from (f)), resume
+    // -> core runs freely (anyrunning=1, anyhalted=0).
+    {
+        uint64_t dcsr64 = 0;
+        bool o1  = j.abstract_reg_read(CSR_DCSR, dcsr64, "dcsr read (resume)");
+        bool o2  = j.abstract_reg_write(CSR_DCSR,
+                                        (uint64_t)((uint32_t)dcsr64 &
+                                                   ~DCSR_STEP),
+                                        "dcsr.step=0");
+        bool ores = j.resume_req(dmstatus, "free resume");
+        bool orun = j.wait_running(dmstatus, "post-resume running");
+        uint32_t anyhalted  = (dmstatus >> 8) & 1;
+        uint32_t anyrunning = (dmstatus >> 10) & 1;
+        printf("[m7] (g) resume (step cleared): dmstatus=0x%08x "
+               "(anyhalted=%u anyrunning=%u; expect 0/1)\n",
+               dmstatus, anyhalted, anyrunning);
+        bool okg = o1 && o2 && ores && orun &&
+                   (anyhalted == 0) && (anyrunning == 1);
+        printf("[m7] (g) check: %s\n", okg ? "ok" : "FAIL");
+        ok = ok && okg;
+    }
+
+    // (h) dret: halt the running core (from (g)), position dpc at the loop
+    // head, then resume by executing DRET (0x7b200073) via ITR. The core
+    // exits debug mode (RTU.v:1143 retire_exit_debug = ... ex2_inst_dret)
+    // and runs from dpc. Confirm by re-halting and checking dpc is back in
+    // the loop and x10 advanced (genuinely running, not stuck).
+    {
+        uint64_t x10pre = 0, x10post = 0, dpcpost = 0;
+        // the core is running (from (g)); halt it before any register r/w.
+        bool oh1 = j.halt_req(dmstatus, "dret halt");
+        bool o1  = j.abstract_reg_read(R_X10, x10pre, "x10 pre-dret");
+        bool o2  = j.abstract_reg_write(CSR_DPC, LOOP, "dpc write (dret)");
+        bool od  = j.execute_itr(DRET, "ITR dret");
+        bool orun = j.wait_running(dmstatus, "post-dret running");
+        // let it run a few loop iterations, then re-halt and verify.
+        bool oh2 = j.halt_req(dmstatus, "post-dret re-halt");
+        bool o3  = j.abstract_reg_read(CSR_DPC, dpcpost, "dpc post-dret");
+        bool o4  = j.abstract_reg_read(R_X10, x10post, "x10 post-dret");
+        bool inloop = (dpcpost >= LOOP && dpcpost < LOOPEN);
+        printf("[m7] (h) dret: dmstatus(after)=0x%08x; re-halt dpc=0x%llx "
+               "(expect in loop); x10 0x%llx -> 0x%llx (expect advanced)\n",
+               dmstatus, (unsigned long long)dpcpost,
+               (unsigned long long)x10pre, (unsigned long long)x10post);
+        bool okh = oh1 && o1 && o2 && od && orun && oh2 && o3 && o4 &&
+                   inloop && (x10post > x10pre);
+        printf("[m7] (h) check: dret ran=%s dpc in loop=%s x10 advanced:%s\n",
+               (od && orun) ? "ok" : "FAIL",
+               inloop ? "ok" : "FAIL",
+               (x10post > x10pre) ? "ok" : "FAIL");
+        ok = ok && okh;
+    }
+
+    return ok;
+}
 
 // The Task-6 smoke (deliverable 3): run against a loaded ELF at reset
 // release -- the core is powered, out of reset and running, so dmstatus
@@ -282,6 +847,12 @@ static bool m7_debug_smoke(const std::function<void()> &core_tick)
            "readback dmcontrol=0x%08x (expect dmactive=0)\n", w0,
            ok6w ? "ok" : "FAIL", rdata);
     ok = ok && ok6w && ok6r && ((rdata & 1) == 0);
+
+    // M7 Task 7: the extended e2e (halt/abstract/ITR/progbuf/step/resume/
+    // dret) against the spin ELF. The spin ELF NEVER terminates, so the
+    // harness exits right after this smoke (TB::init, see below) -- the
+    // marker below gates the whole sequence (base 6 steps + extended).
+    ok = ok && m7_debug_extended(j);
 
     dut.jtag.run_to_idle();
     printf("[m7] JTAG scan totals: %llu TCK cycles "
@@ -601,22 +1172,20 @@ struct TB : public TestBench {
         printf("[init] initial_pc=%lx initial_sp=%lx dtb_addr=%lx\n",
             (unsigned long)initial_pc, (unsigned long)initial_sp, (unsigned long)dtb_addr);
 
-        // M7 Task 6: --m7-debug -- run the JTAG DMI smoke (m7_debug_smoke)
-        // now that the core is out of reset and running, BEFORE normal
-        // stepping begins. The JTAG driver (dut.cpp) owns tck and
-        // interleaves it with the core clk; between the TCK phases it
-        // advances the core through core_tick() -- the full step()
-        // protocol (memory/AXI/UART service) -- so the core keeps
-        // executing for the ~3k cycles the scan takes. The scan is
-        // off-path for the core: dmactive set/clear only, no halt
-        // requested (dmstatus.anyhalted stays 0). On failure the verdict
-        // is M7-DEBUG-FAIL + exit(1); success prints M7-DEBUG-PASS and
-        // the run continues normally (if the ELF finishes during the
-        // scan, the tohost verdict is simply picked up by the first
-        // post-smoke step).
+        // M7 Task 7: --m7-debug -- run the JTAG DMI smoke (m7_debug_smoke,
+        // base 6 steps) + the extended e2e (m7_debug_extended: halt /
+        // abstract GPR+CSR r/w / ITR / progbuf / step / resume / dret)
+        // against the spin ELF, now that the core is out of reset and
+        // running, BEFORE normal stepping begins. The JTAG driver
+        // (dut.cpp) owns tck and interleaves it with the core clk; between
+        // the TCK phases it advances the core through core_tick() -- the
+        // full step() protocol (memory/AXI/UART service) -- so the core
+        // keeps executing for the cycles the scan takes. The verdict
+        // (M7-DEBUG-PASS/FAIL) gates the WHOLE sequence. The spin ELF
+        // NEVER terminates (no tohost write), so the harness EXITS here
+        // (0 on PASS, 1 on FAIL) instead of entering the normal run loop.
         if (m7_opts.debug) {
-            if (!m7_debug_smoke([this] { core_tick(); }))
-                exit(1);
+            exit(m7_debug_smoke([this] { core_tick(); }) ? 0 : 1);
         }
 
         // Config bank: poked after dut.init() and before the first step,
