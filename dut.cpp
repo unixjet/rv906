@@ -13,7 +13,7 @@
 #include "dut.h"
 #include <stdio.h>
 
-DUT::DUT() : vdut(new VDUT) {
+DUT::DUT() : vdut(new VDUT), jtag(vdut) {
 #ifdef VERISIM_TRACE
     tfp = nullptr;
     trace_tick = 0;
@@ -30,6 +30,82 @@ DUT::~DUT() {
     }
 }
 
+//=============================================================================
+// M7 Task 6: JTAG driver (dual-clock interleave)
+//=============================================================================
+// The driver owns BOTH clocks with a fixed interleave (design doc
+// 2026-09-11-m7-debug-design.md "SoC layer", risk #2; donor ratio
+// TCK=clk/4, dtmcs.idle=7):
+//   * one TCK cycle = TMS/TDI settled, 4 clk edges (TCK low phase), TCK
+//     rising edge, 4 clk edges (TCK high phase), TCK falling edge.
+//     => 4 clk edges per TCK phase, clk/tck = 8, which meets the DMI
+//     bridge contract Freq.pclk/Freq.tck > 8/(IDLE_CYCLE-4) = 8/3
+//     (TDT_DTM.v TIMING CONTRACT: the 4-FF pulse syncs + APB FSM must
+//     complete inside the 7-idle-TCK budget between DMI ops).
+//   * the 4 clk edges of each TCK phase are TWO full core clock cycles,
+//     advanced through the `core_tick` callback the harness passes in
+//     (one complete step-equivalent: pre-clock input driving, clk low +
+//     high edges, post-clock output read, then memory/AXI/UART service --
+//     the same code path as the normal run's step()). This is what keeps
+//     the core RUNNING while the scan runs: an un-serviced core would
+//     sample the pre-initialised memory response (0) on its first fetch
+//     and trap-loop on mtvec=0. The driver owns the interleave (when the
+//     TCK edges fall and how many core cycles separate them); the tick
+//     is the harness's atomic "one core clock cycle" primitive.
+//   * clk and tck are NEVER toggled in the same eval (each TCK toggle
+//     gets its own eval()); TMS/TDI are settled 4 clk edges BEFORE the
+//     TCK rising edge that samples them (the TAP FSM and the DR shifter
+//     are clocked on posedge tck, TDT_DTM.v).
+//   * TDO is returned sampled AFTER the TCK falling-edge eval: TDO is
+//     negedge-registered (tdo_r <= chain_shifter[0] on negedge tck,
+//     TDT_DTM.v TDO section; donor tdt_dtm_chain.v:105-122), so the
+//     falling-edge eval has already latched the bit shifted out by the
+//     cycle's rising edge. This equals the donor's posedge-sampled TDO
+//     (JTAG_DRV.vh shift_dr reads `jtag_tdo at @(posedge) -- tdo_r is
+//     stable between negedges).
+uint32_t JTAG::cycle(uint32_t tms, uint32_t tdi,
+                     const std::function<void()> &core_tick)
+{
+    // TMS/TDI settled well before the TCK rising edge (a full eval below
+    // plus the 4 clk edges of the low phase that follow).
+    v->jtag_tms = tms & 1;
+    v->jtag_tdi = tdi & 1;
+    v->eval();
+
+    // TCK low phase: two core clock cycles (4 clk edges). The DMI->APB
+    // bridge (pclk domain) and the DM run on these edges between TCK
+    // edges -- this is what carries a DMI request across the
+    // tck<->clk pulse syncs.
+    core_tick();
+    core_tick();
+
+    // TCK rising edge (TAP state machine + DR shifter clock).
+    v->jtag_tck = 1;
+    v->eval();
+    tck_cycles++;
+
+    // TCK high phase: two core clock cycles (4 clk edges).
+    core_tick();
+    core_tick();
+
+    // TCK falling edge (TDO latched).
+    v->jtag_tck = 0;
+    v->eval();
+
+    // TDO sampled after the TCK falling-edge eval.
+    return v->jtag_tdo;
+}
+
+void JTAG::run_to_idle()
+{
+    // Idle pad state: TAP stays in Run-Test/Idle (TMS=0 in Idle), no
+    // scans, DMI engine idle, TDO returns to 1 (TDT_DTM.v tdo fallthrough).
+    v->jtag_tms = 0;
+    v->jtag_tdi = 0;
+    v->jtag_tck = 0;
+    v->eval();
+}
+
 void DUT::init(RV_AType pc, RV_UType sp, RV_UType dtb) {
 #ifdef VERISIM_TRACE
     Verilated::traceEverOn(true);
@@ -39,13 +115,14 @@ void DUT::init(RV_AType pc, RV_UType sp, RV_UType dtb) {
 #endif
 
     // Reset sequence
-    // M7 Task 5: JTAG debug pad stubs (TASK 6 REPLACES THE INPUT STUBS WITH
-    // THE C++ JTAG DRIVER -- keep this comment as the replacement point).
-    // JTAG idle: tck/tms/tdi tied 0 -> TAP in Test-Logic-Reset, no scans,
-    // DTM APB master idle, dmactive stays 0 -> DM off-path identity.
+    // M7 Task 6: JTAG debug pads are owned by the C++ JTAG driver (struct
+    // JTAG, see the JTAG::cycle contract above). Idle at reset:
+    // tck/tms/tdi=0 -> TAP in Test-Logic-Reset, no scans, DTM APB master
+    // idle, dmactive stays 0 -> DM off-path identity.
     // tdt_rst_n is the DM's own async reset (D-M7-3); held 1 (released) so
-    // the DM is powered but inactive (all core-side outputs at reset
-    // constants, SBA master driving no AXI requests).
+    // the DM is powered but inactive (mirrors the donor ciu_rst_b power-on
+    // deassert -- all core-side outputs at reset constants, SBA master
+    // driving no AXI requests).
     vdut->jtag_tck   = 0;
     vdut->jtag_tms   = 0;
     vdut->jtag_tdi   = 0;

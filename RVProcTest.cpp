@@ -66,6 +66,235 @@ int RVProcAXI_Verilator(AXI4L::BUS<NUM_MASTERS, NUM_SLAVES> *axi_bus, IO_PINS *i
     do{dut.init(initial_pc, initial_sp, dtb_addr); dut.sync(cpu);}while(0)
 
 //=============================================================================
+// M7 Task 6: JTAG DMI driver + --m7-debug smoke
+//=============================================================================
+// C++ port of the donor's ext_debug class (refs/openc906/smart_run/tests/
+// cases/debug/JTAG_DRV.vh:936-1143): jtag_tlr, write_ir, shift_dr and
+// dmi_rw with busy-poll + timeout. The donor's TAP sequences, IR/DR scan
+// formats, poll/timeout constants and bit positions are the de-facto
+// contract (design doc M7 "SoC layer", risk #1) and are ported verbatim;
+// the low-level clocking (TCK/clk interleave, TDO sampling) lives in the
+// JTAG driver in dut.cpp.
+//
+// IR codes (JTAG_DRV.vh:458-465): IDCODE=5'h01, DMI_ACC=5'h02,
+// DTMCS=5'h10, DMI=5'h11; abits=10, dtmcs.version=1 (TDT_DTM.v).
+// DMI ops (JTAG_DRV.vh:467-469): NOP=00, READ=01, WRITE=10 (the TDT_DTM
+// request engine fires on ^op, i.e. 01 or 10 -- TDT_DTM.v wr_vld).
+// DMI DR = {addr[9:0], data[31:0], op[1:0]}, 44 bits, LSB-first scan
+// (donor :1103, TDT_DTM.v address/data/op capture). The DR readout is
+// {addr[43:34], data[33:2], res_op[1:0]} (TDT_DTM.v dmi_total):
+// res_op 00=done, 11=busy (request in flight), 10=failed -> error
+// (donor rwMemorybyDMI error check, :1109-1112).
+// Polling (rwMemorybyDMIwithCheck, :1121-1143): after an op, re-scan the
+// DMI DR with op=NOP until res_op==00; 30-round timeout (max_poll_round_num,
+// :1047). The 7-idle-TCK spacing after every DR update (dtmcs.idle, learned
+// in initDTM, :1061-1079) is what guarantees the request has completed
+// before the next scan (TDT_DTM.v TIMING CONTRACT).
+//
+// DM word offsets used by the smoke (JTAG_DRV.vh:502-503): dmcontrol=0x10,
+// dmstatus=0x11.
+struct M7Opts {
+    bool debug = false;   // --m7-debug
+};
+static M7Opts m7_opts;
+
+#define M7_IR_IDCODE   0x01
+#define M7_IR_DMI      0x11
+#define M7_IR_DTMCS    0x10
+#define M7_DMI_NOP     0x0
+#define M7_DMI_READ    0x1
+#define M7_DMI_WRITE   0x2
+#define M7_DMI_DR_LEN  44          // abits(10) + data(32) + op(2)
+#define M7_MAX_POLL    30          // donor max_poll_round_num (:1047)
+#define M7_IDCODE      0x10000B6FU // TDT_DTM.v IDCODE_REG_DEFINE
+#define M7_DM_DMCONTROL 0x10
+#define M7_DM_DMSTATUS  0x11
+
+struct M7JTAG {
+    int idle_cycle_num = 7;        // from dtmcs.idle (initDTM :1077)
+    // The harness's "one core clock cycle" service callback (TB::
+    // core_tick) -- passed into every JTAG::cycle so the core KEEPS
+    // RUNNING (its fetches/AXI/UART serviced) while the scan runs.
+    std::function<void()> tick;
+
+    // jtag_tlr: the standard 5x TMS=1 (D-M7-2; the clone has no trst_n --
+    // the donor's jtag_rst used trst_b, JTAG_DRV.vh:559-588), then run to
+    // Idle. Returns the last TDO (1 while the TAP is not shifting).
+    uint32_t tlr() {
+        uint32_t tdo = 0;
+        for (int i = 0; i < 5; i++) tdo = dut.jtag.cycle(1, 0, tick);
+        tdo = dut.jtag.cycle(0, 0, tick);   // TLR -> Run-Test/Idle
+        return tdo;
+    }
+
+    // write_ir (JTAG_DRV.vh:591-654, JTAG_5 path; rwDTMReg :1086 calls it
+    // with idle_cycles=0): IDLE -> SELECT-DR -> SELECT-IR -> CAPTURE-IR ->
+    // SHIFT-IR (5 bits LSB-first) -> EXIT1-IR, leaving the TAP in
+    // EXIT1-IR; shift_dr() completes the IR update and the DR scan.
+    void write_ir(uint32_t ir) {
+        dut.jtag.cycle(1, 0, tick);   // IDLE -> SELECT_DR_SCAN
+        dut.jtag.cycle(1, 0, tick);   // -> SELECT_IR_SCAN
+        dut.jtag.cycle(0, 0, tick);   // -> CAPTURE_IR
+        dut.jtag.cycle(0, 0, tick);   // -> SHIFT_IR (IR captured)
+        dut.jtag.cycle(0, 0, tick);   // donor's wash cycle (:636; TDI don't-care)
+        for (int i = 0; i < 4; i++) { dut.jtag.cycle(0, ir & 1, tick); ir >>= 1; }
+        dut.jtag.cycle(1, ir & 1, tick);   // 5th bit (LSB-first) -> EXIT1_IR
+    }
+
+    // shift_dr (JTAG_DRV.vh:658-729, JTAG_5 path): completes the IR update
+    // (TMS=1, TMS=1), captures the DR, shifts `len` bits LSB-first while
+    // shifting `din` in LSB-first, exits to IDLE and idles idle_cycle_num
+    // TCK cycles (the DMI spacing contract). Returns the shifted-out
+    // value (bit i of the DUT's DR at bit i of the return).
+    uint64_t shift_dr(int len, uint64_t din) {
+        uint64_t dout = 0;
+        dut.jtag.cycle(1, 0, tick);   // EXIT1_IR -> UPDATE_IR
+        dut.jtag.cycle(1, 0, tick);   // -> SELECT_DR_SCAN (IR updated on this edge)
+        dut.jtag.cycle(0, 0, tick);   // -> CAPTURE_DR
+        dout |= dut.jtag.cycle(0, 0, tick);   // -> SHIFT_DR; TDO = DR bit 0
+        for (int i = 1; i < len; i++) {
+            uint32_t tdi = (din >> (i - 1)) & 1;
+            dout |= ((uint64_t)dut.jtag.cycle(0, tdi, tick) & 1) << i;
+        }
+        dut.jtag.cycle(1, 0, tick);   // -> EXIT1_DR
+        dut.jtag.cycle(1, 0, tick);   // -> UPDATE_DR
+        dut.jtag.cycle(0, 0, tick);   // -> IDLE (DR updated; DMI request fires)
+        for (int i = 0; i < idle_cycle_num; i++) dut.jtag.cycle(0, 0, tick);
+        return dout;
+    }
+
+    // rwDTMReg (:1084-1091): write_ir + shift_dr for the DMI register.
+    uint64_t dmi_scan(uint32_t op, uint32_t addr, uint32_t data) {
+        uint64_t wr = ((uint64_t)addr << 34) | ((uint64_t)data << 2) | op;
+        write_ir(M7_IR_DMI);
+        return shift_dr(M7_DMI_DR_LEN, wr);
+    }
+
+    // rwMemorybyDMIwithCheck (:1121-1143): issue one DMI op, then poll the
+    // DMI DR with op=NOP until res_op==00 (or the 30-round timeout /
+    // res_op==10 failed). `data` is updated with the readout data field
+    // ([33:2] -- the read value once the request completes).
+    // Returns true when res_op==00 with no failed op.
+    bool dmi_rw_check(uint32_t op, uint32_t addr, uint32_t &data,
+                      const char *what) {
+        uint64_t rd = dmi_scan(op, addr, data);
+        uint32_t res_op = rd & 3;
+        data = (uint32_t)((rd >> 2) & 0xFFFFFFFFULL);
+        bool error = (res_op == 2);
+        for (int i = 0; i < M7_MAX_POLL; i++) {
+            rd = dmi_scan(M7_DMI_NOP, addr, 0);
+            res_op = rd & 3;
+            data = (uint32_t)((rd >> 2) & 0xFFFFFFFFULL);
+            if (res_op == 2) error = true;
+            if (res_op == 0 || res_op == 2) break;
+        }
+        if (res_op == 3) {
+            printf("M7-DEBUG-FAIL: %s: DMI busy poll timeout "
+                   "(%d rounds, last res_op=busy)\n", what, M7_MAX_POLL);
+            return false;
+        }
+        if (error) {
+            printf("M7-DEBUG-FAIL: %s: DMI res_op=10 (op failed)\n", what);
+            return false;
+        }
+        return true;
+    }
+};
+
+// The Task-6 smoke (deliverable 3): run against a loaded ELF at reset
+// release -- the core is powered, out of reset and running, so dmstatus
+// reports version=2 with anyhalted=0 (no halt requested). `core_tick`
+// is the harness's one-core-clock-cycle service callback (TB::
+// core_tick); it runs between the TCK phases so the core KEEPS RUNNING
+// (fetches/AXI/UART serviced) while the scan runs -- an un-serviced
+// core would sample the pre-initialised memory response (0) on its
+// first fetch and trap-loop on mtvec=0.
+static bool m7_debug_smoke(const std::function<void()> &core_tick)
+{
+    printf("[m7] M7 debug smoke: JTAG DTM/DMI against the running core\n");
+    M7JTAG j;
+    j.tick = core_tick;
+    bool ok = true;
+
+    // (1) jtag_tlr: 5x TMS=1 + run to Idle; TDO must read 1 (TDT_DTM.v
+    //     holds tdo=1 whenever the TAP is not shifting).
+    uint32_t tdo = j.tlr();
+    printf("[m7] (1) jtag_tlr: TDO=%u (expect 1)\n", tdo);
+    if (tdo != 1) ok = false;
+
+    // (2) IDCODE read: IR=5'h01, 32-bit DR (JTAG_DRV.vh:1040).
+    uint64_t rd = 0;
+    j.write_ir(M7_IR_IDCODE);
+    rd = j.shift_dr(32, 0);
+    printf("[m7] (2) IDCODE = 0x%08llx (expect 0x%08x)\n",
+           (unsigned long long)rd, M7_IDCODE);
+    if ((uint32_t)rd != M7_IDCODE) ok = false;
+
+    // (3) DTMCS read: IR=5'h10, 32-bit DR; the initDTM checks
+    // (JTAG_DRV.vh:1061-1079): version==1, abits==10; learn idle[14:12].
+    j.write_ir(M7_IR_DTMCS);
+    rd = j.shift_dr(32, 0);
+    uint32_t dtmcs = (uint32_t)rd;
+    uint32_t dtm_version = dtmcs & 0xF;
+    uint32_t dtm_abits   = (dtmcs >> 4) & 0x3F;
+    uint32_t dtm_idle    = (dtmcs >> 12) & 0x7;
+    printf("[m7] (3) DTMCS = 0x%08x (version=%u abits=%u idle=%u; "
+           "expect version=1 abits=10)\n", dtmcs, dtm_version, dtm_abits,
+           dtm_idle);
+    if (dtm_version != 1 || dtm_abits != 10) ok = false;
+    j.idle_cycle_num = (dtm_idle ? (int)dtm_idle : 7);
+
+    // (4) DMI write dmcontrol.dmactive=1 (dmcontrol=0x10; data=0x1), then
+    // read dmcontrol back to prove the bit landed (the DM APB slave is
+    // live regardless of dmactive, so the readback is the gate).
+    uint32_t w = 1, rdata = 0;
+    bool ok4w = j.dmi_rw_check(M7_DMI_WRITE, M7_DM_DMCONTROL, w,
+                               "dmcontrol dmactive=1 write");
+    bool ok4r = j.dmi_rw_check(M7_DMI_READ, M7_DM_DMCONTROL, rdata,
+                               "dmcontrol readback");
+    printf("[m7] (4) DMI write dmcontrol=0x%08x (dmactive=1): %s; "
+           "readback dmcontrol=0x%08x (expect dmactive=1)\n", w,
+           ok4w ? "ok" : "FAIL", rdata);
+    ok = ok && ok4w && ok4r && ((rdata & 1) == 1);
+
+    // (5) DMI read dmstatus (0x11): version==2 (TDT_DM.v DM_VERSION,
+    //     spec 0.13), anyhalted==0 (bit 8 -- core running, no halt
+    //     requested).
+    uint32_t dmstatus = 0;
+    bool ok5 = j.dmi_rw_check(M7_DMI_READ, M7_DM_DMSTATUS, dmstatus,
+                              "dmstatus read");
+    uint32_t dm_version  = dmstatus & 0xF;
+    uint32_t anyhalted   = (dmstatus >> 8) & 1;
+    uint32_t anyrunning  = (dmstatus >> 10) & 1;
+    printf("[m7] (5) dmstatus = 0x%08x (version=%u anyhalted=%u "
+           "anyrunning=%u; expect version=2 anyhalted=0): %s\n",
+           dmstatus, dm_version, anyhalted, anyrunning,
+           ok5 ? "ok" : "FAIL");
+    ok = ok && ok5 && (dm_version == 2) && (anyhalted == 0);
+
+    // (6) DMI write dmcontrol.dmactive=0 + readback (dmactive set/clear).
+    uint32_t w0 = 0;
+    bool ok6w = j.dmi_rw_check(M7_DMI_WRITE, M7_DM_DMCONTROL, w0,
+                               "dmcontrol dmactive=0 write");
+    bool ok6r = j.dmi_rw_check(M7_DMI_READ, M7_DM_DMCONTROL, rdata,
+                               "dmcontrol readback after clear");
+    printf("[m7] (6) DMI write dmcontrol=0x%08x (dmactive=0): %s; "
+           "readback dmcontrol=0x%08x (expect dmactive=0)\n", w0,
+           ok6w ? "ok" : "FAIL", rdata);
+    ok = ok && ok6w && ok6r && ((rdata & 1) == 0);
+
+    dut.jtag.run_to_idle();
+    printf("[m7] JTAG scan totals: %llu TCK cycles "
+           "(clk/tck=8 interleave, TDO negedge-sampled)\n",
+           (unsigned long long)dut.jtag.tck_cycles);
+    if (ok)
+        printf("M7-DEBUG-PASS\n");
+    else
+        printf("M7-DEBUG-FAIL\n");
+    return ok;
+}
+
+//=============================================================================
 // M1 FetchSink accessors -- RETIRED in Task 7 (FetchSink.v deleted)
 //=============================================================================
 // These functions used to poke/sample FetchSink's harness config bank and
@@ -372,6 +601,24 @@ struct TB : public TestBench {
         printf("[init] initial_pc=%lx initial_sp=%lx dtb_addr=%lx\n",
             (unsigned long)initial_pc, (unsigned long)initial_sp, (unsigned long)dtb_addr);
 
+        // M7 Task 6: --m7-debug -- run the JTAG DMI smoke (m7_debug_smoke)
+        // now that the core is out of reset and running, BEFORE normal
+        // stepping begins. The JTAG driver (dut.cpp) owns tck and
+        // interleaves it with the core clk; between the TCK phases it
+        // advances the core through core_tick() -- the full step()
+        // protocol (memory/AXI/UART service) -- so the core keeps
+        // executing for the ~3k cycles the scan takes. The scan is
+        // off-path for the core: dmactive set/clear only, no halt
+        // requested (dmstatus.anyhalted stays 0). On failure the verdict
+        // is M7-DEBUG-FAIL + exit(1); success prints M7-DEBUG-PASS and
+        // the run continues normally (if the ELF finishes during the
+        // scan, the tohost verdict is simply picked up by the first
+        // post-smoke step).
+        if (m7_opts.debug) {
+            if (!m7_debug_smoke([this] { core_tick(); }))
+                exit(1);
+        }
+
         // Config bank: poked after dut.init() and before the first step,
         // per the plan's pinned harness config mechanism (owner: Task 5.2).
         // These registers have no RTL driver, so what is written here
@@ -514,7 +761,14 @@ struct TB : public TestBench {
                INV_PULSES, kind[which], (unsigned long long)tb_cycle);
     }
 
-    bool step() override {
+    // M7 Task 6: one full core clock cycle with full peripheral
+    // servicing -- the step() protocol factored out so the --m7-debug
+    // JTAG smoke (TB::init) can advance the core cycle-by-cycle between
+    // TCK phases (JTAG::cycle's core_tick callback). The core keeps
+    // running (fetches/AXI/UART serviced) while the scan runs; without
+    // this its first fetch would sample the pre-initialised memory
+    // response (0) and trap-loop on mtvec=0.
+    bool core_tick() {
         bool quitted = RVProcAXI(&axi_bus, &io_pins);
 
         // Post-clock: the committed-stream registers hold what this edge
@@ -544,6 +798,10 @@ struct TB : public TestBench {
         axi_uart.update(&io_pins.uart_ch);
 
         return quitted;
+    }
+
+    bool step() override {
+        return core_tick();
     }
 
     // End-of-run verdict. TestBench::run() calls term() BEFORE its
@@ -666,6 +924,10 @@ int main(int argc, char** argv)
         if (strcmp(cp, "--inv-test") == 0)   { m1_opts.inv_test = true; continue; }
         if (strcmp(cp, "--sink-stall") == 0) { m1_opts.sink_stall = true; continue; }
         if (strcmp(cp, "--no-checker") == 0) { m1_opts.checker_on = false; continue; }
+        // M7 Task 6: opt-in JTAG DMI smoke mode (default off; the OFF-path
+        // identity is untouched -- without the flag the JTAG pads stay
+        // idle and no smoke runs).
+        if (strcmp(cp, "--m7-debug") == 0)  { m7_opts.debug = true; continue; }
         if (m1_take_fencei(cp))              continue;
         if (m1_take_uint(cp, "--m1-rung", &v)) {
             if (v < 1 || v > 4) {
