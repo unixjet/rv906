@@ -73,6 +73,18 @@ module BPU (
     //=========================================================================
     input  wire [PC_WIDTH-1:0]      pcgen_btb_ifpc,
     input  wire [PC_WIDTH-1:0]      pred_idpc,
+    // M8 T4b FIX (2nd round, port-freeze amendment #3): the PRED-stage
+    // ARRIVAL event, required by the `pred_idpc_r` register below (see its
+    // comment block). Donor aq_ifu_pred.v's `icache_pred_inst_vld` input
+    // (aq_ifu_icache.v:1339, the ICache's PRED-stage hit/bypass level) is
+    // what gates its `pred_idpc` register's load; rv906's equivalent of
+    // that event is IFU.v's `icache_inst_vld` (= `icache_ipack_inst_vld
+    // && !ctrl_ipack_cancel && !pred_ipack_mask`, the donor's own
+    // aq_ifu_ipack.v:253 formula -- "a fresh fetch word is actually
+    // landing in IPACK THIS cycle", one cycle BEFORE `ipack_pred_inst0_
+    // vld` rises, which is exactly the offset the load needs). Task 1's
+    // port freeze missed it because the register it feeds did not exist.
+    input  wire                     icache_inst_vld,
     input  wire [31:0]              ipack_pred_inst0,
     input  wire                     ipack_pred_inst0_vld,
     input  wire [15:0]              ipack_pred_inst1,
@@ -431,15 +443,90 @@ module BPU (
     // direction mux is occupied by slot 0 this cycle) -- without this term
     // `pred_br_tar`/BTB's tag-compare would incorrectly key off slot 0's PC
     // for what is actually slot 1's branch.
+    // M8 T4b FIX (Class-B, coremark + m1-m5 hang; 2nd round after the
+    // interrupt regression caught the first attempt's 1-cycle-late load):
+    // restore the donor's OWN PRED-stage PC REGISTER, which Task 1
+    // collapsed away. Donor aq_ifu_pred.v:444-453 keeps a REGISTER
+    // `pred_idpc` (gated clock, aq_ifu_pred.v:398-408) that stays aligned
+    // to the instruction BPU is classifying THIS cycle, and computes ALL
+    // branch-base PCs from it (pred_h0_pc :461, pred_cur_pc :475-483,
+    // pred_ras_tar :656-657, RAS link :628, BTB tag :804).
+    //
+    // TIMING CONTRACT (the subtle part, verified against the trace): the
+    // donor's load source `pcgen_pred_ifpc` (aq_ifu_pcgen.v:285-293,319)
+    // latches the fetch pointer on the GRANT cycle, so it already equals
+    // the arriving word's base PC during the ARRIVAL cycle (icache data
+    // lands one cycle after its grant, both here and in the donor). The
+    // register loads on the ARRIVAL event (`icache_pred_inst_vld`,
+    // aq_ifu_icache.v:1339), so it is correct from the bundle's FIRST
+    // display cycle at the PRED stage (the IPACK entry is created at the
+    // edge ending the arrival cycle, displayed from the next). Loading on
+    // the entry-valid (`ipack_pred_inst0_vld`) instead -- or latching the
+    // raw pointer on the arrival instead of the grant -- lands the
+    // register ONE BUNDLE STALE on every first-display cycle after a
+    // redirect: with the 1st-round version, the interrupt test's trap
+    // redirect to 0x80000400 left pred_idpc_r at the pre-trap bundle
+    // 0x80000444 for the cycle the new bundle's c.j@0x80000400 was
+    // predicted (probe: [bpu] pcp=80000444 pbtk=1 vs [ifu] e1=80000400),
+    // misdirecting the fetch and cascading into an inst-fetch-fault trap
+    // loop. THE FIX (both halves, donor-faithful):
+    //   1. IFU.v latches `pcgen_pipe_ifpc` on `icache_pcgen_grant` with
+    //      `pcgen_fetch_pc` (aq_ifu_pcgen.v:285-293 verbatim shape; this
+    //      SUPERSEDES that file's BUG FIX #4 arrival-latch, which only
+    //      masked the race at the source while the BPU still consumed the
+    //      raw pointer directly -- the donor never did that), and
+    //   2. this register loads on the new `icache_inst_vld` input (the
+    //      arrival event, see the port note above), gated by the donor's
+    //      `pred_id_stall`.
+    //
+    // Donor-to-rv906 signal map (each confirmed against the real files):
+    //   donor `icache_pred_inst_vld` -> `icache_inst_vld` (new input;
+    //     rv906's aq_ifu_ipack.v:253 equivalent -- "fresh word landing in
+    //     IPACK this cycle", cancel/mask already excluded, which in the
+    //     donor are absorbed by the icache's own abort handling).
+    //   donor `pred_id_stall` (aq_ifu_pred.v:741: `pred_ret_stall ||
+    //     pred_delay_br || ibuf_pred_stall`) -> `pred_ret_stall ||
+    //     pred_delay_br || ibuf_ipack_stall` -- the donor's `ibuf_pred_
+    //     stall` IS `ibuf_ipack_stall` (BOTH alias `ibuf_stall`,
+    //     aq_ifu_ibuf.v:1340,1345), so no term is missing. Blocking the
+    //     load on `pred_ret_stall` matters in rv906 too: during RAS WAIT
+    //     `pred_ipack_ret_stall` holds entry1 valid-but-unretired while
+    //     `ibuf_ipack_stall` alone can be 0, so the raw fetch pointer
+    //     would race ahead the same way.
+    //   donor `pred_delay_br` -> `pred_delay_br` (same formula,
+    //     aq_ifu_pred.v:548-549); donor `pcgen_pred_ifpc` -> the
+    //     `pred_idpc` INPUT (the port keeps its donor-mapped name and its
+    //     IFU.v driver, IFU.v's `assign pred_idpc = pcgen_pipe_ifpc` --
+    //     untouched).
+    // No gated clock cell: the donor's gate (idpc_icg_en,
+    // aq_ifu_pred.v:398) only saves power -- its clock-off cycles map to
+    // the hold branch below, so the ungated always block replicates the
+    // behavior. `pred_ret_stall` (below, RAS section) and `pred_delay_br`
+    // (further below, SECTION BHT k) are forward wire references, same
+    // convention as this file's `bht_pred_rslt` forward reference.
+    //=========================================================================
+    reg [PC_WIDTH-1:0] pred_idpc_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            pred_idpc_r <= {PC_WIDTH{1'b0}};
+        else if (icache_inst_vld && !pred_ret_stall && !pred_delay_br
+                 && !ibuf_ipack_stall)
+            pred_idpc_r <= pred_idpc;                                  // donor :448-449
+        else if (pred_delay_br)
+            pred_idpc_r <= {pred_idpc_r[PC_WIDTH-1:2], 2'b10};         // donor :450-451
+        else
+            pred_idpc_r <= pred_idpc_r;                                // donor :452-453
+    end
+
     reg [PC_WIDTH-1:0] pred_h0_pc;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) pred_h0_pc <= {PC_WIDTH{1'b0}};
-        else if (ipack_pred_h0_create) pred_h0_pc <= {pred_idpc[PC_WIDTH-1:2], 2'b10};
+        else if (ipack_pred_h0_create) pred_h0_pc <= {pred_idpc_r[PC_WIDTH-1:2], 2'b10};
     end
 
-    wire [PC_WIDTH-1:0] pred_cur_pc = pred_br_taken0 ? (ipack_pred_h0_vld ? pred_h0_pc : pred_idpc)
-                                    : (pred_ras_link_vld1 || pred_inst1_taken || pred_delay_br_raw) ? {pred_idpc[PC_WIDTH-1:2], 2'b10}
-                                    : pred_idpc;
+    wire [PC_WIDTH-1:0] pred_cur_pc = pred_br_taken0 ? (ipack_pred_h0_vld ? pred_h0_pc : pred_idpc_r)
+                                    : (pred_ras_link_vld1 || pred_inst1_taken || pred_delay_br_raw) ? {pred_idpc_r[PC_WIDTH-1:2], 2'b10}
+                                    : pred_idpc_r;
 
     // Push value: low RAS_PC_WIDTH bits of (call PC + inst length). Real RTL
     // computes the length purely from slot0's own width and defaults to the
@@ -542,8 +629,8 @@ module BPU (
     // design doc S2.1's "materially looser than BTB's 64KiB, still a real
     // limit"). Chicken-bit-off degenerates to `pred_idpc` (S4.4).
     wire [PC_WIDTH-1:0] pred_ras_tar = cp0_ifu_ras_en
-                                      ? {pred_idpc[PC_WIDTH-1:RAS_PC_WIDTH], ras_tar_pc}
-                                      : pred_idpc;
+                                      ? {pred_idpc_r[PC_WIDTH-1:RAS_PC_WIDTH], ras_tar_pc}
+                                      : pred_idpc_r;
 
     // d. RAS-busy stall FSM (aq_ifu_pred.v:659-696): at most one predicted
     // return in flight through ID-stage at a time -- IDLE moves to WAIT the
@@ -703,7 +790,40 @@ module BPU (
     // `pred_delay_br_raw` (real's 2nd AND term, TASK 9: now real, SECTION
     // BHT below) suppresses this cycle's BTB-mispredict correction while a
     // same-row-second-lookup delay/replay is in flight for slot 1 instead.
-    wire pred_chgflw     = btb_pred_tar_vld ? (btb_mis_pred && !pred_delay_br_raw) : pred_br_taken;
+    //
+    // M8 T4c FIX (Class-B, coremark/m1-m5 hang): the verbatim donor formula
+    // above is only correct in the donor's pipeline, where a taken branch
+    // with a valid BTB entry is redirected by the BTB's OWN PCGEN-stage
+    // channel -- `btb_xx_chgflw_vld`/`btb_pcgen_tar_pc` (aq_ifu_btb.v:71-74,
+    // 740-747) consumed at aq_ifu_pcgen.v:279-282, one fetch BEFORE the
+    // branch reaches this ID stage. rv906 collapses the 2-stage BTB CAM
+    // into this ID stage (SECTION BTB header above) and exposes no
+    // PCGEN-stage BTB channel (frozen ports), so in the "BTB hit, target
+    // correct, BHT predicts taken" case the donor's ID-stage formula
+    // evaluates to 0 AND nothing else redirects: the fetch keeps streaming
+    // linearly past the branch while bju_pcgen tracks the resolved (taken)
+    // path -- a prediction/fetch desync that corrupts the stream and
+    // hangs coremark (repro: memmove's byte loop, bne@0x4012 predicted
+    // taken + BTB hit; wrong-path fall-through ret/or/... execute, a
+    // later branch mispredicts from the desynced bju_pcgen, redirects to a
+    // bogus target, misaligned load traps, hang). Probe-confirmed
+    // (dut_dbg [bpu]: btbv=1 btbmp=0 ibst=0 pbtk=1 pbtar=target pcp=br_pc,
+    // no pcgen chgflw). The added `pred_br_taken` term fires this same
+    // (only) ID-stage redirect channel for exactly the case the donor's
+    // PCGEN-stage channel covered: taken + BTB hit. Target is `pred_tar`
+    // = `pred_br_tar`, which equals the stored BTB target in the
+    // hit-and-correct case by definition of `btb_mis_pred=0` (target
+    // compare is part of it); the hit-and-wrong-target case already fired
+    // via `btb_mis_pred` and still invalidates the entry (`btb_clr_one`).
+    // Deviation from donor: redirect lands one stage later (ID-stage time
+    // vs PCGEN-stage time) through the SAME pcgen level-1 slot the
+    // donor's own ID-stage corrections use; committed stream is unchanged
+    // (the donor's PCGEN redirect prevents exactly the same wrong-path
+    // fetches this redirect now cancels via ctrl_if_cancel's existing
+    // fan-out + the TASK 4c IPACK drop of the branch's own fall-through).
+    wire pred_chgflw     = btb_pred_tar_vld
+                         ? ((btb_mis_pred || pred_br_taken) && !pred_delay_br_raw)
+                         : pred_br_taken;
     wire [PC_WIDTH-1:0] pred_tar = pred_br_taken ? pred_br_tar : pred_nxt_pc;
     // pred_curflw (RAS's own channel, S4.1 "RAS bypasses BTB entirely"):
     // TASK 9 -- the real `|| delay_chgflw` OR term is now real (SECTION BHT

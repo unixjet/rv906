@@ -130,6 +130,12 @@ module IFU (
     //=========================================================================
     output wire [PC_WIDTH-1:0]      pcgen_btb_ifpc,        // BTB slices [15:0] itself
     output wire [PC_WIDTH-1:0]      pred_idpc,             // current ID-stage PC
+    // M8 T4b FIX (2nd round): the PRED-stage ARRIVAL event, now a BPU input
+    // (BPU.v's `pred_idpc_r` load gate -- see BPU.v's port note for the
+    // donor mapping). Same net this file already computes as
+    // `icache_inst_vld` in SECTION IPACK (ipack.v:253: "this cycle's fetch
+    // data is real and not cancelled/masked") -- exposed as a port now.
+    output wire                     icache_inst_vld,
     output wire [31:0]              ipack_pred_inst0,      // = icache_ipack_inst, ID-stage view
     output wire                     ipack_pred_inst0_vld,
     output wire [15:0]              ipack_pred_inst1,
@@ -442,44 +448,38 @@ module IFU (
         else if (pcgen_buf_chgflw) pcgen_buf_chgflw <= 1'b0;
     end                                                                             // pcgen.v:221-229
 
-    // BUG FIX #4 (Task 9 bring-up, found running dense_br.S's region C
-    // through the full RTL at EVERY rung: two back-to-back compressed
-    // conditional branches sharing one fetch bundle, repeated for 128
-    // iterations, corrupted the committed stream starting ~90 iterations
-    // in -- FetchSink kept reporting the correct PC but delivered bytes
-    // from FAR ahead in the program, i.e. whole instructions were silently
-    // dropped from the stream). ROOT CAUSE, confirmed with a temporary C++
-    // probe (VERISIM_TRACE-style bring-up, per plan discipline -- not left
-    // in the final RTL): `pcgen_pipe_ifpc` (BPU's `pred_idpc`) was latching
-    // `pcgen_fetch_pc` on EVERY `icache_pcgen_grant` -- i.e. tracking
-    // "whatever PCGEN most recently REQUESTED" -- while SECTION IPACK's
-    // entry1/entry2 (the actual data BPU classifies as `ipack_pred_inst0/1`
-    // this cycle) can lag several GRANTS behind whenever IPACK is busy
-    // (Task 9's delay/replay mechanism, BPU.v SECTION BHT part (k), holds
-    // entry2 valid-but-unretired for multiple cycles while ICache keeps
-    // granting fresh, uncorrelated fetches in the meantime -- `grant` fires
-    // essentially every cycle regardless of IPACK's own backlog, confirmed
-    // in the trace). Once `pred_idpc` races even ONE word ahead of what
-    // entry1/entry2 actually hold, every address BPU derives from it
-    // (`pred_cur_pc`'s slot-1 term, RAS pushes, BTB tag/target, and Task 9's
-    // own delay-redirect target) is wrong by a whole word -- for the delay
-    // redirect specifically, this manifests as PCGEN jumping the fetch
-    // pointer PAST content that was never actually retired, permanently
-    // dropping it from the stream (exactly the corruption observed).
-    // THE FIX: latch `icache_pcgen_addr` (the address PAIRED WITH the data
-    // IPACK is actually consuming THIS cycle, an existing IFU.v input) on
-    // `icache_inst_vld` (SECTION IPACK's own "this cycle's fetch data is
-    // real and not cancelled/masked" gate) instead of `pcgen_fetch_pc` on
-    // `icache_pcgen_grant` -- this ties `pred_idpc` to the SAME event that
-    // actually feeds entry1/entry2, eliminating the race regardless of how
-    // many cycles IPACK spends processing one word. `icache_inst_vld` is
-    // defined later in this file (SECTION IPACK) -- a forward wire
-    // reference, harmless in Verilog and already this file's own
-    // convention (BPU.v's SECTION BHT does the same for `bht_pred_rslt`).
+    // M8 T4b FIX (2nd round): GRANT-latched fetch pointer, aq_ifu_pcgen.v:
+    // 285-293 verbatim shape. HISTORY: BUG FIX #4 (Task 9) re-timed this
+    // register from "pcgen_fetch_pc on every icache_pcgen_grant" to
+    // "icache_pcgen_addr on icache_inst_vld" (the arrival) after dense_br.S
+    // region C corrupted the stream -- because at the time the BPU
+    // CONSUMED THIS RAW POINTER DIRECTLY as its branch base PC, so any
+    // grant that outran IPACK's held entries (delay/replay backlog)
+    // mis-keyed every derived address by a word. That fix masked the race
+    // at the source instead of fixing the architecture. The DONOR's
+    // answer is two-part: keep the GRANT latch (this register is meant to
+    // be the PRED-stage-aligned pointer, which the grant latch provides
+    // EXACTLY one cycle early -- the arrival cycle -- because icache data
+    // lands one cycle after its grant), and put the alignment REGISTER in
+    // the BPU (BPU.v's `pred_idpc_r`, donor aq_ifu_pred.v:444-453), which
+    // loads this pointer on the arrival event (`icache_inst_vld`, now a
+    // BPU input too) and HOLDS it across the cycles the PRED stage lags
+    // or is stalled (IBUF full / RAS WAIT / post-redirect gap). With the
+    // BPU register in place the grant latch is safe again: in steady state
+    // the raw pointer leads the displayed bundle by exactly the one cycle
+    // the register's arrival-load absorbs, and on a redirect the raw
+    // pointer re-latches the target on the first post-redirect grant so
+    // the register is correct from the target's first display cycle
+    // (the interrupt test's trap-to-0x80000400 case that the 1st-round
+    // arrival-latch + entry-valid-load version got one bundle stale on).
+    // `boot_rst_vld` keeps the unconditional top-priority term per BUG FIX
+    // #2's audit (this register is never re-consulted for fetch
+    // addressing; the donor's own vec_pcgen_rst_vld has the same
+    // asymmetry, aq_ifu_pcgen.v:287-288).
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) pcgen_pipe_ifpc <= {PC_WIDTH{1'b0}};
         else if (boot_rst_vld) pcgen_pipe_ifpc <= cp0_xx_mrvbr;
-        else if (icache_inst_vld) pcgen_pipe_ifpc <= icache_pcgen_addr[PC_WIDTH-1:0];
+        else if (icache_pcgen_grant) pcgen_pipe_ifpc <= pcgen_fetch_pc[PC_WIDTH-1:0];
         else pcgen_pipe_ifpc <= pcgen_pipe_ifpc;
     end                                                                             // pcgen.v:285-293
 
@@ -562,17 +562,26 @@ module IFU (
     // lookahead second instruction -- confirmed (by reading aq_ifu_top.v's
     // wire list directly) to be a DIFFERENT wire from `pred_ibuf_chgflw_vld0`
     // (both exist as separate top-level wires there). It is NOT on IFU.v's
-    // frozen port list. Since every BPU.v predictor output is tied inactive
-    // for M1 (BPU.v's own skeleton body), this signal is PROVABLY always 0
-    // in this milestone's configuration -- tied to a local constant below
-    // rather than silently added as a new port. If a later task (7-9) finds
-    // BPU needs to drive a real value here, add `pred_ipack_chgflw_vld0` as
-    // a new IFU.v input then, with the same justification recorded at the
-    // port-list freeze.
+    // frozen port list. Since every BPU.v predictor output was tied inactive
+    // for M1 (BPU.v's own skeleton body), this signal was PROVABLY always 0
+    // in that configuration -- tied to a local constant below rather than
+    // silently added as a new port.
+    //
+    // TASK 4c FIX (M8, coremark + m2/m3/m4 hang): the tie-0 was the live
+    // bug. Once the BPU was brought up real (Task 9), a predicted-taken
+    // branch at IPACK slot 0 must cancel the fall-through carry's create/
+    // retire for the SAME cycle, exactly as the donor does. The FLAGGED
+    // premise ("a DIFFERENT wire from pred_ibuf_chgflw_vld0") is WRONG
+    // against the real source: aq_ifu_pred.v:713,780,786 drive BOTH
+    // `pred_ipack_chgflw_vld0` and `pred_ibuf_chgflw_vld0` from the SAME
+    // wire (`pred_chgflw_vld0 = pred_br_taken0 || pred_ras_ret_vld0`).
+    // BPU.v:1180 already drives that exact formula out as
+    // `pred_ibuf_chgflw_vld0`, so no new IFU.v port / BPU.v output is
+    // needed -- alias it here.
     //=========================================================================
-    wire pred_ipack_chgflw_vld0 = 1'b0;   // see FLAGGED note above
+    wire pred_ipack_chgflw_vld0 = pred_ibuf_chgflw_vld0;  // donor aq_ifu_pred.v:780,786
 
-    wire icache_inst_vld   = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
+    assign icache_inst_vld   = icache_ipack_inst_vld && !ctrl_ipack_cancel && !pred_ipack_mask; // ipack.v:253
     wire ipack_align_create = icache_inst_vld && !icache_ipack_unalign;                        // ipack.v:255
 
     //-------------------------------------------------------------------------
@@ -740,12 +749,16 @@ module IFU (
     wire        ipack_secnd_vld = (h0_vld || h1_16bit_vld) && h2_16bit_vld;         // ipack.v:393
     wire [15:0] ipack_secnd_inst = entry2_inst;                                      // ipack.v:395
 
-    // ipack_one_16bit_vld (ipack.v:399-402) with pred_ipack_chgflw_vld0(=0
-    // const)/pred_ipack_delay_stall(real port) terms simplified: the real
-    // formula ANDs in `!(h2_16bit_vld && !pred_ipack_chgflw_vld0 &&
-    // !pred_ipack_delay_stall)`; since the const-0 factor is always true,
-    // this reduces to `!(h2_16bit_vld && !pred_ipack_delay_stall)`.
-    wire ipack_one_16bit_vld = (!h0_vld && h1_16bit_vld && !(h2_16bit_vld && !pred_ipack_delay_stall))
+    // ipack_one_16bit_vld -- verbatim donor formula (ipack.v:399-402).
+    // (TASK 4c: this was previously simplified under the assumption that
+    // pred_ipack_chgflw_vld0 was constant 0 -- the assumption that caused
+    // the M8 coremark hang. The chgflw term inside the negation is
+    // load-bearing: it lets a 16-bit predicted-taken branch at slot 0
+    // retire as exactly ONE halfword even when slot 2 holds a valid
+    // fall-through halfword, which must NOT be pushed or carried.)
+    wire ipack_one_16bit_vld = (!h0_vld && h1_16bit_vld && !(h2_16bit_vld
+                                 && !pred_ipack_chgflw_vld0
+                                 && !pred_ipack_delay_stall))
                             || (!entry1_vld && h2_16bit_vld);
     wire ipack_all_vld = h0_vld && entry1_vld && h2_16bit_vld
                       && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall;         // ipack.v:412-414
@@ -819,8 +832,24 @@ module IFU (
     // since it predates Task 9's delay mechanism entirely; reasoned and
     // derived locally from this file's own entry-retirement invariants,
     // not found pre-existing in the real source.
-    wire ipack_h0_delay_vld = h0_vld && entry1_vld && pred_ipack_delay_stall
-                            && !pred_ipack_chgflw_vld0;
+    // TASK 4c: the trigger is now the UNION
+    // `(pred_ipack_delay_stall || pred_ipack_chgflw_vld0)` (was
+    // `&& pred_ipack_delay_stall && !pred_ipack_chgflw_vld0`). The same
+    // "complete h0+entry1 32-bit retires as a pair, third half discarded"
+    // shape ALSO occurs when that 32-bit instruction IS the predicted-taken
+    // branch at slot 0 (chgflw=1, e2 = fall-through that must be dropped).
+    // The donor covers that shape inside its IBUF's mirrored create-side
+    // classification (aq_ifu_ibuf.v:1259-1313), which rv906's binary IBUF
+    // does not have (see BUG FIX #3 above: the flags are this design's sole
+    // push-count source) -- so the pair must retire HERE or the taken
+    // branch silently drops (entries retire unconditionally via
+    // entry0/1_retire_en). The two triggers are mutually exclusive:
+    // chgflw needs bht_pred_rslt[1] or a jump at slot 0
+    // (aq_ifu_pred.v:592), delay_stall needs a NOT-taken branch at slot 0
+    // (aq_ifu_pred.v:546) -- one instruction cannot be both -- so the OR
+    // adds no new combination beyond the two covered shapes.
+    wire ipack_h0_delay_vld = h0_vld && entry1_vld
+                            && (pred_ipack_delay_stall || pred_ipack_chgflw_vld0);
 
     wire        ipack_retire_vld  = entry1_vld || h2_16bit_vld;                      // ipack.v:419
     wire [47:0] ipack_retire_inst = {entry2_inst, ipack_first_inst};                 // ipack.v:424
@@ -829,8 +858,20 @@ module IFU (
     wire ipack_ibuf_inst_vld_raw = ipack_retire_vld;
     wire ipack_ibuf_inst_vld    = ipack_retire_vld && !ipack_buf_stall;
     wire ipack_ibuf_inst_one    = ipack_one_16bit_vld;
-    wire ipack_ibuf_inst_two    = ((ipack_secnd_vld || ipack_one_32bit_vld)
-                                 && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall) // BUG FIX #3
+    // TASK 4c: the !pred_ipack_chgflw_vld0 gate now applies to
+    // `ipack_secnd_vld` ONLY (its 2-halfword push includes entry2, which is
+    // the fall-through AFTER the taken slot-0 branch and must be dropped),
+    // NOT to `ipack_one_32bit_vld`: there the push is the slot-0 branch
+    // itself, and in the first OR-term (!h0 && h1_32bit && e2_vld) entry2 is
+    // the branch's OWN completing high half -- gating it would silently
+    // drop any 32-bit predicted-taken branch that arrives with no pending
+    // carry (e.g. an uncompressed bne/blt/bge). one_32bit's second
+    // OR-term (h0 && e1 && h2_32bit_vld) already dies under chgflw via
+    // h2_32bit_vld's own !pred_ipack_chgflw_vld0 (line ~632), so no extra
+    // gate is needed there.
+    wire ipack_ibuf_inst_two    = (ipack_secnd_vld
+                                 && !pred_ipack_chgflw_vld0 && !pred_ipack_delay_stall)
+                                 || (ipack_one_32bit_vld && !pred_ipack_delay_stall) // BUG FIX #3
                                  || ipack_h0_delay_vld;                              // BUG FIX #5
     wire ipack_ibuf_inst_all    = ipack_all_vld;
     wire [47:0] ipack_ibuf_inst  = ipack_retire_inst;

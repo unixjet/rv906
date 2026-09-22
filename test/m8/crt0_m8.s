@@ -258,8 +258,22 @@ __asychronous_int:
 .global vector_table
  .align  10
   vector_table:   #totally 256 entries
+  # M8 T4c DEVIATION (recorded per coordinator decision): the donor's
+  # crt0.s:262-264 uses `.long __fail` (32-bit entries) read by the SAME
+  # 64-bit `ld` in __synchronous_exception (crt0.s:233) followed by
+  # `addi x14,x14,-4` (crt0.s:236) before `jr` -- the handler is kept
+  # VERBATIM from the donor here (crt0.s:203,222,229 region). Under the
+  # donor's .long entries + its link layout the -4 arithmetic lands on
+  # the intended entry only by layout accident (the 64-bit load's upper
+  # half duplicates the 32-bit entry, harmless at the donor's link base).
+  # rv906 links at a 40-bit VA (link_m8.ld) and this port already uses
+  # full-width `.quad` entries so the 64-bit ld reads a well-formed
+  # target; the -4 must then cancel EXACTLY, so the entries are
+  # `__fail+4`. (Before this fix, entry=__fail made `jr` land at
+  # __fail-4 == the PASS path's `1: j 1b` spin -- every trap silently
+  # hung instead of reaching tohost=3.)
   .rept   128
-  .quad   __fail   # 64-bit: dispatch uses 8-byte offsets (slli 3) + 64-bit ld
+  .quad   __fail+4   # 64-bit: dispatch uses 8-byte offsets (slli 3) + 64-bit ld, then -4 (handler verbatim)
   .endr
 
   .global __dummy

@@ -272,6 +272,7 @@ module RVProc #(
     //=========================================================================
     wire [PC_WIDTH-1:0]      pcgen_btb_ifpc;
     wire [PC_WIDTH-1:0]      pred_idpc;
+    wire                     icache_inst_vld;  // M8 T4b FIX 2nd round (BPU.v header)
     wire [31:0]              ipack_pred_inst0;
     wire                     ipack_pred_inst0_vld;
     wire [15:0]              ipack_pred_inst1;
@@ -817,6 +818,7 @@ module RVProc #(
 
         .pcgen_btb_ifpc          (pcgen_btb_ifpc),
         .pred_idpc               (pred_idpc),
+        .icache_inst_vld         (icache_inst_vld),
         .ipack_pred_inst0        (ipack_pred_inst0),
         .ipack_pred_inst0_vld    (ipack_pred_inst0_vld),
         .ipack_pred_inst1        (ipack_pred_inst1),
@@ -880,6 +882,7 @@ module RVProc #(
 
         .pcgen_btb_ifpc          (pcgen_btb_ifpc),
         .pred_idpc               (pred_idpc),
+        .icache_inst_vld         (icache_inst_vld),
         .ipack_pred_inst0        (ipack_pred_inst0),
         .ipack_pred_inst0_vld    (ipack_pred_inst0_vld),
         .ipack_pred_inst1        (ipack_pred_inst1),

@@ -852,12 +852,22 @@ static void test_rvc_pairs(void) {
 
 static void test_rvc_illegal(void) {
     reset_dut();
+    // M8 T4c: c.fld/c.fsd/c.fldsp/c.fsdsp are now LEGAL (they were the
+    // d16_illegal "no FP in M2" leftovers). c.fld decodes to the same
+    // EU_LSU/LSU_FUNC_FLD as its 32-bit twin with dst0_frf=1 (D8).
+    write_gpr(8, 0x1000);
     present(c_fld()); tick(); present(0, false);
-    check(dut->idu_cp0_ex1_illegal == 1, "c.fld: illegal (RVC FP out of scope -- only 32-bit F/D FP is legal post-swap)");
+    check(dut->idu_lsu_ex1_sel == 1, "c.fld: lsu_sel fires (legal EU_LSU op) -- M8 T4c");
+    check(dut->idu_lsu_ex1_func == LSU_FUNC_FLD, "c.fld: func == LSU_FUNC_FLD");
+    check(dut->idu_lsu_ex1_src0_data == 0x1000, "c.fld: src0=x8(base)");
+    check(dut->idu_lsu_ex1_src1_data == 0, "c.fld: src1=imm=0");
+    check(dut->idu_lsu_ex1_dst0_reg == 8, "c.fld: dst0=f8 (rd' 000 -> x8, FRF index)");
+    check(dut->idu_lsu_ex1_dst0_frf == 1, "c.fld: dst0_frf==1 (D8 selector, not a GPR dest)");
+    check(dut->idu_cp0_ex1_illegal == 0, "c.fld: legal (M8 T4c RVC FP decode)");
 
     present(c_addi4spn_bad()); tick(); present(0, false);
     check(dut->idu_cp0_ex1_illegal == 1, "c.addi4spn nzuimm=0: illegal (reserved encoding)");
-    test_result("T12 RVC illegal cases: c.fld (RVC FP out of scope) + reserved-zero encodings");
+    test_result("T12 RVC FP decode (c.fld legal, M8 T4c) + reserved-zero encodings illegal");
 }
 
 // ---- 5.5: WBT RAW/WAW except-clause matrix (each of the 5, individually

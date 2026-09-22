@@ -1208,6 +1208,10 @@ module IDU (
     reg                  d16_src2_vld, d16_src2_imm_vld, d16_dst0_vld;
     reg [4:0]            d16_src0_reg, d16_src1_reg, d16_src2_reg, d16_dst0_reg;
     reg [63:0]           d16_src1_imm, d16_src2_imm;
+    // M8 T4c: RVC FP load/store FRF tags (mirror of d32_dst0_frf/d32_src2_frf
+    // at ~line 468) -- c.fld/c.fldsp dest and c.fsd/c.fsdsp src-data live in
+    // the FP register file, not GPR, so they need the same FRF marking.
+    reg                  d16_dst0_frf, d16_src2_frf;
 
     always @* begin
         d16_eu           = {EU_WIDTH{1'b0}};
@@ -1225,6 +1229,8 @@ module IDU (
         d16_dst0_reg     = 5'd0;
         d16_src1_imm     = 64'd0;
         d16_src2_imm     = 64'd0;
+        d16_dst0_frf     = 1'b0;
+        d16_src2_frf     = 1'b0;
 
         casez ({inst[15:10], inst[6:5], inst[1:0]})
             10'b000???_??00: begin  // c.addi4spn
@@ -1234,8 +1240,45 @@ module IDU (
                 d16_dst0_vld = 1'b1; d16_dst0_reg = c_rs2_3;
                 d16_illegal = (inst[12:5] == 8'd0);          // nzuimm==0 reserved
             end
-            10'b001???_??00, 10'b101???_??00,               // c.fld / c.fsd
-            10'b001???_??10, 10'b101???_??10: d16_illegal = 1'b1;  // c.fldsp / c.fsdsp (no FP in M2)
+            // M8 T4c: c.fld/c.fsd/c.fldsp/c.fsdsp (compressed FP load/store).
+            // BUG FIX: these four were marked d16_illegal (leftover "no FP in
+            // M2" placeholder) while the 32-bit flw/fld/fsw/fsd landed in M5
+            // Task 4c -- so any program using a compressed FP load/store
+            // (e.g. -O3 coremark's main prologue c.fsdsp for the FP caller-
+            // saves) decoded illegal (mcause=2) and trapped.
+            // Field layouts (donor-conformant, confirmed bit-exact against the
+            // toolchain): CL (c.fld/c.fsd, [1:0]=00) mirrors c.ld/c.sd --
+            // base=rs1'=c_rd_rs1_3, FP reg=c_rs2_3, offset=c_ld_imm (donor
+            // key 14'h200). CI (c.fldsp/c.fsdsp, [1:0]=10) base=sp; the load
+            // dest FP reg=inst[11:7]=c_rd_rs1_5 with offset=c_ldsp_imm
+            // (donor 14'h400), the store src FP reg=inst[6:2]=c_rs2_5 with
+            // offset=c_sdsp_imm (donor 14'h800) -- exactly the integer
+            // c.ldsp/c.sdsp split. FRF tags mark the FP side (dst0_frf for
+            // loads, src2_frf for stores) instead of dst0_vld/src2_vld.
+            10'b001???_??00: begin  // c.fld (CL)
+                d16_eu = EU_LSU; d16_func = LSU_FUNC_FLD;
+                d16_src0_vld = 1'b1; d16_src0_reg = c_rd_rs1_3;
+                d16_src1_imm_vld = 1'b1; d16_src1_imm = c_ld_imm;
+                d16_dst0_frf = 1'b1; d16_dst0_reg = c_rs2_3;
+            end
+            10'b101???_??00: begin  // c.fsd (CL)
+                d16_eu = EU_LSU; d16_func = LSU_FUNC_FSD;
+                d16_src0_vld = 1'b1; d16_src0_reg = c_rd_rs1_3;
+                d16_src1_imm_vld = 1'b1; d16_src1_imm = c_ld_imm;
+                d16_src2_frf = 1'b1; d16_src2_reg = c_rs2_3;
+            end
+            10'b001???_??10: begin  // c.fldsp (CI)
+                d16_eu = EU_LSU; d16_func = LSU_FUNC_FLD;
+                d16_src0_vld = 1'b1; d16_src0_reg = 5'd2;      // sp
+                d16_src1_imm_vld = 1'b1; d16_src1_imm = c_ldsp_imm;
+                d16_dst0_frf = 1'b1; d16_dst0_reg = c_rd_rs1_5;
+            end
+            10'b101???_??10: begin  // c.fsdsp (CI)
+                d16_eu = EU_LSU; d16_func = LSU_FUNC_FSD;
+                d16_src0_vld = 1'b1; d16_src0_reg = 5'd2;      // sp
+                d16_src1_imm_vld = 1'b1; d16_src1_imm = c_sdsp_imm;
+                d16_src2_frf = 1'b1; d16_src2_reg = c_rs2_5;
+            end
             10'b010???_??00: begin  // c.lw
                 d16_eu = EU_LSU; d16_func = LSU_FUNC_LW;
                 d16_src0_vld = 1'b1; d16_src0_reg = c_rd_rs1_3;
@@ -1449,11 +1492,11 @@ module IDU (
     wire [4:0]            dis_dst0_reg5 = is32 ? d32_dst0_reg     : d16_dst0_reg;
     wire [63:0]           dis_src1_imm  = is32 ? d32_src1_imm     : d16_src1_imm;
     wire [63:0]           dis_src2_imm  = is32 ? d32_src2_imm     : d16_src2_imm;
-    // M5 Task 4c: FLW/FLD/FSW/FSD FRF tags -- no 16-bit (RVC) FP load/store
-    // decode exists yet (c.fld/c.fsd stay illegal, "no FP in M2" above), so
-    // the d16 side is always 0.
-    wire                  dis_dst0_frf  = is32 && d32_dst0_frf;
-    wire                  dis_src2_frf  = is32 && d32_src2_frf;
+    // M5 Task 4c: FLW/FLD/FSW/FSD FRF tags. M8 T4c: the 16-bit (RVC) side is
+    // now live too -- c.fld/c.fldsp (dst0_frf) and c.fsd/c.fsdsp (src2_frf)
+    // mark their FP register-file operand, exactly like the 32-bit arms.
+    wire                  dis_dst0_frf  = is32 ? d32_dst0_frf : d16_dst0_frf;
+    wire                  dis_src2_frf  = is32 ? d32_src2_frf : d16_src2_frf;
     // M5 Task 4b: OP-FP's funct3 field IS the rm field for FADD/FSUB/FCVT.f2f
     // (dynamic rounding mode) and a fixed sub-op selector (already captured
     // in FUNC bits above) for FMIN/FMAX/FSGNJ* -- passing it through
@@ -1940,7 +1983,12 @@ module IDU (
     wire [63:0] dis_src0_data = fwd_src0_vld ? fwd_data(dis_src0_reg5) : gpr_src0_data;
     wire [63:0] dis_src1_data = !dis_src1_vld ? dis_src1_imm
                               : fwd_src1_vld  ? fwd_data(dis_src1_reg5) : gpr_src1_data;
-    wire [63:0] dis_src2_data = dis_src2_frf ? frf_src1_data
+    // M8 T4c: the FRF store-source read must use the DECODED register
+    // (dis_src2_reg5), not the fixed 32-bit inst[24:20] field (frf_src1_data):
+    // RVC c.fsd holds its source FP reg in inst[4:2] and c.fsdsp in inst[6:2],
+    // so the fixed 32-bit field would read f0. For 32-bit fsd, dis_src2_reg5 ==
+    // inst[24:20] == dis_fsrc1_reg5, so this is a no-op on the 32-bit path.
+    wire [63:0] dis_src2_data = dis_src2_frf ? frf_read(dis_src2_reg5)
                               : !dis_src2_vld ? dis_src2_imm
                               : fwd_src2_vld  ? fwd_data(dis_src2_reg5) : gpr_src2_data;
 
