@@ -826,14 +826,37 @@ module IU (
     wire bju_resolves_now = bju_entry_pop
                           || (idu_iu_ex1_bju_sel && !bju_entry_vld_r && !bju_create_entry);
 
-    // PC-gen next pc (donor aq_iu_bju.v:572-581,624-625): the pcgen tracks the
-    // EX1 register, so its non-taken fall-through is always the LIVE
-    // `bju_pcgen_pc + len` (bju_inc_pc_ext = bju_cur_pc_ext + len, cur_pc =
-    // bju_pcgen_pc), NOT the latched entry inc-pc. While a cond-branch is
-    // parked in the entry the pcgen self-increments off the live pc to stay
-    // locked to EX1; only a resolving+taken branch sends it to the target.
+    // PC-gen next pc (donor aq_iu_bju.v:611-625, the "Condition Branch" /
+    // "Next PC" blocks). The donor does NOT hold the pcgen at the branch's own
+    // PC while it is parked; it advances the pcgen to the PREDICTED next pc,
+    // staying in lockstep with the front end (the BPU has already redirected
+    // the fetch to the target on a predicted-taken branch). Mechanism:
+    //   aq_iu_bju.v:615-616  bju_cond_br_taken =
+    //       (bju_ex1_inst_no_depd || bju_entry_pop) ? bju_cond_br_taken_raw
+    //                                                            : bju_bht_pred[1];
+    //     i.e. the REAL comparison result only when the branch RESOLVES (in-EX1
+    //     no-dep, or entry pop); otherwise (PARKING or PARKED) the BHT
+    //     PREDICTION (bju_bht_pred[1]).
+    //   aq_iu_bju.v:624-625  bju_next_pc = bju_ag_tar_pc_sel ? bju_ag_tar_pc
+    //                                                            : bju_inc_pc_ext;
+    //     with bju_ag_tar_pc_sel driven by that (real-or-predicted) taken
+    //     (aq_iu_bju.v:622-623). So on a park the pcgen advance VALUE is
+    //     (bht_pred[1] ? target : inc_pc).
+    //
+    // rv906 F4/T4d-5 VALUE fix (not a gate fix): the old value
+    //     (bju_resolves_now && bju_taken) ? bju_target_pc : bju_inc_pc_rt
+    //   was ALWAYS the fall-through on the park cycle (bju_resolves_now is
+    //   low there), so a predicted-taken parked branch left the pcgen on the
+    //   fall-through while the front end went to the target -- the M8 coremark
+    //   +2 halfword-slip that clobbered s7 (FAIL@257385). Now the advance
+    //   VALUE follows the BHT prediction (bju_bht_pred_sel[1]) on a park/parked
+    //   cycle (bju_resolves_now low, matching the donor) and the real result
+    //   (bju_taken) on a resolve cycle. The advance GATE is unchanged (IU.v:972
+    //   still fires on the park cycle) -- a gate change (moving the advance to
+    //   the resolve cycle) regressed the rv64ui-p-lb/sd auipc-lockstep tests.
     wire [PC_WIDTH-1:0] bju_pcgen_next_pc =
-        (bju_resolves_now && bju_taken) ? bju_target_pc : bju_inc_pc_rt;
+        bju_resolves_now ? (bju_taken           ? bju_target_pc : bju_inc_pc_rt)
+                         : (bju_bht_pred_sel[1] ? bju_target_pc : bju_inc_pc_rt);
 
     // rv906 M2 bring-up fix (rv64uc-p-rvc wrong-path pcgen drift): the donor
     // bju_tar_pc_vld formula (aq_iu_bju.v:649-653) fires only on BHT/RAS
