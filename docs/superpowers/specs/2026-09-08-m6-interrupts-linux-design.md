@@ -1,6 +1,6 @@
 # M6: Interrupt path (CLINT/PLIC/CSR) + single-hart Linux boot — design doc
 
-## Status: Tasks 1-5 done (b541e8d..20c12f4); Task 6 (PLIC UART IRQ) in flight; 7/8/9 to follow
+## Status: COMPLETE — all tasks landed (T0 71115c6, T1 b541e8d, T2 ead61f6, T3 40855c1, T4 029fa8d, T5 20c12f4, T6 a9f9acf, T7 ba80c97 "8/8 m6", T8 c0d3895 Linux boot fixes); T9 close-out = this status + 08-verification.md §8.17. m6 8/8 + Linux 6.5.0 banner gate green (controller-verified on HEAD=ceb6834); see 08-verification.md §8.17. Known follow-on: post-banner stall (time CSR re-point, M8 T2 / D-M8-5) — tracked under M8, not M6.
 
 ## Context
 

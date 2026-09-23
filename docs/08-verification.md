@@ -200,3 +200,138 @@ Task 11 fixes (IDU/FPU/CSR/RVProc/pkg + `test/m5/run_all.sh`); full gate
 chain re-run from a clean rebuild — M5 46/46, unit suite PASS, 86/87
 sweep, 19/19 atomics. M5 acceptance ("rv64uf/ud pass") met.
 
+## §8.17 M6 interrupts + Linux boot acceptance (§7.4 "interrupts + Linux boot (8 m6 ELFs; OpenSBI 1.3 + Linux 6.5 single-hart)")
+
+M6 built the machine-mode interrupt delivery path and the PLIC/CLINT
+wiring to boot a real OS: a 15-term `int_sel` claim with vectored
+`tvec` (CSR.v / RTU.v), the real WFI (D-M4-7 discharged — `wfi_wake =
+mip & mie || dtu_cp0_wake_up`), the `time` CSR (0xC01) as a CLINT mtime
+mirror (D-M4-9 discharged; the M8 follow-on re-point is D-M8-5, see
+below), a PLIC source 7 = UART IRQ, and the misa lockstep (D-M6-6).
+All M6 RTL tasks landed (git log: b541e8d T1, ead61f6 T2, 40855c1 T3,
+029fa8d T4, 20c12f4 T5, a9f9acf T6, ba80c97 T7 "8/8 m6", c0d3895 T8
+Linux boot fixes); the M6 milestone is closed by c0d3895.
+
+### Gate chain (must pass all):
+
+```bash
+make verisim                                        # clean
+make -C test/m2/unit run                            # UNIT-SUITE-PASS (10 benches)
+# standard battery (rv64ui/um/sv/mi sweeps, atomics, m4, m5) — same gates as §8.5-§8.16
+bash test/m6/run_all.sh                             # 8/8 m6 ELFs, tohost=1 each
+bash test/m6/run_linux.sh                           # 6h wall cap, checker ON; gate = "Linux version" in test/m6/boot.log
+```
+
+`test/m6/` is the 8-ELF bare-metal interrupt suite (`test/m6/Makefile`
+globs `*.S` → `m6-*.elf`, `-march=rv64imac_zicsr`, `.tohost` @
+0x7FFFF000; `run_all.sh` runs each with `--print-result`, 300 s timeout,
+PASS = tohost 1): **msip** (M-mode software interrupt), **mtip**
+(M-mode timer interrupt), **plic_uart** (PLIC source 7 = UART RX IRQ
+claim), **ssip_deleg** (S-mode software interrupt via delegation),
+**stip_sbi** (S-mode timer via SBI), **priority** (15-term int_sel
+claim priority), **vectored** (tvec mode 1 vector dispatch), **wfi**
+(real WFI sleep/wake).
+
+### Expected results (green = pass, red = known failure):
+
+| Gate | Result |
+|---|---|
+| make verisim | clean |
+| unit suite | UNIT-SUITE-PASS |
+| m2 sweep | 86/87 (only the documented rv64ui-p-ma_data) |
+| atomics (rv64ua subset) | 19/19 |
+| m4 directed SI+MI+MMU | 30/30 |
+| m4 v sweep | 85/86 (only the documented rv64ui-v-ma_data) |
+| m5 | 46/46 |
+| **m6 suite** | **8/8** (msip, mtip, plic_uart, ssip_deleg, stip_sbi, priority, vectored, wfi) |
+| **Linux boot gate** | **GREEN** — `Linux version 6.5.0` banner in `test/m6/boot.log` (OpenSBI v1.3 fw_jump + kernel 6.5.0, Buildroot 2025.02.4); banner reached at ~38M cycles in a 3600 s-capped run with the M1 ISS checker on |
+
+Known post-banner stall: after the `Linux version 6.5.0` banner the
+kernel waits for timer-driven work and the checked-in `test/m6/boot.log`
+continues past the banner (to cycle ~429M, tohost=0) without further
+console progress. Root-cause class: the kernel's timing path runs off
+the `time` CSR, which in rv906 is a CLINT mtime mirror (clk/100) rather
+than a per-cycle counter — the M8 follow-on is the `time` CSR re-point
+to `mcycle_reg` (M8 T2, D-M8-5 in the M8 design doc), which lands after
+the M7 close-out. **The banner is the M6 gate**; the stall is tracked
+under M8, not M6.
+
+**Verification log (M6, controller-verified on HEAD=ceb6834):** m6 8/8
+(ba80c97); Linux boot gate green (c0d3895: OpenSBI v1.3 + Linux 6.5.0
+banner, ~38M cycles, 3600 s-capped, checker on); full battery on the
+final M7 binary: unit UNIT-SUITE-PASS, 86/87 sweep, 19/19 atomics, m4
+30/30 directed, 85/86 v sweep, 46/46 m5, 8/8 m6.
+
+## §8.18 M7 standard Debug acceptance (§7.4 "standard debug: JTAG DTM + DM + SBA + core-side triggers")
+
+M7 implemented the RISC-V Debug Spec 0.13 subsystem — `rtl/TDT_DTM.v`
+(JTAG DTM, tck↔clk via 4-FF pulse syncs), `rtl/TDT_DM.v` (Debug Module
++ abstract engine + SBA registers + 128-bit SBA AXI master),
+`rtl/SBA_AxiUp.v` (128→512 crossbar up-converter), `rtl/DTU.v`
+(dcsr/dpc/dscratch, 10 triggers, halt_info verdict), plus the
+halt/resume/step seams in RTU/CSR/IFU/LSU/IDU. The C++ testbench is
+the debug host (no OpenOCD): `dut.cpp` owns the 4 JTAG pads at the
+donor timing contract (clk:tck = 8:1, 4 clk edges per TCK phase, TDO
+negedge-sampled); `RVProcTest.cpp` is the DMI client. Module doc:
+`docs/10-debug.md`.
+
+### Gate chain (must pass all):
+
+```bash
+make verisim                                        # clean
+make -C test/m2/unit run                            # UNIT-SUITE-PASS (10 benches incl. dtu_tb)
+make -C test/m7/unit run                            # dm_tb + dtm_tb → UNIT-SUITE-PASS
+bash test/m7/run_debug.sh                           # --m7-debug on the spin ELF, 300 s cap → M7-DEBUG-PASS
+bash test/m7/directed/run_directed.sh               # m7-break_no_skip (tohost=1)
+# standard battery — same gates as §8.5-§8.17
+bash test/m4/directed/run_directed.sh               # rv64mi-p-breakpoint among them
+```
+
+### Expected results (green = pass, red = known failure):
+
+| Gate | Result |
+|---|---|
+| make verisim | clean |
+| unit suite (m2, 10 benches incl. dtu_tb) | UNIT-SUITE-PASS |
+| m7 unit (dm_tb + dtm_tb) | UNIT-SUITE-PASS |
+| **run_debug.sh → M7-DEBUG-PASS** | **GREEN**: trigger steps (i)-(v) all ok; SBA o0-r all ok (12 ok lines); core left HALTED; 58540 TCK; zero "abstractcmd busy timeout"; sim exit=0 |
+| m7 directed: m7-break_no_skip | PASS (tohost=1) |
+| m7 directed: m7-debug_spin | FAIL **by design** (the spin ELF never writes tohost=1 — it is the JTAG host's halt/trigger target; annotated in the runner, not gated) |
+| **rv64mi-p-breakpoint** | **PASS at the 1026-cyc baseline** (restored by the T8b word-align omission, 10-debug.md §4.1 item 4) |
+| unit (final binary) | UNIT-SUITE-PASS |
+| m2 sweep | 86/87 (only the documented rv64ui-p-ma_data) |
+| atomics (rv64ua subset) | 19/19 |
+| m4 directed SI+MI+MMU | 30/30 |
+| m4 v sweep | 85/86 (only the documented rv64ui-v-ma_data) |
+| m5 | 46/46 |
+| m6 | 8/8 |
+
+### Directed coverage (the e2e evidence, all controller-verified on HEAD=ceb6834):
+
+- **halt** — dmcontrol.haltreq → dmstatus anyhalted=1/anyrunning=0; dpc in the spin-loop range; dcsr.cause=3 (dm_sync); x8 intact.
+- **dpc/dcsr capture** — the halted PC and the cause are readable via the abstract CSR path.
+- **abstract GPR/CSR r/w** — GPR read x8 = 0x5A5A0000; 64-bit GPR write to x9; CSR r/w through the dscratch1/x6 REGACC path; cmderr=2 on an unsupported regno; cmderr=4 while running.
+- **ITR** — `addi x13,x13,1` via abstractcmd; dpc unchanged.
+- **step** — exactly one instruction (dpc +4, dcsr.cause=4).
+- **resume** — via `resumereq` AND via dret (ITR `0x7B200073`).
+- **triggers** — execute-halt (action 1, dcsr.cause=2), execute-trap (action 0, mcause=3, mepc in {LOOP, LOOP+4}), load-trigger match (action 0 → trap, load cancelled — x14 untouched), store-trigger suppression (action 0 → trap, the store word stays at its pre-store value), and a second trigger via tselect=1.
+- **SBA** — 32/64/128-bit r/w (P32=0xDEADBEEF; 64-bit bytes 0xA0..0xA7; 128-bit bytes 0x00..0x0F), clobber independence (32-bit low-word overwrite leaves the high 96 bits intact), tohost uncached readback 0x77777777 @0x7FFFF000, sberror=4 (unsupported access — the register latches the raw sbaccess, donor-faithful; spec 0.13 would clear sbaccess), sberror=3 (unaligned 128-bit).
+
+### Known deviations (documented in 10-debug.md §4, not silent):
+
+The four-item M7 deviation ledger: (1) the two `!rtu_yy_xx_dbgon`
+fetch/issue gates (IFU.v:1094 load-bearing, LSU.v:1190 defense-in-depth)
+are donor deviations — the donor C906 has no dbgon gate in
+fetch/issue/commit and rv906 closes the halted-hart-commits-memory-ops
+gap; (2) the LSU execute-verdict fanout (LSU.v:138/1240/1247/1355/3177,
+RVProc.v:1278) is a donor-faithful restoration of
+`aq_idu_id_dp.v:1099-1100/:1117-1118`; (3) the trigger-address
+sign-extension (DTU.v:707-710) is a donor-faithful restoration
+(`aq_dtu_mcontrol.v:1105/:1237`, the active lines); (4) the ldst-path
+low-4-bit word-align is deliberately omitted (DTU.v:681-706) — with it,
+rv64mi-p-breakpoint regressed 1026→1049 cyc FAIL. Plus the D-M7-*
+design-time decisions (single clock domain, no trst_n/TAP2, SBA =
+crossbar master #3, standard 0.13 tdata1 layout, T-Head CSRs dropped,
+no async halt, single-issue DTU, no DM clock gating) — 10-debug.md
+§4.1 item 5.
+
