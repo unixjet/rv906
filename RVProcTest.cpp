@@ -957,6 +957,12 @@ static bool m7_debug_triggers(M7JTAG &j)
     const uint64_t LOAD_PC  = 0x80000044ULL;
     const uint64_t STORE_PC = 0x80000048ULL;
     const uint64_t B_ADDR   = 0x80001000ULL;
+    // T8b: the loop's x12 is set by `lui x12, 0x80001` (RV64 sign-
+    // extends), so the loop's load/store VA is 0xFFFF_FFFF_8000_1000 and
+    // its 40-bit PA is 0xFF80001000 (bit 39 set). The donor's ldst
+    // trigger match SIGN-extends that PA (aq_dtu_mcontrol.v:1237), so a
+    // trigger armed on B must carry the sign-extended value to match.
+    const uint64_t B_TRIG   = 0xFFFFFFFF80001000ULL;
     const uint32_t X15_C    = 0x11111111U;   // C: store value the loop converged to
     const uint32_t X14_W    = 0x22222222U;   // W: x14 set for the load-cancellation test
     const uint32_t X15_D    = 0x33333333U;   // D: x15 set for the store-suppression test
@@ -1065,7 +1071,7 @@ static bool m7_debug_triggers(M7JTAG &j)
         uint64_t x14_setup = 0;
         bool orx14s = j.abstract_reg_read(R_X14, x14_setup, "x14 setup rb (iii)");
         bool o2 = j.abstract_reg_write(CSR_TDATA1, TD_LOAD_A0, "tdata1 load a0");
-        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_ADDR, "tdata2=B (iii)");
+        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_TRIG, "tdata2=B (iii)");
         uint64_t td2_setup = 0;
         bool ortd2s = j.abstract_reg_read(CSR_TDATA2, td2_setup, "tdata2 setup rb (iii)");
         bool o4 = j.abstract_reg_write(CSR_DPC, LOAD_PC, "dpc=LOAD_PC (iii)");
@@ -1082,7 +1088,7 @@ static bool m7_debug_triggers(M7JTAG &j)
                "0x%llx) tdata2 readback=0x%llx (expect 0x%llx)\n",
                (unsigned long long)X14_W, (unsigned long long)x14_setup,
                (unsigned long long)X14_W, (unsigned long long)td2_setup,
-               (unsigned long long)B_ADDR);
+               (unsigned long long)B_TRIG);
         printf("[m7] (iii) load action=0: x14=0x%llx (expect 0x%llx=W, load "
                "not committed) mcause=0x%llx (expect 3) mepc=0x%llx (expect "
                "0x%llx or 0x%llx) mtval=0x%llx\n",
@@ -1091,7 +1097,7 @@ static bool m7_debug_triggers(M7JTAG &j)
                (unsigned long long)LOAD_PC, (unsigned long long)(LOAD_PC + 4),
                (unsigned long long)mtval);
         bool okiii = o1 && orx14s && (x14_setup == X14_W) && o2 && o3 &&
-                     ortd2s && (td2_setup == B_ADDR) && o4 && ores && oh &&
+                     ortd2s && (td2_setup == B_TRIG) && o4 && ores && oh &&
                      ox14 && omc &&
                      omepc && omtv && x14_ok &&
                      (mcause == MCAUSE_BREAKPOINT) && mepc_ok;
@@ -1116,7 +1122,7 @@ static bool m7_debug_triggers(M7JTAG &j)
         uint64_t x15_setup = 0;
         bool orx15s = j.abstract_reg_read(R_X15, x15_setup, "x15 setup rb (iv)");
         bool o2 = j.abstract_reg_write(CSR_TDATA1, TD_STORE_A0, "tdata1 store a0");
-        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_ADDR, "tdata2=B (iv)");
+        bool o3 = j.abstract_reg_write(CSR_TDATA2, B_TRIG, "tdata2=B (iv)");
         uint64_t td2s = 0;
         bool ortd2s = j.abstract_reg_read(CSR_TDATA2, td2s, "tdata2 setup rb (iv)");
         bool o4 = j.abstract_reg_write(CSR_DPC, STORE_PC, "dpc=STORE_PC (iv)");
@@ -1133,7 +1139,7 @@ static bool m7_debug_triggers(M7JTAG &j)
                "0x%llx) tdata2 readback=0x%llx (expect 0x%llx)\n",
                (unsigned long long)X15_D, (unsigned long long)x15_setup,
                (unsigned long long)X15_D, (unsigned long long)td2s,
-               (unsigned long long)B_ADDR);
+               (unsigned long long)B_TRIG);
         printf("[m7] (iv) store action=0: x14=0x%llx (expect 0x%llx=C, B "
                "unchanged -> store suppressed) mcause=0x%llx (expect 3) "
                "mepc=0x%llx (expect 0x%llx or 0x%llx) mtval=0x%llx\n",
@@ -1142,7 +1148,7 @@ static bool m7_debug_triggers(M7JTAG &j)
                (unsigned long long)STORE_PC, (unsigned long long)(STORE_PC + 4),
                (unsigned long long)mtval);
         bool okiv = o1 && orx15s && (x15_setup == X15_D) && o2 && o3 &&
-                    ortd2s && (td2s == B_ADDR) && o4 && ores && oh && ox14 &&
+                    ortd2s && (td2s == B_TRIG) && o4 && ores && oh && ox14 &&
                     omc &&
                     omepc && omtv && x14_ok &&
                     (mcause == MCAUSE_BREAKPOINT) && mepc_ok;

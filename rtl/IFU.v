@@ -1074,13 +1074,25 @@ module IFU (
     // M7 Task 1: debug-instruction (itr) injection (donor aq_ifu_ibuf.v:949-
     // 953,1085,1098 -- the donor inserts the DM's word into the ibuf's own
     // create path; rv906's ibuf has no separate create0 port, so the
-    // equivalent is a delivery mux here). While dbgon, ctrl_inst_fetch is
-    // masked and the halt flush already emptied the ibuf, so pop_entry_vld
-    // is 0 and the injected word is the ONLY thing delivered -- no double
-    // issue is possible. The word bypasses the ibuf (no head advance): the
+    // equivalent is a delivery mux here).
+    //
+    // T8b (BUG-1 (iii) regression fix): the premise above -- "the halt flush
+    // already emptied the ibuf, so pop_entry_vld is 0" -- is FALSE in
+    // practice. probe_run12 tick 1331 shows pop=1 while dbgon=1: the post-
+    // halt refetch burst (re-fetched lw at the trigger PC and following
+    // lines) still sits in the ibuf and pops out during the halt. Gated on
+    // !rtu_yy_xx_dbgon below, those normal instructions are dropped at the
+    // IFU/IDU boundary instead of reaching the IDU: no EX1/WBT entry is
+    // created for them (no desync vs the halted LSU, no leaked writeback
+    // slot), and the ibuf still advances (ibuf_pop_fire, :980) so the stale
+    // burst is consumed and discarded. On resume the fetch refills the ibuf
+    // from the resume PC. Only the injected debug word (dtu_dbg_inst_
+    // deliver, separate term) is delivered while dbgon -- no double issue
+    // is possible. The word bypasses the ibuf (no head advance): the
     // donor's create path also consumes no ICache fetch entry.
     wire dtu_dbg_inst_deliver = rtu_yy_xx_dbgon && dtu_ifu_debug_inst_vld;
-    assign ifu_idu_id_inst_vld = pop_entry_vld || dtu_dbg_inst_deliver;   // ibuf.v:1354
+    assign ifu_idu_id_inst_vld = (pop_entry_vld && !rtu_yy_xx_dbgon)
+                             || dtu_dbg_inst_deliver;   // ibuf.v:1354
     assign ifu_idu_id_inst     = dtu_dbg_inst_deliver ? dtu_ifu_debug_inst
                                                       : {ibuf_h1, ibuf_h0}; // ibuf.v:1355-1356
 

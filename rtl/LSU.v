@@ -115,6 +115,27 @@ module LSU #(
     // for an epc, and the IU display has decayed by reply time (the
     // non-blocking LSU no longer holds EX1 until dp, unlike the donor).
     input  wire [PC_WIDTH-1:0]      iu_lsu_ex1_pc,
+    // M8 T8b (BUG-2 (v)): the EX1 instruction's execute-trigger halt_info,
+    // latched in the IDU's EX1 bundle from the DTU's live IFU-feed verdict
+    // (IDU.v ex1_halt_info_r <= ifu_idu_id_halt_info). The donor pipes this
+    // SAME field to the LSU as well as the CP0 (aq_idu_id_dp.v:1099-1100
+    // idu_cp0_ex1_halt_info, :1117-1118 idu_lsu_ex1_halt_info -- one source
+    // field fanned out per EU), and the donor AG latches it into the op's
+    // request buffer (aq_lsu_ag.v:184/681 ag_halt_info = idu_lsu_ex1_halt_
+    // info, :899 ag_req_buffer_halt_info <= ag_halt_info) so that
+    // lsu_rtu_ex1_halt_info (aq_lsu_ag.v:1698) carries it to the RTU dp
+    // mux (aq_rtu_dp.v:399-401), which for a load selects the LSU leg
+    // (cp0_rtu_ex1_cmplt_dp = idu_cp0_ex1_dp_sel = ex1_eu_sel[EU_CP0_SEL],
+    // aq_idu_id_ctrl.v:649, is 0 for an LSU-routed op). rv906's RTU makes
+    // the same LSU-leg selection (RTU.v ex1_halt_info = ex1_lsu_solo_dp ?
+    // lsu_rtu_ex1_halt_info : iu_rtu_ex1_halt_info) but rv906's LSU had NO
+    // idu_lsu_ex1_halt_info input: the exec verdict reached the RTU only on
+    // the iu leg, which the RTU discards for LSU-routed ops. Result: an
+    // execute trigger on a load/store PC never fired (the (v) bug). This
+    // port restores the donor's fanout; the IDU already exposes the very
+    // same ex1_halt_info_r as ifu_idu_id_halt_info's consumer, so RVProc.v
+    // wires the existing idu_iu_ex1_halt_info wire here.
+    input  wire [TDT_HINFO_WIDTH-1:0] idu_lsu_ex1_halt_info,
 
     //=========================================================================
     // LSU -> IDU : the single EX1 issue-gate stall signal (contract 8;
@@ -237,6 +258,23 @@ module LSU #(
     // Matches CSR.v's/IDU.v's own consumption of this same RTU.v broadcast
     // (`assign rtu_yy_xx_flush_fe = retire_flush_fe;`, RTU.v:903).
     input  wire                     rtu_yy_xx_flush_fe,
+    // T8b (BUG-1 (iii)): the RTU's debug-mode-on (halt) flag. A halted hart
+    // must not commit user-mode memory operations (RISC-V debug spec). The
+    // donor C906 has NO dbgon gate anywhere in the fetch/issue/commit path
+    // (verified: no dbgon in aq_lsu_ag.v / aq_lsu_dc.v / aq_rtu_wb.v /
+    // aq_idu_id_ctrl.v; the IFU keeps fetching after a halt and the DTU
+    // answers the ldst check "no match" during dbgon via trigger_enable
+    // gating ldst_type_size_match, aq_dtu_mcontrol.v:1229), so a load
+    // refetched by the post-halt prefetch burst reaches DC and writes back
+    // (x14 = C) even though the trigger is correctly dbgon-disabled. This
+    // gate is a documented spec-compliance deviation from the donor: while
+    // dbgon is asserted, the LSU must not issue a new access, so a
+    // post-halt refetch can neither start a cache access nor write back.
+    // At the halt the BE pipeline is drained (RTU cpu_no_op at the BE
+    // flush), so no legitimately in-flight op is affected; on resume the
+    // FE flush clears ag_wait_r and the IDU flush clears the live EX1 wire,
+    // so no stale op survives.
+    input  wire                     rtu_yy_xx_dbgon,
 
     //=========================================================================
     // LSU -> MMU / MMU -> LSU : the DTLB request/response (contract 2),
@@ -1141,7 +1179,15 @@ module LSU #(
     // every cycle, so issue_real is bit-identical to its pre-Task-5 form
     // there -- ag_wait_r never sets, this AND-term is always satisfied the
     // same cycle ag_issue_ready is.
-    wire issue_real  = ag_issue_ready && mmu_lsu_pa_vld;
+    // T8b (BUG-1 (iii)): the `&& !rtu_yy_xx_dbgon` term stops a post-halt
+    // prefetch-burst access from issuing while the hart is in debug mode
+    // (see the rtu_yy_xx_dbgon port comment for the donor-deviation
+    // rationale). It is the single admission point: it keeps the op out of
+    // the DC FSM (no ST_DCS, no touches_array, no reply writeback) and out
+    // of the DTU ldst feed (lsu_dtu_ldst_addr_vld = issue_real), so the
+    // dbgon-disabled trigger neither sees nor cancels it -- it simply
+    // never commits.
+    wire issue_real  = ag_issue_ready && mmu_lsu_pa_vld && !rtu_yy_xx_dbgon;
     wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
                        && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
     // M4 misalign fix (contract 3 + donor aq_lsu_ag.v, which raises misalign
@@ -1174,9 +1220,32 @@ module LSU #(
     // outranks the trap (RTU retire_trap_vld is gated by !halt_req).
     // misalign/MMU-fault keep their own exceptions (checked first in the
     // vec ladder) -- a faulting access is not ALSO a trigger.
+    // M8 T8b (BUG-2 (v)): an EXECUTE-trigger match rides the IDU's EX1
+    // bundle (the idu_lsu_ex1_halt_info port above) instead of the DTU's
+    // live ldst channel. The DTU's exec verdict has CANCEL=1 for every
+    // non-chain match with timing forced 0 (donor exe0_cancel,
+    // aq_dtu_mcontrol_output_select.v:2821/:2980; exe0_timing=0 at :2977),
+    // so a matching load/store must trap at issue exactly like a timing-0
+    // ldst match: the access never reaches ST_DCS (no commit, no ST_REPLY
+    // writeback) and the RTU takes the vec-3 breakpoint (epc = this op's
+    // PC). The donor gets the same effect from ag_pipe_dt_cancel =
+    // ag_pipe_halt_info[CANCEL] feeding ag_pipe_expt_vld (aq_lsu_ag.v:1432
+    // / :1374) on the request buffer's verdict.
+    //
+    // ag_halt_info_buf mirrors the donor's ag_req_buffer_halt_info
+    // (aq_lsu_ag.v:899-901): the op enters the buffer with the IDU's exec
+    // verdict, and the ldst verdict supersedes it when it matches (last
+    // update wins). In rv906 both verdicts are live at the same issue
+    // cycle, so the donor's two-step buffer update collapses to this mux.
+    wire [TDT_HINFO_WIDTH-1:0] ag_halt_info_buf = dtu_lsu_halt_info_vld
+                                                 ? dtu_lsu_halt_info
+                                                 : idu_lsu_ex1_halt_info;
+    // Donor ag_pipe_dt_cancel (aq_lsu_ag.v:1432): the buffered verdict's
+    // CANCEL bit ALONE -- no MATCH qualifier, because both verdict bundles
+    // are all-zero unless a slot matched (the IFU forwards 0 for a
+    // trigger-free fetch; the ldst bundle is only presented with vld).
     wire trig_fault_issue = issue_real && !ag_misalign && !mmu_fault_issue
-                           && dtu_lsu_halt_info_vld
-                           && dtu_lsu_halt_info[TDT_HINFO_CANCEL];
+                           && ag_halt_info_buf[TDT_HINFO_CANCEL];
 
     wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign && !mmu_fault_issue && !trig_fault_issue)
                         : issue_drain ? stb_was_hit[drain_pick]
@@ -1273,8 +1342,17 @@ module LSU #(
                         dc_is_drain_r   <= 1'b0;
                         dc_wa_r         <= cp0_lsu_wa;
                         dc_touched_array_r <= touches_array;
-                        dc_halt_info_r    <= dtu_lsu_halt_info_vld ? dtu_lsu_halt_info
-                                                                   : {TDT_HINFO_WIDTH{1'b0}};
+                        // M8 T8b (BUG-2 (v)): donor request-buffer
+                        // semantics (aq_lsu_ag.v:899-901) -- the IDU's
+                        // exec verdict is latched with the op, and the
+                        // (live-at-issue) ldst verdict supersedes it when
+                        // it matches. An exec match never reaches this
+                        // latch live (CANCEL=1 takes the trap-at-issue
+                        // path above), so this branch stays 0 in practice
+                        // -- the latch exists so the ST_REPLY leg can carry
+                        // a non-cancel verdict for a future timing-1 exec
+                        // path, matching the donor's buffered exec info.
+                        dc_halt_info_r    <= ag_halt_info_buf;
                         dc_store_cancel_r <= dtu_lsu_addr_trig_en || dtu_lsu_data_trig_en;
                         state <= ST_DCS;
                     end else if (issue_drain) begin
@@ -3084,7 +3162,11 @@ module LSU #(
                                + (lsu_reply_len ? {{(PC_WIDTH-3){1'b0}}, 3'd4}
                                                 : {{(PC_WIDTH-3){1'b0}}, 3'd2});
     // M7 Task 2: the replying op's trigger verdict, per cmplt_dp leg:
-    //   trig_fault_issue: the LIVE bundle (the op is in AG right now);
+    //   trig_fault_issue: the LIVE buffered verdict ag_halt_info_buf (the
+    //     op is in AG right now; M8 T8b BUG-2 (v): this now also carries
+    //     the IDU's exec-trigger verdict, so the RTU's retire packet for a
+    //     breakpoint-on-load matches the donor's lsu_rtu_ex1_halt_info =
+    //     ag_pipe_halt_info, aq_lsu_ag.v:1698);
     //   misalign/MMU-fault: 0 -- the fault keeps its own exception (the
     //     dc_*_r latches hold the PREVIOUS op, and passing this op's live
     //     match here would make the RTU's leg 4 pre-empt the fault's vec);
@@ -3093,7 +3175,7 @@ module LSU #(
     //     LFB entry -- no gate test exercises it);
     //   ST_REPLY: dc_halt_info_r, latched at this op's own AG issue.
     assign lsu_rtu_ex1_halt_info = trig_fault_issue
-                             ? dtu_lsu_halt_info
+                             ? ag_halt_info_buf
                              : (misalign_issue || mmu_fault_issue || lfb_cmplt_fire)
                              ? {TDT_HINFO_WIDTH{1'b0}}
                              : dc_halt_info_r;

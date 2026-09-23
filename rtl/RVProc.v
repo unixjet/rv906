@@ -1275,6 +1275,7 @@ module RVProc #(
         .idu_lsu_ex1_inst_len    (idu_lsu_ex1_inst_len),
         .iu_lsu_ex1_cur_pc       (iu_lsu_ex1_cur_pc),
         .iu_lsu_ex1_pc           (iu_lsu_ex1_pc),
+        .idu_lsu_ex1_halt_info   (idu_iu_ex1_halt_info),   // T8b: donor aq_idu_id_dp.v:1117 exec-verdict fanout
 
         .lsu_idu_full            (lsu_idu_full),
         .lsu_cp0_stb_empty       (lsu_cp0_stb_empty),
@@ -1319,6 +1320,7 @@ module RVProc #(
         .rtu_lsu_expt_ack        (rtu_lsu_expt_ack),
         .rtu_lsu_expt_exit       (rtu_lsu_expt_exit),
         .rtu_yy_xx_flush_fe      (rtu_yy_xx_flush_fe),
+        .rtu_yy_xx_dbgon         (rtu_yy_xx_dbgon),   // T8b: gate LSU issue off while halted
 
         .lsu_mmu_va              (lsu_mmu_va),
         .lsu_mmu_va_vld          (lsu_mmu_va_vld),

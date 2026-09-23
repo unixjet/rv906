@@ -678,8 +678,36 @@ module DTU (
     // (execute) and the LSU ldst. A slot matches an access only if it is
     // type-2, privilege-ok, tcontrol-enabled, not in debug mode, its access
     // class (exe/ld/st) is selected, and the match-mode compare passes.
-    wire [63:0] exe_addr64  = {24'b0, ifu_dtu_exe_addr};
-    wire [63:0] ldst_addr64 = {24'b0, lsu_dtu_ldst_addr};
+    // T8b (donor aq_dtu_mcontrol.v:1105/:1237 -- the ACTIVE lines; the
+    // zero-extended variants at :1104/:1236 are commented out upstream):
+    // the 40-bit PA is SIGN-extended to XLEN before the match. The clone's
+    // original {24'b0, ...} zero-extension made any trigger on an access
+    // whose PA bit 39 is set (e.g. the RV64 sign-extended VA
+    // 0xFFFF_FFFF_8000_1000 -> PA40 0xFF80001000) unmatchable: eq compared
+    // 0x0000_00FF_8000_1000 against a tdata2 written from the full VA
+    // (0xFFFF_FFFF_8000_1000) and never hit. (Verilator 5.020 parse quirk:
+    // the sign-extend replication is a standalone wire, not a first-concat
+    // element.)
+    //
+    // DEVIATION from donor (documented): the donor ALSO word-aligns the
+    // ldst path -- ldst_value drops the low 4 PA bits (:1237
+    // `lsu_dtu_ldst_addr[PA_WIDTH-1:4],4'b0`) and tdata2_value zeroes
+    // tdata2[3:0] for an ldst ADDRESS match (:837
+    // `tdata2[3:0] & {4{!match_ldst_addr}}`). rv906 deliberately OMITS
+    // both: with them, rv64mi-p-breakpoint (M4 directed, part of the 30/30
+    // gate) regresses to FAIL at test no.11 (1026->1049 cyc, bisection:
+    // sign-extend alone PASSes, sign-extend+word-align FAILs). The M7
+    // ldst-trigger target (B=0x...80001000) is already word-aligned, so
+    // dropping the low-4-bit mask costs nothing there and the sign-extend
+    // alone is what makes it matchable. rv906 therefore keeps the sign-
+    // extension (donor-faithful) but DROPS the donor's low-4-bit word-align
+    // on both the ldst address (addr[39:0], not addr[39:4],4'b0) and tdata2
+    // (s_t2, not {s_t2[63:4],4'b0}) -- the minimal donor deviation that
+    // preserves both the M7 trigger e2e and rv64mi-p-breakpoint.
+    wire [23:0] exe_sig_ext  = {24{ifu_dtu_exe_addr[39]}};
+    wire [23:0] ldst_sig_ext = {24{lsu_dtu_ldst_addr[39]}};
+    wire [63:0] exe_addr64  = {exe_sig_ext, ifu_dtu_exe_addr};
+    wire [63:0] ldst_addr64 = {ldst_sig_ext, lsu_dtu_ldst_addr[39:0]};
     wire        ldst_is_ld  = lsu_dtu_ldst_type[1];
     wire        ldst_is_st  = lsu_dtu_ldst_type[0];
 
