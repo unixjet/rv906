@@ -1016,29 +1016,37 @@ static void test_mcycle_free_running(void) {
     test_result("T20 mcycle: free-running, increments every cycle, R/W");
 }
 
-static void test_time_csr_mirror(void) {
-    // M6 Task 3: time (0xC01) is a READ-ONLY mirror of the CLINT mtime input.
-    // It is not a storage flop -- the read mux returns the live `mtime` pin,
-    // so advancing the driven input must be immediately visible.
-    dut->mtime = 0x1122334455667788ULL;
+static void test_time_csr_d_m8_5(void) {
+    // M8 T2 (D-M8-5): the `time` (0xC01) read arm was re-pointed from the
+    // CLINT mtime mirror to mcycle_reg -- `time` now advances at exactly the
+    // cycle rate. DONOR DEVIATION (the donor's `time` reads the SoC mtime,
+    // aq_hpcp_top.v:2655): cross-checking `time`-derived windows against
+    // donor cycle counts would carry rtc_tick phase; a per-cycle `time`
+    // keeps the M8 parity windows deterministic. The mtime pin is now UNUSED
+    // by CSR.v (kept wired for structural fidelity; the CLINT mtime MMIO
+    // 0x0200BFF8 is unaffected). This pins the new semantics:
+    //  (a) time == mcycle (the same free-running counter as the 0xB00 alias)
+    //  (b) time free-runs 1/cycle and does NOT track the mtime pin
+    //  (c) driving the mtime pin has NO effect on the time read
     uint64_t t0 = csr_read(CSR_TIME);
-    check(t0 == 0x1122334455667788ULL, "time: read returns the driven mtime value",
-          t0, 0x1122334455667788ULL);
+    uint64_t m0 = csr_read(CSR_MCYCLE);   // one dispatch edge after t0
+    check(m0 == t0 + 1, "time (D-M8-5): same counter as the 0xB00 mcycle alias",
+          m0, t0 + 1);
 
-    dut->mtime = 0xAABBCCDDEEFF0011ULL;
+    dut->mtime = 0x1122334455667788ULL;
     uint64_t t1 = csr_read(CSR_TIME);
-    check(t1 == 0xAABBCCDDEEFF0011ULL,
-          "time: read tracks a changed mtime pin (mirror, not a storage flop)",
-          t1, 0xAABBCCDDEEFF0011ULL);
-    check(t1 > t0, "time: a larger mtime reads as a larger time", t1, t0);
+    check(t1 != 0x1122334455667788ULL,
+          "time (D-M8-5): does NOT mirror the driven mtime pin",
+          t1, 0x1122334455667788ULL);
+    check(t1 == t0 + 2, "time (D-M8-5): advances 1/cycle (2 dispatch edges)",
+          t1, t0 + 2);
 
-    // time is read-only: a write form must NOT raise wb_vld storage (the
-    // generic RO-write gate, csr_addr[11:10]==2'b11, traps it as illegal).
-    dut->mtime = 0x0ULL;
+    for (int i = 0; i < 10; i++) tick_no_dispatch();
     uint64_t t2 = csr_read(CSR_TIME);
-    check(t2 == 0x0ULL, "time: read reflects the reset-to-zero mtime pin",
-          t2, 0x0ULL);
-    test_result("T27 time: read-only mirror of CLINT mtime, tracks the live pin");
+    check(t2 - t1 == 11, "time (D-M8-5): per-cycle free-run (1 read + 10 idle)",
+          t2 - t1, 11);
+
+    test_result("T27 time (D-M8-5): per-cycle mcycle alias; mtime pin no longer mirrored");
 }
 
 static void test_minstret_rw_no_spurious_increment(void) {
@@ -1711,7 +1719,7 @@ int main(int argc, char **argv) {
     test_mtvec_direct_mode_only();
     test_mepc_lsb_forced_zero();
     test_mcycle_free_running();
-    test_time_csr_mirror();
+    test_time_csr_d_m8_5();
     test_minstret_rw_no_spurious_increment();
     test_flush_suppresses_dispatch();
 

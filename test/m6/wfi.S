@@ -7,9 +7,14 @@
 #
 # Sequence:
 #   1. mtvec = handler; mie.MTIE = 1; mstatus.MIE = 1
-#   2. Read `time` (0xC01) -> t0; write mtimecmp = t0 + 2 (CLINT 0x4000)
-#      -> mtip fires at exactly mtime == t0+2 (two rtc_ticks away, so mtip
-#      is guaranteed 0 when wfi reaches EX1)
+#   2. Read mtime (CLINT 0x0200BFF8) -> t0; write mtimecmp = t0 + 2
+#      (CLINT 0x4000) -> mtip fires at exactly mtime == t0+2 (two
+#      rtc_ticks away, so mtip is guaranteed 0 when wfi reaches EX1).
+#      M8 T2 (D-M8-5): calibrated against the mtime MMIO, NOT the `time`
+#      CSR -- `time` now advances per cycle (mcycle_reg) while mtimecmp
+#      is compared against the clk/100 mtime, so a `csrr 0xC01` t0 would
+#      land mtimecmp ~1000 ticks in the future and the wake check below
+#      would fail.
 #   3. wfi  <- must HOLD until mtip
 #   4. mtip fires -> wfi wakes, retires -> RTU takes the timer interrupt
 #      at the wfi's OWN retire boundary (mepc == wfi+4 == post_wfi)
@@ -20,9 +25,11 @@
 #   - mepc   == post_wfi  (proves NO post-wfi instruction executed before
 #                          the trap -- a no-op wfi would have let them run
 #                          and the trap would land later, mepc != post_wfi)
-#   - time   == t0 + 2    (proves the hart really waited for the tick;
-#                          a pass-through wfi would have trapped/continued
-#                          at t0+1 or earlier)
+#   - t_now  in [t0+2, t0+4]  (proves the hart really waited for the tick;
+#                          a pass-through wfi would read ~t0+1. Not an exact
+#                          equality: the handler's mtime read lands ~90-110
+#                          cycles after the wake, straddling the next 100-
+#                          cycle tick -- see the check in the handler)
 #   - clear mtip (mtimecmp = -1), mret -> post_wfi
 #
 # Post-mret: tohost = 1 (PASS). mret returns to mepc == post_wfi, so the
@@ -62,8 +69,10 @@ _start:
 
     #-------------------------------------------------------------------------
     # Step 2: schedule the timer tick two rtc_ticks out
+    # (D-M8-5: mtime MMIO, not the `time` CSR -- see header)
     #-------------------------------------------------------------------------
-    csrr x13, 0xC01           # x13 = t0 = live mtime
+    li   x14, 0x0200BFF8      # CLINT mtime
+    LOAD x13, 0(x14)          # x13 = t0 = live mtime
     mv   x15, x13             # keep t0 across the trap (handler re-checks)
     addi x13, x13, 2
     li   x14, 0x02004000      # CLINT mtimecmp
@@ -98,9 +107,19 @@ interrupt_handler:
     la   x14, post_wfi
     bne  x13, x14, fail_test  # trap must land EXACTLY at the wfi boundary
 
-    csrr x13, 0xC01           # t_now: mtime at wake
+    li   x14, 0x0200BFF8      # CLINT mtime (D-M8-5: mtime, not `time`)
+    LOAD x13, 0(x14)          # t_now: mtime at wake
+    # Range check, NOT exact equality: t_now must be >= t0+2 (wfi held
+    # until the scheduled tick -- a pass-through wfi would read ~t0+1)
+    # and <= t0+4 (no spurious multi-tick spin). The handler's own mtime
+    # read is ~90-110 cycles AFTER the mtip fires (wake + retire + flush
+    # + icache COLD miss of the never-fetched handler + prologue + this
+    # MMIO load), i.e. straddling the very next 100-cycle mtime tick, so
+    # t_now legitimately lands at t0+2 or t0+3.
     addi x14, x15, 2          # t0 + 2
-    bne  x13, x14, fail_test  # wfi must have held until the 2nd tick
+    blt  x13, x14, fail_test  # t_now >= t0+2
+    addi x14, x15, 4          # t0 + 4
+    bgt  x13, x14, fail_test  # t_now <= t0+4
 
     # Clear mtip before returning (mtimecmp = -1)
     li   x13, 0x02004000

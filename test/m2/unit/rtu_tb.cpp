@@ -130,6 +130,9 @@ static void tie_idle_inputs(void) {
     dut->fpu_rtu_ex1_falu_fvld  = 0;
     dut->fpu_rtu_ex1_falu_xvld  = 0;
     dut->fpu_rtu_ex1_falu_preg  = 0;
+    // T4d-14: dispatch-time FPU for-pcgen select (IDU-driven in the real
+    // core; idle = no FP dispatch this cycle).
+    dut->idu_fpu_ex1_cmplt_for_pcgen = 0;
     // M7 Task 1: DTU/debug ports, idle = "no debugger attached, no halt".
     dut->dtu_rtu_sync_halt_req  = 0;
     dut->dtu_rtu_resume_req     = 0;
@@ -905,50 +908,71 @@ static void test_wbf0_register(void) {
 }
 
 //-----------------------------------------------------------------------------
-// T20: M5 Task 8 -- the FPU joins the one-hot completion bus. An FP op
-// completing in EX1 (fvld OR xvld, FPU.v SECTION 13 -- both pulse only on
-// the cycle the result mux actually outputs, incl. FDSU's completion cycle)
-// must: (a) assert the pcgen trigger rtu_iu_ex1_cmplt the SAME cycle with
-// inst_len==1 (FP ops are always 32-bit; RVC has no F/D encodings),
-// (b) register into the EX1->EX2 retire packet -> rtu_cp0_inst_retire ONE
-// cycle later, and (c) carry the EX1-cycle flags onto the new
-// rtu_cp0_fflags/rtu_cp0_fs_dirty_updt outputs CSR.v consumes for the D7
-// sticky OR-in + mstatus.FS dirty.
+// T20: M5 Task 8, updated for M8 T4d-14 -- the FPU's TWO distinct legs on
+// RTU's completion machinery. T4d-14 (donor-faithful, aq_vidu_vid_ctrl_fp.
+// v:174-177: vpu_rtu_ex1_cmplt = idu_vidu_ex1_fp_sel) split them:
+//   (a) FOR-PCGEN leg: rtu_iu_ex1_cmplt is driven by the DISPATCH-time
+//       select idu_fpu_ex1_cmplt_for_pcgen (pulses once when the FP op is
+//       committed into EX1), NOT by the late fvld/xvld result writeback.
+//       Without the split, a multi-cycle FDSU (fdiv/fsqrt, 29-cycle double)
+//       would fire the pcgen trigger 29 cycles late, from a pcgen that has
+//       already moved onto a later instruction's pc (coremark@497336).
+//       inst_len==1 (aq_rtu_dp.v:374, CBUS_FPU_SEL: 32-bit, no FP in RVC).
+//   (b) RETIRE leg: rtu_cp0_inst_retire / rtu_cp0_fflags /
+//       rtu_cp0_fs_dirty_updt still complete on the result writeback (fvld
+//       OR xvld) ONE cycle later (EX2 retire packet) -- the result
+//       legitimately retires when it arrives (FPU.v SECTION 13: both pulse
+//       only on the cycle the result mux actually outputs).
+// Driving fvld/xvld ALONE must NOT trigger the pcgen (the T4d-14 pin).
 //-----------------------------------------------------------------------------
 static void test_fpu_cmplt_retire_heartbeat(void) {
-    // fvld leg (FRF-destined result).
+    // (a) pcgen leg: the dispatch-time select only.
+    tie_idle_inputs();
+    dut->idu_fpu_ex1_cmplt_for_pcgen = 1;
+    dut->eval();
+    check(dut->rtu_iu_ex1_cmplt == 1,
+          "FPU pcgen: dispatch-time select triggers rtu_iu_ex1_cmplt");
+    check(dut->rtu_iu_ex1_inst_len == 1, "FPU pcgen: inst_len==1 (32-bit; no FP in RVC)");
+    check(!RTUP(dut)->dbg_onehot_violation, "FPU pcgen: single source, one-hot clean");
+    tick();
+    check(dut->rtu_cp0_inst_retire == 0,
+          "FPU pcgen: the dispatch-time select does NOT retire (retire is leg b)");
+
+    // The T4d-14 regression pin: the late fvld result writeback must NOT
+    // advance the pcgen (before the fix, fvld||xvld was the for-pcgen arm).
     tie_idle_inputs();
     dut->fpu_rtu_ex1_falu_fvld   = 1;
     dut->fpu_rtu_ex1_falu_fflags = 0b01010;   // NX|DZ
     dut->eval();
-    check(dut->rtu_iu_ex1_cmplt == 1, "FPU cmplt: pcgen trigger asserted same cycle as fvld");
-    check(dut->rtu_iu_ex1_inst_len == 1, "FPU cmplt: inst_len==1 (32-bit; no FP in RVC)");
-    check(!RTUP(dut)->dbg_onehot_violation, "FPU cmplt: single source, one-hot clean");
+    check(dut->rtu_iu_ex1_cmplt == 0,
+          "FPU pcgen: late fvld alone does NOT trigger the pcgen (T4d-14)");
+
+    // (b) retire leg: fvld -> EX2 retire packet one cycle later, with flags.
     tick();
     check(dut->rtu_cp0_inst_retire == 1,
-          "FPU cmplt: rtu_cp0_inst_retire fires ONE cycle later (EX2 retire packet)");
+          "FPU retire: rtu_cp0_inst_retire fires ONE cycle later (EX2 retire packet)");
     check(dut->rtu_cp0_fflags == 0b01010,
-          "FPU cmplt: rtu_cp0_fflags carries the EX1-cycle flags", dut->rtu_cp0_fflags, 0b01010);
+          "FPU retire: rtu_cp0_fflags carries the EX1-cycle flags", dut->rtu_cp0_fflags, 0b01010);
     check(dut->rtu_cp0_fs_dirty_updt == 1,
-          "FPU cmplt: rtu_cp0_fs_dirty_updt fires on retire (EX2)");
+          "FPU retire: rtu_cp0_fs_dirty_updt fires on retire (EX2)");
     tie_idle_inputs();
     tick();
     check(dut->rtu_cp0_inst_retire == 0 && dut->rtu_cp0_fs_dirty_updt == 0,
-          "FPU cmplt: the retire pulse is one-cycle, clears when idle");
+          "FPU retire: the retire pulse is one-cycle, clears when idle");
 
-    // xvld leg (GPR-destined fcmp/fclass) drives the same retire path.
+    // xvld leg (GPR-destined fcmp/fclass) drives the same retire path only.
     tie_idle_inputs();
     dut->fpu_rtu_ex1_falu_xvld   = 1;
     dut->fpu_rtu_ex1_falu_fflags = 0b00100;   // OF
     dut->eval();
-    check(dut->rtu_iu_ex1_cmplt == 1, "FPU cmplt: xvld alone also triggers pcgen");
-    check(dut->rtu_iu_ex1_inst_len == 1, "FPU cmplt: xvld completer also 32-bit");
+    check(dut->rtu_iu_ex1_cmplt == 0,
+          "FPU pcgen: late xvld alone does NOT trigger the pcgen (T4d-14)");
     tick();
     check(dut->rtu_cp0_fs_dirty_updt == 1,
-          "FPU cmplt: xvld retire also pulses rtu_cp0_fs_dirty_updt");
+          "FPU retire: xvld retire pulses rtu_cp0_fs_dirty_updt");
     check(dut->rtu_cp0_fflags == 0b00100,
-          "FPU cmplt: xvld retire also carries its flags", dut->rtu_cp0_fflags, 0b00100);
-    test_result("T20 FPU cmplt leg (M5 Task 8): fvld/xvld -> retire heartbeat + fflags/FS-dirty to CSR");
+          "FPU retire: xvld retire also carries its flags", dut->rtu_cp0_fflags, 0b00100);
+    test_result("T20 FPU legs (M5 Task 8 + M8 T4d-14): pcgen on dispatch-time select; retire on fvld/xvld");
 }
 
 //=============================================================================
