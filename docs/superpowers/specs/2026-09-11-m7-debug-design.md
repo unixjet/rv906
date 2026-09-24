@@ -1,6 +1,12 @@
 # M7: RISC-V Standard Debug — JTAG DTM + Debug Module + SBA + core-side DTU
 
-Status: design settled (2026-09-11). Exploration notes (all facts pinned to
+Status: COMPLETE (2026-09-24) — all tasks landed (T0 2b5290c, T1 903bcb8,
+T2 5fb6c34, T3 a539a59, T4 04a048c, T5 0e90039, T6 b364081, T7 abd7008,
+T8 49849d0, T8b ceb6834, T9 f37e4d7); T10 = final battery on the
+M8-fixed tree + this status + 08-verification §8.18 final-battery block.
+M7-DEBUG-PASS (58,540 TCK) + the full standard battery green in one run
+(controller-verified on HEAD=0cff95c); see 08-verification.md §8.18.
+Design settled 2026-09-11. Exploration notes (all facts pinned to
 `file:line` in these):
 - `notes/2026-09-11-m7-rv906-debug-seams.md` — rv906 insertion points
 - `notes/2026-09-11-m7-donor-debug-machinery.md` — donor tdt/dtu architecture,

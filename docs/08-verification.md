@@ -306,6 +306,28 @@ bash test/m4/directed/run_directed.sh               # rv64mi-p-breakpoint among 
 | m5 | 46/46 |
 | m6 | 8/8 |
 
+### Final battery (M7 T10 sign-off, 2026-09-24, HEAD=0cff95c — the M8-fixed tree)
+
+One run, all gates green (controller-verified; the T10 battery script runs
+STAGE0 verisim → STAGE9 time_cyc in sequence, log kept with the T10
+record). The M7 gate chain above plus the standard battery were re-asserted
+on the tree that also carries the M8 RTL work (T4c/T4d coremark fixes,
+T2 `time` CSR / D-M8-5):
+
+| Gate | Result |
+|---|---|
+| make verisim | clean |
+| m2 unit suite (10 benches incl. dtu_tb; csr_tb T27 + rtu_tb T20 refreshed for T2 / T4d-14, 0cff95c) | UNIT-SUITE-PASS |
+| m7 unit (dm_tb + dtm_tb) | UNIT-SUITE-PASS |
+| m2 sweep | 86/87 (only the documented rv64ui-p-ma_data) |
+| m4 v sweep | 85/86 (only the documented rv64ui-v-ma_data) |
+| m4 directed SI+MI+MMU (incl. rv64mi-p-breakpoint @1026 cyc) | 30/30 |
+| m5 | 46/46 |
+| m6 | 8/8 (wfi: D-M8-5 mtime-MMIO calibration + tick-straddle range, 0cff95c) |
+| m7 debug (--m7-debug, 58,540 TCK) | M7-DEBUG-PASS |
+| m7 directed (m7-break_no_skip) | PASS (debug_spin FAILs by design, annotated) |
+| m8 suite | 5/5 (csr 345 / interrupt 512 / MMU 730 / time_cyc 4493 / coremark 503406) |
+
 ### Directed coverage (the e2e evidence, all controller-verified on HEAD=ceb6834):
 
 - **halt** — dmcontrol.haltreq → dmstatus anyhalted=1/anyrunning=0; dpc in the spin-loop range; dcsr.cause=3 (dm_sync); x8 intact.
