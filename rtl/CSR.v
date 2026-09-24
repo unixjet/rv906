@@ -291,6 +291,10 @@ module CSR #(
     input  wire                     meip,
     // M6 Task 3: live CLINT mtime mirror -- read-only `time` CSR (0xC01),
     // serves the M/S/U alias from one mirror (design doc Task 3).
+    // M8 T2 (D-M8-5): the `time` CSR (0xC01) read arm is now mcycle_reg, so
+    // this mirror is UNUSED by CSR.v (kept wired for structural fidelity to
+    // the M6 Task-3 port list; the CLINT mtime MMIO 0x0200BFF8 lives at
+    // RVProcAXI, not here, and is unaffected). Non-fatal UNUSED.
     input  wire [63:0]              mtime,
 
     //=========================================================================
@@ -1648,7 +1652,18 @@ module CSR #(
             CSR_MCYCLE:     csr_read_mux = mcycle_reg;
             CSR_MINSTRET:   csr_read_mux = minstret_reg;
             CSR_CYCLE:      csr_read_mux = mcycle_reg;
-            CSR_TIME:       csr_read_mux = mtime;
+            // M8 T2 (D-M8-5): `time` (0xC01) re-pointed from the CLINT mtime
+            // mirror to mcycle_reg. DEVIATION from the donor: the donor's
+            // `time` reads the external SoC mtime (aq_hpcp_top.v:2655,
+            // TIME: data_out = biu_hpcp_time), which on rv906 is the clk/100
+            // CLINT counter -- cross-checking `time`-derived windows against
+            // donor cycle counts would then carry rtc_tick phase. Reading
+            // mcycle_reg makes `time` advance at exactly the cycle rate, so
+            // the M8 parity windows are deterministic. The CLINT mtime
+            // (clk/100) stays as MMIO 0x0200BFF8 (time_cyc.S checks 3/4 pin
+            // it NOT per-cycle); only the 0xC01 read arm moves. mtip.S gets
+            // ~100x slower but still PASSes (design doc D-M8-5 row).
+            CSR_TIME:       csr_read_mux = mcycle_reg;
             CSR_INSTRET:    csr_read_mux = minstret_reg;
             // M7 Task 2: trigger CSRs (0x7A0-0x7AA) read from the DTU, same
             // style as the debug-mode arms below; the M4 zero-trigger
