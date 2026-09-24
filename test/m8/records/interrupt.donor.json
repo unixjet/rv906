@@ -1,0 +1,12 @@
+{
+  "case": "interrupt",
+  "side": "donor",
+  "verdict": "PASS",
+  "cycles": 3716.5,
+  "console_excerpt": "\t********* Init Program *********\n\t********* Wipe memory to 0 *********\n\t********* Read program *********\n\t********* Load program to memory *********\n\n**********************************************\n*    simulation finished successfully        *\n**********************************************\n../logical/tb/tb.v:269: $finish called at 371650 (100ps)",
+  "raw_report": "TEST PASS",
+  "build_ok": "true",
+  "toolchain": "riscv64-unknown-elf-gcc 15.1.0 (/opt/riscv/bin) + iverilog 12",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d (T1-patched donor string)",
+  "deltas": []
+}

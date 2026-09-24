@@ -1,0 +1,17 @@
+{
+  "case": "coremark",
+  "side": "donor",
+  "verdict": "PASS",
+  "cycles": 435894.5,
+  "console_excerpt": "\t********* Init Program *********\n\t********* Wipe memory to 0 *********\n\t********* Read program *********\n\t********* Load program to memory *********\n\n**********************************************\n*    simulation finished successfully        *\n**********************************************\n../logical/tb/tb.v:269: $finish called at 43589450 (100ps)",
+  "raw_report": "TEST PASS",
+  "build_ok": "true",
+  "toolchain": "riscv64-unknown-elf-gcc 15.1.0 (/opt/riscv/bin) + iverilog 12",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d (link line, -mtune=c906 dropped)",
+  "deltas": [
+    "T6 patch 3: 4 vendor CFLAGS dropped (-msignedness-cmpiv -mno-thread-jumps1 -mno-iv-adjust-addr-cost -mno-expand-split-imm)",
+    "T6 patch 4: -mtune=c906 dropped (vendor tune rejected by standard gcc cc1)",
+    "T6 patch 5: GCC-15 acceptance tokens (implicit-decl / int-conversion), md5-ledgered",
+    "T6 patch 6: core_main.c:178 iterations 2->1 (identical-both-sides trimmed run)"
+  ]
+}

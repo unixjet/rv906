@@ -1,0 +1,10 @@
+{
+  "case": "time_cyc",
+  "side": "rv906",
+  "verdict": "PASS",
+  "cycles": 4493,
+  "console_excerpt": "dt=00000fca dm=00000028\n[init] initial_pc=80000000 initial_sp=821f0000 dtb_addr=82200000\n[m1] rung=1 (ras=0 btb=0 bht=0) sink_stall=0 inv_test=0 max_insts=200000 checker=1\nfinal_cycles 4493\n[checker] AXI memory traffic: 8 reads, 1 writes\n[m1] fetch-stream checker RETIRED in Task 7 (FetchSink removed; no committed-stream registers on the real core) -- Task 8 installs the per-retire trace harness (contract 13); no stream comparison this run\ntest/m8/build/time_cyc.elf: PASS.",
+  "toolchain": "xpack riscv-none-elf-gcc 15.2.0 (/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin)",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d",
+  "deltas": []
+}

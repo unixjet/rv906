@@ -9,9 +9,9 @@ equality for every final-set case. Cycles are printed as a column
 
 Final parity set -- T6 declaration
 (docs/superpowers/specs/notes/2026-09-21-m8-t6-donor-runs.md section 7):
-    {csr, interrupt, MMU}  (donor TEST PASS)
+    {csr, interrupt, MMU, coremark}  (donor TEST PASS; coremark entered
+    the set when its donor build unblocked and it PASSed at 435894.5 cyc)
     exception              (donor TEST FAIL, R1 source-inherent: dropped)
-    coremark               (pending: donor build blocked on patch 4 + run)
 
 Usage:
     python3 test/m8/compare.py            # compare what is recorded
@@ -36,8 +36,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECORDS = os.path.join(HERE, "records")
 
-FINAL_SET = ["csr", "interrupt", "MMU"]
-PENDING = ["coremark"]   # enters the set if it PASSes on the donor
+FINAL_SET = ["csr", "interrupt", "MMU", "coremark"]
+PENDING = []   # coremark entered the set once the donor run PASSed (T6)
 
 
 def load_record(recdir, case, side):

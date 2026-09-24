@@ -1,7 +1,17 @@
 # M8: Cross-Check vs Original openc906 RTL — Design (Task 0)
 
 Date: 2026-09-21
-Status: FINAL — pins every decision the M8 implementation tasks (T2–T7) need.
+Status: COMPLETE (2026-09-24) — all tasks landed (T0 de37767+3e0b984,
+T1 81351a5, T2 198d9f1, T3 269fd7c, T4 9908076, T4b 878a7e2, T4c 09a5044,
+T4d-5 bb72e5e, T4d-10 8d77235, T4d-11+14 27f1718, T5 17989bc, T6
+473fbb6+097d5af, follow-up 0cff95c); T7 close-out = compare.py (final
+parity set) + test/m8/records + notes/2026-09-24-m8-t7-results.md + this
+status. **Parity MET**: {csr, interrupt, MMU, coremark} PASS on BOTH
+sides (rv906 345/512/730/503406 vs donor 2736.5/3716.5/4550.5/435894.5);
+cycles annotated, never gated (D-M8-6); `exception` out of set per D-M8-2
+(source-inherent donor FAIL). controller-verified on HEAD=c538633.
+Was: FINAL design (pins every decision the M8 implementation tasks T2–T7
+need).
 Parent: `docs/superpowers/specs/2026-08-20-rv906-c906-clone-design.md:318` —
 verbatim umbrella row:
 

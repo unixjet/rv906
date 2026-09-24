@@ -1,0 +1,14 @@
+{
+  "case": "coremark",
+  "side": "rv906",
+  "verdict": "PASS",
+  "cycles": 503406,
+  "console_excerpt": "ERROR! Please define ee_ptr_int to a type that holds a pointer!\n\nVCUNT_SIM: CoreMark has been run 1 times, one times cost 457476 cycles !\n\nVCUNT_SIM: CoreMark 1.0 : 2.1////0 (iterations/sec)/MHz\n[init] initial_pc=80000000 initial_sp=821f0000 dtb_addr=82200000\n[m1] rung=1 (ras=0 btb=0 bht=0) sink_stall=0 inv_test=0 max_insts=200000 checker=1\nfinal_cycles 503406\n[checker] AXI memory traffic: 552 reads, 834 writes\n[m1] fetch-stream checker RETIRED in Task 7 (FetchSink removed; no committed-stream registers on the real core) -- Task 8 installs the per-retire trace harness (contract 13); no stream comparison this run\ntest/m8/build/coremark.elf: PASS.",
+  "toolchain": "xpack riscv-none-elf-gcc 15.2.0 (/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin)",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d",
+  "deltas": [
+    "case body trim (identical-both-sides, the one approved .c-source deviation; T6 patch 6): core_main.c:178 results[0].iterations= 2 -> 1 -- the donor 2-iteration run tripped its ~2 h wall guard with no $finish, so the final donor PASS verdict (435,894.5 cycles) was produced at iterations=1 and both sides run that setting (note 2026-09-21-m8-t6-donor-runs.md section 6); ported core_main.c md5 bb0aae42c4104f5e9da1cbf723fba40c == donor current (trimmed) md5, other 8 files byte-identical",
+    "exit glue (rv906 only, ledger L13 class): clib/vtimer.c sim_end() donor magic write 0xffff0000 -> 0x6000FFF8 (donor tb $finish on that write, tb.v:259-282) replaced by a call to __exit() (crt0_m8.s:171-180 -> tohost=1 PASS); both sides end at the same program point (sim_end is the last call of the VCUNT_SIM block)",
+    "console (rv906 only, ledger L12 class): the linked fputc is clib/printf.c (the Makefile excludes clib/fputc.o -- duplicate fputc symbol, the donor flow carries the same latent duplicate), which writes THR 0x10000000 (device/uart16550.cpp:66-71 -> ttysrv::out -> verisim stdout); the donor fputc targets 0x6000fff8 (unmapped, axi_err, invisible), so the VCUNT_SIM lines are visible on rv906 and absent on donor"
+  ]
+}

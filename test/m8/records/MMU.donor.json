@@ -1,0 +1,14 @@
+{
+  "case": "MMU",
+  "side": "donor",
+  "verdict": "PASS",
+  "cycles": 4550.5,
+  "console_excerpt": "\t********* Init Program *********\n\t********* Wipe memory to 0 *********\n\t********* Read program *********\n\t********* Load program to memory *********\n\n**********************************************\n*    simulation finished successfully        *\n**********************************************\n../logical/tb/tb.v:269: $finish called at 455050 (100ps)",
+  "raw_report": "TEST PASS",
+  "build_ok": "true",
+  "toolchain": "riscv64-unknown-elf-gcc 15.1.0 (/opt/riscv/bin) + iverilog 12",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d (T1-patched donor string)",
+  "deltas": [
+    "mxstatus -> 0x7c0 (6 sites, T6 patch 1)"
+  ]
+}

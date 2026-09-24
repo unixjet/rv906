@@ -1,0 +1,17 @@
+{
+  "case": "interrupt",
+  "side": "rv906",
+  "verdict": "PASS",
+  "cycles": 512,
+  "console_excerpt": "[init] initial_pc=80000000 initial_sp=821f0000 dtb_addr=82200000\n[m1] rung=1 (ras=0 btb=0 bht=0) sink_stall=0 inv_test=0 max_insts=200000 checker=1\nfinal_cycles 512\n[checker] AXI memory traffic: 41 reads, 1 writes\n[m1] fetch-stream checker RETIRED in Task 7 (FetchSink removed; no committed-stream registers on the real core) -- Task 8 installs the per-retire trace harness (contract 13); no stream comparison this run\ntest/m8/build/interrupt.elf: PASS.",
+  "toolchain": "xpack riscv-none-elf-gcc 15.2.0 (/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin)",
+  "march": "rv64imafdc_zicsr_zifencei -mabi=lp64d",
+  "deltas": [
+    "PLICBASE_M 0x4000000000 -> 0x0C000000 (rv906 PLIC base, rtl/RVProcAXI.v:156; offsets map 1:1, rtl/PLIC.v:9-17)",
+    "source: donor INTPEND 0x1000 backdoor (writable one-shot pending, sw 0x2) -> real UART IRQ, PLIC source 7 (IER@0x10000004=2, device/uart16550.cpp:101-104 -> G_io_pins_uart_irq, rtl/RVProcAXI.v:680); rv906 pending reg is RO",
+    "reordered init (M6 pattern): UART IER assert is the LAST poke, after set_mthreshold_off -- a level source poked before threshold-off would raise meip while the store is in flight and take the trap at the store retire boundary (mepc=wfi) -> wfi would block after mret",
+    "prio[7]=4 @0x0C00001C (donor 0xa out of range: rv906 prio is 3-bit), enable bit7 @0x0C002000, DROPPED donor INTIE_HART 0x80 second-level poke (rv906 single-context: 0x2000 is the context-0 enable)",
+    "handler: IER deassert (li x13,0x10000004; li x12,0; sb x12,0(x13)) between claim and complete, replacing 3 of the 4 nops -- mandatory on rv906: THRE level stays high while IER set, so without it the interrupt re-fires after mret and the case loops in claim forever",
+    "handler stack frame: mstatus slot 0x16(x2)->0x10(x2) in stack_push/stack_pop (donor 0x16=22 is an unaligned sd on rv906, which traps misaligned at issue, LSU.v contract 3 / design 4.2 item 5; donor C906 tolerated it via mxstatus.mm; same 24-byte frame, donor -24/+16 push/pop asymmetry kept)"
+  ]
+}
