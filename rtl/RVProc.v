@@ -424,6 +424,7 @@ module RVProc #(
     wire                     idu_fpu_ex1_fcnvt_sel;
     wire                     idu_fpu_ex1_fmau_sel;  // M5 Task 5
     wire                     idu_fpu_ex1_fdsu_sel;  // M5 Task 6
+    wire                     idu_fpu_ex1_cmplt_for_pcgen;  // T4d-14: dispatch-time FPU cmplt for pcgen
     wire                     fpu_idu_fdsu_full;     // M5 Task 6
     wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func;
     wire [2:0]               idu_fpu_ex1_rm;
@@ -1046,6 +1047,7 @@ module RVProc #(
         .idu_fpu_ex1_fcnvt_sel   (idu_fpu_ex1_fcnvt_sel),
         .idu_fpu_ex1_fmau_sel    (idu_fpu_ex1_fmau_sel),
         .idu_fpu_ex1_fdsu_sel    (idu_fpu_ex1_fdsu_sel),
+        .idu_fpu_ex1_cmplt_for_pcgen (idu_fpu_ex1_cmplt_for_pcgen),
         .fpu_idu_fdsu_full       (fpu_idu_fdsu_full),
         .idu_fpu_ex1_func        (idu_fpu_ex1_func),
         .idu_fpu_ex1_rm          (idu_fpu_ex1_rm),
@@ -1507,6 +1509,7 @@ module RVProc #(
         .fpu_rtu_ex1_falu_fvld   (fpu_rtu_ex1_falu_fvld),
         .fpu_rtu_ex1_falu_xvld   (fpu_rtu_ex1_falu_xvld),
         .fpu_rtu_ex1_falu_preg   (fpu_rtu_ex1_falu_preg),
+        .idu_fpu_ex1_cmplt_for_pcgen (idu_fpu_ex1_cmplt_for_pcgen),
 
         .rtu_yy_xx_expt_vld      (rtu_yy_xx_expt_vld),
         .rtu_yy_xx_expt_int      (rtu_yy_xx_expt_int),

@@ -968,7 +968,29 @@ module IU (
     // IFUDBG tracing: cnt=124 va ffffffffffe01 -> 000000ffffe01 on this path).
     assign iu_ifu_tar_pc      = {{(64-PC_WIDTH){bju_next_pc[PC_WIDTH-1]}}, bju_next_pc};
     assign iu_ifu_pc_mispred  = bju_resolves_now && bju_pc_reg_mispred;
-    assign iu_ifu_bht_mispred = bju_cond_br_mispred;
+    // Donor aq_iu_bju.v:637-639,651,790 gates iu_ifu_bht_mispred to the
+    // actual RESOLUTION cycle: no_entry term =
+    // bju_cond_sel && (taken ^ pred[1]) && bju_ex1_inst_no_depd
+    // && idu_iu_ex1_bju_sel (aq_iu_bju.v:461: no_depd = !bju_depend_lsu
+    // && ex1_bju_sel), entry term = same mismatch && bju_entry_pop.
+    // NOTE the donor's no_entry term is NOT required to have the entry
+    // empty -- a live no-depd branch at ex1 behind an occupied entry
+    // still fires it (with the entry-muxed cond/taken/pred values, since
+    // the donor muxes bju_func/bju_srcN/bju_bht_pred on bju_entry_vld,
+    // aq_iu_bju.v:562-565, exactly like rv906's bju_func_sel/bju_cmp_srcN/
+    // bju_bht_pred_sel on bju_entry_vld_r). T4d-11 (coremark@483291): the
+    // old un-gated `bju_cond_br_mispred` kept firing for 3 cycles AFTER
+    // the branch had resolved, on ex1 BUBBLES where the stale registered
+    // compare still read as a mismatch (IU probe: ex1v=0 ex1b=0 entryv=0
+    // yet misp=1 at 481985-481987). Each spurious cycle (a) reloaded
+    // bht_vghr from {bht_ghr[12:0], iu_ifu_bht_taken} (aq_ifu_bht.v:
+    // 214-215) and (b) re-latched bht_ref_vghr (aq_ifu_bht.v:513-530),
+    // moving the mispredict-refill write from the resolved branch's real
+    // (row 0x2AA, lane 2) to (row 0x155, lane 5) and desyncing the BHT
+    // state from the donor from that point on.
+    wire bju_bht_mispred_no_entry = bju_cond_br_mispred && !bju_depend_lsu
+                                  && idu_iu_ex1_bju_sel;
+    assign iu_ifu_bht_mispred = bju_bht_mispred_no_entry || bju_bht_mispred_entry;
     assign iu_ifu_br_vld      = bju_resolves_now && bju_is_cond_br_sel;
     assign iu_ifu_bht_taken   = bju_taken;
     assign iu_ifu_bht_pred    = bju_bht_pred_sel;

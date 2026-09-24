@@ -380,6 +380,11 @@ module RTU (
     input  wire                     fpu_rtu_ex1_falu_fvld,
     input  wire                     fpu_rtu_ex1_falu_xvld,
     input  wire [GPR_IDX_WIDTH-1:0] fpu_rtu_ex1_falu_preg,
+    // T4d-14: dispatch-time FPU completion for the pcgen (IDU-generated;
+    // donor vpu_rtu_ex1_cmplt = idu_vidu_ex1_fp_sel). Replaces the late
+    // fvld||xvld as the FPU's for-pcgen arm so a multi-cycle FDSU op
+    // advances the pcgen at its dispatch, not 29 cycles later.
+    input  wire                     idu_fpu_ex1_cmplt_for_pcgen,
 
     //=========================================================================
     // RTU -> CSR : trap-entry capture (RTU note S7).
@@ -489,6 +494,16 @@ module RTU (
     // vec (VPU) leg (aq_rtu_dp.v:307,325); rv906 has no VPU and a separate
     // FPU cluster (D1), so this is the new 8th leg.
     wire ex1_fpu_cmplt_dp = fpu_rtu_ex1_falu_fvld || fpu_rtu_ex1_falu_xvld;
+    // T4d-14: the FPU's for-PCGEN completion is the DISPATCH-time signal
+    // (donor vpu_rtu_ex1_cmplt = idu_vidu_ex1_fp_sel, aq_vidu_vid_ctrl_fp.v
+    // :174-177), NOT the late fvld||xvld. The late signal is kept above
+    // (ex1_fpu_cmplt_dp) for the retire leg (dp_cmplt_source) and the
+    // FPU writeback, which legitimately retire on the result writeback.
+    // But the pcgen must advance when the FP op is committed into EX1, so
+    // a multi-cycle FDSU (fdiv/fsqrt, 29-cycle double) advances the pcgen
+    // at its dispatch, not 29 cycles later when the pcgen has already
+    // moved onto a later instruction's pc.
+    wire ex1_fpu_cmplt_for_pcgen = idu_fpu_ex1_cmplt_for_pcgen;
 
     wire [7:0] dp_cmplt_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_dp,
                                    ex1_div_cmplt_dp, ex1_lsu_cmplt_dp, ex1_cp0_cmplt_dp,
@@ -530,14 +545,18 @@ module RTU (
     // the pass value. Task 9.7 fix: OR the early for-pcgen arm here.
     wire ex1_lsu_cmplt_for_pcgen = lsu_rtu_ex1_cmplt_for_pcgen;
     wire ex1_bju_cmplt_for_pcgen = iu_rtu_ex1_bju_cmplt_for_pcgen;
-    // M5 Task 8: FPU has no early/late split -- fvld/xvld fire on the same
-    // EX1 cycle as the result (single-cycle units; FDSU's iterative span is
-    // resolved by its own fdsu_cmplt_now), so its for-pcgen arm is its `_dp`
-    // flavor itself, exactly like the ALU's.
+    // T4d-14: the FPU's for-pcgen arm is the DISPATCH-time signal
+    // (ex1_fpu_cmplt_for_pcgen, donor vpu_rtu_ex1_cmplt =
+    // idu_vidu_ex1_fp_sel), NOT the late fvld||xvld. A multi-cycle FDSU
+    // (fdiv/fsqrt, 29-cycle double) must advance the pcgen at its dispatch,
+    // not 29 cycles later when the pcgen has already moved on. (M5 Task 8
+    // assumed no early/late split because the FMAU/FADD legs are
+    // single-cycle; the FDSU leg breaks that assumption -- see ex1_fpu_
+    // cmplt_for_pcgen's comment.)
     wire dp_ex1_cmplt_for_pcgen  = ex1_alu_cmplt_dp  || ex1_mul_cmplt_dp
                                   || ex1_bju_cmplt_for_pcgen || ex1_div_cmplt_dp
                                   || ex1_lsu_cmplt_for_pcgen || ex1_cp0_cmplt_dp
-                                  || ex1_vec_cmplt_dp || ex1_fpu_cmplt_dp;
+                                  || ex1_vec_cmplt_dp || ex1_fpu_cmplt_for_pcgen;
     assign rtu_iu_ex1_cmplt = dp_ex1_cmplt_for_pcgen;
 
     // rtu_iu_ex1_inst_len = the COMPLETING instruction's length, muxed by
@@ -566,7 +585,7 @@ module RTU (
     // desynced).
     wire [7:0] pcgen_len_source = {ex1_alu_cmplt_dp, ex1_mul_cmplt_dp, ex1_bju_cmplt_for_pcgen,
                                     ex1_div_cmplt_dp, ex1_lsu_cmplt_for_pcgen, ex1_cp0_cmplt_dp,
-                                    ex1_vec_cmplt_dp, ex1_fpu_cmplt_dp};
+                                    ex1_vec_cmplt_dp, ex1_fpu_cmplt_for_pcgen};
     reg rtu_iu_ex1_inst_len_r;
     always @* begin
         case (pcgen_len_source)

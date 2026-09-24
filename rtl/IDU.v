@@ -287,6 +287,23 @@ module IDU (
     // (IU.v SECTION DIV is this signal's structural precedent, design doc
     // D1).
     output wire                     idu_fpu_ex1_fdsu_sel,
+    // T4d-14: FPU completion FOR THE PCGEN (dispatch-time), mirroring the
+    // donor's vpu_rtu_ex1_cmplt = idu_vidu_ex1_fp_sel (aq_vidu_vid_ctrl_fp.v
+    // :174-177). The donor advances the pcgen off the FP SELECT in EX1
+    // (i.e. when the FP op is dispatched into the FP unit), NOT off the
+    // FP result writeback. rv906's for-pcgen arm was fvld||xvld
+    // (execution completion), which for the multi-cycle FDSU (fdiv/fsqrt,
+    // 29-cycle double) fires 29 cycles AFTER dispatch -- by then bju_pcgen_pc
+    // has advanced past the fdiv/fsqrt's own pc onto a later instruction's
+    // pc (coremark: an fdiv.d dispatched pre-0xc648 completed while pcgen
+    // sat at the fmadd.d's pc 0xc658, so its late fvld advanced the pcgen
+    // from the wrong pc, desyncing pcgen one instruction ahead of the
+    // auipc@0xc684 and corrupting its base -> c.fld misalign trap). This
+    // signal is the common base of the five FPU dispatch selects above
+    // (ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit)
+    // and pulses once, on the cycle the FP op is committed into EX1,
+    // regardless of the FP unit's (FDSU) execution latency.
+    output wire                     idu_fpu_ex1_cmplt_for_pcgen,
     output wire [FUNC_WIDTH-1:0]    idu_fpu_ex1_func,
     output wire [2:0]               idu_fpu_ex1_rm,
     // M5 Task 4b: destination register tag (rd), same pass-through shape as
@@ -2294,6 +2311,12 @@ module IDU (
                                   && (ex1_func_r[FUNC_FDSU_DIV] || ex1_func_r[FUNC_FDSU_SQRT])
                                   && !ex1_func_r[FUNC_MAU_MUL]
                                   && !fpu_idu_fdsu_full;
+    // T4d-14: dispatch-time FPU completion for the pcgen (see the port
+    // comment). Common base of the five FPU dispatch selects above --
+    // high for exactly the one cycle an FP op is committed into EX1,
+    // independent of FDSU/FMAU execution latency. Feeds the RTU's FPU
+    // for-pcgen arm in place of the late fvld||xvld (donor-faithful).
+    assign idu_fpu_ex1_cmplt_for_pcgen = ex1_eu_r[EU_FP_SEL] && !ctrl_ex1_internal_stall && rtu_idu_commit;
     assign idu_fpu_ex1_func      = ex1_func_r;
     assign idu_fpu_ex1_rm        = ex1_rm_r;
     assign idu_fpu_ex1_dst0_reg  = {1'b0, ex1_dst0_reg_r};
