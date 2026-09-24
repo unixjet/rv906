@@ -551,8 +551,10 @@ module RTU (
     // TRIGGER (dp_ex1_cmplt_for_pcgen) above, not the retire-late
     // dp_cmplt_source: an LSU op's for-pcgen arm fires while its `_dp` is
     // still several cycles away (line 391-392), and a PARKED bju fires
-    // for-pcgen at entry-creation but `_dp`/bju_resolves_now only at pop
-    // (IU.v iu_rtu_ex1_bju_cmplt_for_pcgen note). On those cycles every
+    // for-pcgen at its operand-resolution (fwd) cycle while its
+    // `_dp`/bju_resolves_now only fires at the later pop
+    // (IU.v iu_rtu_ex1_bju_cmplt_for_pcgen / bju_inst_cmplt notes). On
+    // those cycles every
     // `_dp` bit is 0, so selecting on dp_cmplt_source fell to the
     // `default` 32-bit assumption even for a 16-bit RVC completer,
     // advancing bju_pcgen_pc by 4 instead of 2 -- a permanent pcgen/retire

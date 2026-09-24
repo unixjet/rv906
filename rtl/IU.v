@@ -631,6 +631,52 @@ module IU (
 
     wire bju_entry_pop = bju_entry_vld_r && bju_entry_src0_vld_r && bju_entry_src1_vld_r;
 
+    // -----------------------------------------------------------------
+    // Donor-faithful BJU pcgen completion (M8 T4d-10, supersedes T4d-5
+    // gate). The pcgen's EX1 arm fires when the branch's OPERANDS RESOLVE
+    // -- in-EX1 (no LSU dependency) or on the cycle a DA/LSU forward
+    // fills the last missing entry source ("the fwd cycle") -- and NOT on
+    // the entry-creation cycle and NOT on the pop cycle:
+    //   aq_iu_bju.v:662  bju_inst_cmplt = idu_iu_ex1_bju_sel &&
+    //                                          !bju_depend_lsu
+    //                          || bju_depend_lsu_cmplt;
+    //   aq_iu_bju.v:480-484  bju_depend_lsu_cmplt =
+    //       !bju_entry_vld && (!bju_depend_lsu_src0 || bju_src0_fwd_vld) &&
+    //                         (!bju_depend_lsu_src1 || bju_src1_fwd_vld) &&
+    //                         bju_depend_lsu && idu_iu_ex1_bju_sel // fwd in ex1
+    //     || bju_entry_vld && !(bju_entry_src0_vld && bju_entry_src1_vld) &&
+    //                         (!bju_entry_src0_vld && bju_src0_fwd_vld ||
+    //                          bju_entry_src0_vld) &&
+    //                         (!bju_entry_src1_vld && bju_src1_fwd_vld ||
+    //                          bju_entry_src1_vld);              // fwd in entry
+    // The donor's bju_srcN_fwd_vld (aq_iu_bju.v:452-457) is the LSU-ex2
+    // forward matched to the entry-muxed waited register; rv906's forward
+    // matches are `bju_da_hitN || bju_lsu_hitN` (above, already entry-
+    // muxed through bju_fwd_srcN_reg_sel) -- they are exactly the two
+    // sources that set bju_entry_srcN_vld_r (lines below), so the cmplt
+    // fires the cycle before the corresponding vld bit clocks.
+    //
+    // Why the T4d-5 gate was wrong: it fired on CREATION (pre-advancing
+    // the pcgen ahead of the front end's own redirect) AND on the POP
+    // cycle -- where the following instruction's own completion fires on
+    // the same edge, so one pcgen advance had to serve two instructions
+    // (the RTU's pcgen_len_source one-hot case falls to the 32-bit
+    // default on the 2-bit vector, and the value was the BRANCH's next,
+    // dropping the following instruction's own advance) -- the
+    // coremark@483291 iter-1 checksum desync. The fwd-cycle firing
+    // advances the pcgen exactly once per instruction, donor-for-donor.
+    wire bju_depend_lsu_cmplt =
+          !bju_entry_vld_r && (!bju_depend_lsu_src0 || bju_da_hit0 || bju_lsu_hit0)
+                            && (!bju_depend_lsu_src1 || bju_da_hit1 || bju_lsu_hit1)
+                            && bju_depend_lsu && idu_iu_ex1_bju_sel
+        || bju_entry_vld_r && !(bju_entry_src0_vld_r && bju_entry_src1_vld_r)
+                            && (!bju_entry_src0_vld_r && (bju_da_hit0 || bju_lsu_hit0)
+                                || bju_entry_src0_vld_r)
+                            && (!bju_entry_src1_vld_r && (bju_da_hit1 || bju_lsu_hit1)
+                                || bju_entry_src1_vld_r);
+    wire bju_inst_cmplt = idu_iu_ex1_bju_sel && !bju_depend_lsu
+                        || bju_depend_lsu_cmplt;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             bju_entry_vld_r <= 1'b0;
@@ -826,37 +872,60 @@ module IU (
     wire bju_resolves_now = bju_entry_pop
                           || (idu_iu_ex1_bju_sel && !bju_entry_vld_r && !bju_create_entry);
 
-    // PC-gen next pc (donor aq_iu_bju.v:611-625, the "Condition Branch" /
-    // "Next PC" blocks). The donor does NOT hold the pcgen at the branch's own
-    // PC while it is parked; it advances the pcgen to the PREDICTED next pc,
-    // staying in lockstep with the front end (the BPU has already redirected
-    // the fetch to the target on a predicted-taken branch). Mechanism:
+    // PC-gen next pc (M8 T4d-10: donor-faithful restore, supersedes T4d-5).
+    //
+    // Donor aq_iu_bju.v:611-625 ("Condition Branch" / "Next PC"): the
+    // pcgen's advance VALUE is `bju_next_pc` itself, whose taken-side
+    // select uses the REAL-OR-PREDICTED branch result:
     //   aq_iu_bju.v:615-616  bju_cond_br_taken =
     //       (bju_ex1_inst_no_depd || bju_entry_pop) ? bju_cond_br_taken_raw
-    //                                                            : bju_bht_pred[1];
-    //     i.e. the REAL comparison result only when the branch RESOLVES (in-EX1
-    //     no-dep, or entry pop); otherwise (PARKING or PARKED) the BHT
-    //     PREDICTION (bju_bht_pred[1]).
+    //                                                    : bju_bht_pred[1];
+    //   aq_iu_bju.v:622-623  bju_ag_tar_pc_sel = bju_cond_br_taken &&
+    //       (bju_cond_sel_ex1 || bju_entry_vld) && !bju_entry_pop
+    //                       || bju_uncond_sel;
     //   aq_iu_bju.v:624-625  bju_next_pc = bju_ag_tar_pc_sel ? bju_ag_tar_pc
-    //                                                            : bju_inc_pc_ext;
-    //     with bju_ag_tar_pc_sel driven by that (real-or-predicted) taken
-    //     (aq_iu_bju.v:622-623). So on a park the pcgen advance VALUE is
-    //     (bht_pred[1] ? target : inc_pc).
+    //                                                           : bju_inc_pc_ext;
+    // (aq_iu_bju.v:699-701: the pcgen always block loads exactly
+    // `bju_next_pc`, no separate pcgen value mux.) rv906 signal map:
+    // bju_ag_tar_pc -> entry-muxed bju_target_pc; bju_inc_pc_ext ->
+    // bju_inc_pc_rt (RVC-aware, aq_iu_bju.v:576-583); bju_cond_sel_ex1 ->
+    // bju_is_cond_br_live && idu_iu_ex1_bju_sel; bju_ex1_inst_no_depd ->
+    // idu_iu_ex1_bju_sel && !bju_depend_lsu.
     //
-    // rv906 F4/T4d-5 VALUE fix (not a gate fix): the old value
-    //     (bju_resolves_now && bju_taken) ? bju_target_pc : bju_inc_pc_rt
-    //   was ALWAYS the fall-through on the park cycle (bju_resolves_now is
-    //   low there), so a predicted-taken parked branch left the pcgen on the
-    //   fall-through while the front end went to the target -- the M8 coremark
-    //   +2 halfword-slip that clobbered s7 (FAIL@257385). Now the advance
-    //   VALUE follows the BHT prediction (bju_bht_pred_sel[1]) on a park/parked
-    //   cycle (bju_resolves_now low, matching the donor) and the real result
-    //   (bju_taken) on a resolve cycle. The advance GATE is unchanged (IU.v:972
-    //   still fires on the park cycle) -- a gate change (moving the advance to
-    //   the resolve cycle) regressed the rv64ui-p-lb/sd auipc-lockstep tests.
+    // Combined with the gate above (bju_inst_cmplt, fwd-cycle firing), a
+    // parked branch advances the pcgen to its PREDICTED next pc on the
+    // fwd cycle (one cycle before the pop), and the pop cycle then
+    // advances it again via the FOLLOWING instruction's own completion --
+    // exactly one advance per instruction, no pop-cycle collision. A
+    // mispredicted parked branch self-corrects through the higher-
+    // priority bju_not_ex1_chgflw branch (aq_iu_bju.v:637-638,687-707;
+    // ported above as bju_bht_mispred_entry). The auipc/JAL/branch-target
+    // AG base stays the LIVE pcgen (bju_ag_cur_pc = bju_pcgen_pc,
+    // aq_iu_bju.v:471): with the fwd-cycle advance, by the time the
+    // following instruction executes (pop cycle) the pcgen already holds
+    // that instruction's own PC in lockstep flow.
+    //
+    // T4d-5 (creation-cycle pre-advance) fixed coremark@257385 but the
+    // resolves_now gate's pop-cycle firing left the pop-collision above --
+    // the coremark@483291 iter-1 checksum desync (see the
+    // bju_inst_cmplt comment). For every cycle the new gate fires this
+    // value reduces to the donor's bju_next_pc: live no-dep resolve uses
+    // the REAL result (no_depd term); the park's fwd cycle uses
+    // bht_pred[1] (the front-end's own prediction, so the pcgen stays in
+    // lockstep with wherever the front end actually redirected).
+    wire bju_cond_br_taken_rorp = (bju_entry_pop
+                                  || (idu_iu_ex1_bju_sel && !bju_depend_lsu))
+                                 ? bju_cond_br_taken_raw
+                                 : bju_bht_pred_sel[1];
+    wire bju_pcgen_tar_pc_sel   = bju_cond_br_taken_rorp
+                                 && ((bju_is_beq || bju_is_bne || bju_is_blt
+                                       || bju_is_bge || bju_is_bltu || bju_is_bgeu)
+                                      && idu_iu_ex1_bju_sel
+                                     || bju_entry_vld_r)
+                                 && !bju_entry_pop
+                                 || bju_uncond_sel;
     wire [PC_WIDTH-1:0] bju_pcgen_next_pc =
-        bju_resolves_now ? (bju_taken           ? bju_target_pc : bju_inc_pc_rt)
-                         : (bju_bht_pred_sel[1] ? bju_target_pc : bju_inc_pc_rt);
+        bju_pcgen_tar_pc_sel ? bju_target_pc : bju_inc_pc_rt;
 
     // rv906 M2 bring-up fix (rv64uc-p-rvc wrong-path pcgen drift): the donor
     // bju_tar_pc_vld formula (aq_iu_bju.v:649-653) fires only on BHT/RAS
@@ -982,17 +1051,21 @@ module IU (
 
     assign iu_rtu_ex1_bju_cmplt            = bju_resolves_now;
     assign iu_rtu_ex1_bju_cmplt_dp         = bju_resolves_now;
-    // for-pcgen completion (LSU aq_lsu_ag.v:1675 / RTU aq_rtu_ctrl.v:139
-    // pattern, applied to the bju): the pcgen must advance in lockstep with
-    // the EX1 register. A cond-branch that PARKS in the entry leaves EX1 the
-    // same cycle it is created (ex1 advances to the next inst) but does not
-    // retire until it pops, so its retire cmplt (bju_resolves_now) is low at
-    // creation and would leave the pcgen frozen one inst behind -- desyncing
-    // the auipc that reads bju_pcgen_pc (rv64ui-p-lb/sd). Fire the pcgen
-    // advance whenever the bju occupies EX1 and is not yet parked
-    // (resolving-in-EX1 OR creating-the-entry); a popped parked entry does not
-    // re-advance here (the mispredict redirect moves the pcgen instead).
-    assign iu_rtu_ex1_bju_cmplt_for_pcgen  = idu_iu_ex1_bju_sel && !bju_entry_vld_r;
+    // for-pcgen completion (M8 T4d-10, donor aq_iu_bju.v:662): the pcgen
+    // advances on the branch's operand-RESOLUTION cycle (bju_inst_cmplt --
+    // in-EX1 no-dep resolve, or the fwd cycle that fills the parked
+    // entry's last missing source), NOT on the creation cycle (no
+    // pre-advance ahead of the front end's own redirect) and NOT on the
+    // pop cycle (the pop cycle belongs to the following instruction's own
+    // completion -- firing both here would double-claim one pcgen advance
+    // and corrupt the RTU's pcgen_len_source one-hot; see the
+    // bju_inst_cmplt / bju_pcgen_next_pc comments above). The retire
+    // cmplt above (bju_resolves_now) is unchanged: the parked branch
+    // RETIRES at its pop, while the pcgen tracks it at the donor's fwd
+    // cycle -- the same early/late split the donor makes for the LSU
+    // (aq_lsu_ag.v:1675 / aq_rtu_ctrl.v:151-157 pattern, already applied
+    // to the LSU arm in RTU.v).
+    assign iu_rtu_ex1_bju_cmplt_for_pcgen  = bju_inst_cmplt;
     assign iu_rtu_ex1_bju_data             = bju_wb_data;
     assign iu_rtu_ex1_bju_inst_len         = bju_entry_vld_r ? bju_inst_len_flop : idu_iu_ex1_inst_len; // Task 7.3 (donor aq_iu_bju.v:806)
     assign iu_rtu_ex1_bju_preg             = idu_iu_ex1_dst0_reg;
