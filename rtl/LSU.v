@@ -586,9 +586,15 @@ module LSU #(
     // `ag_issue_ready` depend on `ag_valid` depend on `lsu_idu_full`.
     // `ag_raw_ready` has no such dependency: none of its terms touch
     // `lsu_idu_full`/`ag_valid`.
+    // drain_d_busy_r (declared ahead in the FRZ section, forward reference
+    // in this file's established style): the cycle after a DIRECT STB drain
+    // grant, the DCache is in its one response cycle (not dc_idle) and a
+    // new op's probe would not be accepted by the single-ported DCache --
+    // hold the issue out for that one cycle (see issue_drain_d's comment).
     wire ag_raw_ready = idu_lsu_ex1_raw_vld && (state == ST_IDLE)
                        && !clean_active && !(stb_full && ag_needs_slot_c)
-                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
+                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy
+                       && !drain_d_busy_r;
     // "would issue but for the MMU" -- every OTHER admission gate issue_real
     // already applies (state/clean/rf_port/lfb_cmplt/ptw_sv, the last two
     // declared ahead in SECTION PTW SERVANT, same forward-reference style),
@@ -602,7 +608,7 @@ module LSU #(
     // (ag_raw_ready || ag_wait_r)`.
     wire ag_issue_ready = (state == ST_IDLE) && (ag_raw_ready || ag_wait_r)
                          && !clean_active && !rf_port_busy && !lfb_cmplt_fire
-                         && !ptw_sv_busy;
+                         && !ptw_sv_busy && !drain_d_busy_r;
     wire ag_mmu_wait_start = ag_issue_ready && !mmu_lsu_pa_vld;
 
     always @(posedge clk or negedge rst_n) begin
@@ -870,19 +876,35 @@ module LSU #(
     wire        stb_m2_ag = stb_vld[2] && (stb_addr[2][63:3] == ag_dword);
     wire        stb_m3_ag = stb_vld[3] && (stb_addr[3][63:3] == ag_dword);
 
-    // KNOWN, DOCUMENTED RISK (flagged, not silently modeled as fully
-    // accurate -- matches this project's own established discipline for
-    // carried-forward gaps): an STB entry records the WAY it hit at
-    // creation time; if a LATER, different-address miss's victim-select
-    // picks that SAME way before this entry drains, the pending store data
-    // would be overwritten in the array without ever being written back.
-    // The real donor defends against exactly this with `vb_dc_hit_idx`-
-    // style index-level hazard checks (LSU note cross-cutting #6) that this
-    // minimal M2 clone does not build. Mitigated in practice (not
-    // eliminated) by draining STB opportunistically on every LSU-idle
-    // cycle (below) rather than deferring it, keeping the exposure window
-    // small; a genuine correctness gap for a future milestone's higher-
-    // throughput/back-to-back-miss test programs to re-audit.
+    // STB-victim-collision hazard -- CLOSED by TWO donor-faithful layers
+    // (both present in the donor; either alone would be a clone bug):
+    //
+    //   (1) The per-set FIFO replacement pointer (SECTION below,
+    //   victim-select): the victim of a refill into set S is the set's
+    //   stored FIFO way (aq_lsu_rdl.v:574-576), the pointer rotates
+    //   p -> p+1 mod 4 on every same-set refill's tag commit
+    //   (aq_lsu_lfb.v:1084-1087), and it resets to way 0 on
+    //   invalidate-all (aq_lsu_icc.v:614-615). A line just allocated into
+    //   (or hitting) way w of S therefore cannot be S's victim again until
+    //   3 further same-set refills commit -- a 3-commit MARGIN. This
+    //   clone implements that pointer (fifo_ptr[], the 2-bit-count
+    //   equivalent of the donor's 4-bit one-hot).
+    //
+    //   (2) The DIRECT per-cycle drain grant (issue_drain_d, FRZ section):
+    //   the margin above is only as good as the drain landing within it.
+    //   The donor's drain is a data-port grant (aq_lsu_arb.v:380) that
+    //   fires in the refill's own DRAM bus-wait, so a pending store's bytes
+    //   land within a cycle or two of its line being written -- the margin
+    //   is never near exhaustion. An FSM-gated drain (the pre-fix design:
+    //   `state == ST_IDLE && !ag_valid` only) starves under a dense op
+    //   stream and across a blocking ST_FRZ refill, and 3 same-set commits
+    //   DO slip by in that time -- the pointer alone does NOT close the
+    //   window (that was the discredited first attempt: it changed the
+    //   panic cycle but not the corruption). See the issue_drain_d block
+    //   for the full donor trace and the failure mode.
+    //
+    // With (2) the drain can stay BLIND (no tag re-verify at drain time),
+    // exactly as the donor's is (aq_lsu_stb.v:833-843).
     //-------------------------------------------------------------------------
     // SECTION drain-vs-issue arbitration (from IDLE only).
     //-------------------------------------------------------------------------
@@ -922,8 +944,35 @@ module LSU #(
                                 stb_vld[1] && !stb_lfb_block_c[1],
                                 stb_vld[0] && !stb_lfb_block_c[0]};
     wire any_stb_drainable = |stb_drainable;
-    wire [1:0] drain_pick = stb_drainable[0] ? 2'd0 : stb_drainable[1] ? 2'd1
-                            : stb_drainable[2] ? 2'd2 : 2'd3;
+    // SPLIT BY stb_was_hit (the lost-store fix): a CACHEABLE entry
+    // (was_hit=1, its drain is the blind DCache data-array write) drains
+    // through the DIRECT per-cycle data-port grant (issue_drain_d, defined
+    // in the FRZ section below) -- the donor's mechanism, where the STB
+    // drain is a data-port grant asserted whenever no other data-array
+    // requester is active (aq_lsu_arb.v:380), so it lands in the refill's
+    // own DRAM bus-wait window instead of waiting for the main pipe to be
+    // idle. A NON-cacheable entry (was_hit=0: SC/AMO write-back whose drain
+    // is a direct AXI write, no array involved) keeps the old FSM path
+    // (issue_drain -> ST_DCS -> ST_FRZ -> MS_DIRECT_WRITE).
+    wire [3:0] stb_drainable_hit  = {stb_drainable[3] && stb_was_hit[3],
+                                     stb_drainable[2] && stb_was_hit[2],
+                                     stb_drainable[1] && stb_was_hit[1],
+                                     stb_drainable[0] && stb_was_hit[0]};
+    wire [3:0] stb_drainable_miss = {stb_drainable[3] && !stb_was_hit[3],
+                                     stb_drainable[2] && !stb_was_hit[2],
+                                     stb_drainable[1] && !stb_was_hit[1],
+                                     stb_drainable[0] && !stb_was_hit[0]};
+    wire any_stb_drainable_hit  = |stb_drainable_hit;
+    wire any_stb_drainable_miss = |stb_drainable_miss;
+    // The OLD path (issue_drain) picks the lowest NON-cacheable entry only;
+    // the DIRECT path (issue_drain_d) picks the lowest cacheable entry only.
+    // The sets are disjoint, so the two paths can never target the same
+    // entry (they may legitimately fire the same cycle: the old path takes
+    // no DCache port, see its touches_array=0).
+    wire [1:0] drain_pick = stb_drainable_miss[0] ? 2'd0 : stb_drainable_miss[1] ? 2'd1
+                            : stb_drainable_miss[2] ? 2'd2 : 2'd3;
+    wire [1:0] drain_pick_d = stb_drainable_hit[0] ? 2'd0 : stb_drainable_hit[1] ? 2'd1
+                            : stb_drainable_hit[2] ? 2'd2 : 2'd3;
     // M3 audit fix -- STB-full admission control. Store/SC/AMO entries are
     // created at REPLY; if the STB is full and the completion cannot merge,
     // REPLY would stall waiting for a free slot -- but drains start only
@@ -957,15 +1006,15 @@ module LSU #(
                               || idu_lsu_ex1_func == LSU_FUNC_SC_W
                               || idu_lsu_ex1_func == LSU_FUNC_SC_D)
                              && !ag_misalign && !ag_stb_match_c;
-    // M4 LFB/STB-race fix: gate on any_stb_drainable (not any_stb_vld) --
-    // an entry whose dword collides with a still-in-flight LFB entry
+    // M4 LFB/STB-race fix: gate on any_stb_drainable_miss (not any_stb_vld)
+    // -- an entry whose dword collides with a still-in-flight LFB entry
     // (stb_lfb_block_c, SECTION drain-vs-issue arbitration above) must not
-    // be opportunistically drained, so drain_want itself must not fire on
-    // the strength of ONLY such entries being valid: any_stb_vld=1 with
-    // any_stb_drainable=0 would still set issue_drain (line ~1010) and let
-    // drain_pick's ternary fall through to its 2'd3 default, draining a
-    // slot that may not even be stb_vld[3].
-    wire drain_want = !ag_valid && any_stb_drainable && (state == ST_IDLE);
+    // be drained, and the OLD path only drains non-cacheable (was_hit=0)
+    // entries: a cacheable-only drainable set (any_stb_vld=1 with
+    // any_stb_drainable_miss=0) must not set issue_drain, which would let
+    // drain_pick's ternary fall through to its 2'd3 default and enter the
+    // FRZ direct-AXI path on an entry that is not a direct-drain entry.
+    wire drain_want = !ag_valid && any_stb_drainable_miss && (state == ST_IDLE);
 
     //-------------------------------------------------------------------------
     // SECTION DCache.v instance -- see DCache.v's own header for why it is
@@ -988,6 +1037,9 @@ module LSU #(
     wire [WAYS-1:0]             u_dc_resp_way_dirty;
     wire [DCACHE_TAG_WIDTH-1:0] u_dc_resp_victim_tag;
     wire                        u_dc_inv_done;
+    // DCache's own FSM is in its accept state (see DCache.v's dc_idle port)
+    // -- the "data array free" term of the direct STB drain grant below.
+    wire                        u_dc_idle;
 
     // dc_inv_* is driven by the FENCE.I clean walk (SECTION CLEAN below);
     // dcache_tb.cpp exercises DCache.v's own invalidate mechanism directly,
@@ -1001,6 +1053,7 @@ module LSU #(
         .dc_resp_vld(u_dc_resp_vld), .dc_resp_hit_way(u_dc_resp_hit_way), .dc_resp_rdata(u_dc_resp_rdata),
         .dc_resp_way_vld(u_dc_resp_way_vld), .dc_resp_way_dirty(u_dc_resp_way_dirty),
         .dc_resp_victim_tag(u_dc_resp_victim_tag),
+        .dc_idle(u_dc_idle),
         .dc_inv_vld(clean_inv_fire), .dc_inv_index(clean_set), .dc_inv_way_sel(clean_way_oh),
         .dc_inv_done(u_dc_inv_done)
     );
@@ -1078,9 +1131,9 @@ module LSU #(
     // issue_drain are all declared further down this file -- forward
     // reference, same style this file already uses throughout (e.g.
     // ag_needs_slot_c in lsu_idu_full's own definition).
-    wire ptw_sv_idle_free = (state == ST_IDLE) && !any_stb_vld && !clean_active
+    wire ptw_sv_idle_free = (state == ST_IDLE) && u_dc_idle && !any_stb_vld && !clean_active
                            && !rf_port_busy && !lfb_any_vld
-                           && !issue_real && !issue_drain;
+                           && !issue_real && !issue_drain && !drain_d_busy_r;
     wire ptw_sv_probe_fire = (ptw_sv_state == PTW_SV_IDLE) && mmu_lsu_data_req
                             && ptw_sv_idle_free;
 
@@ -1164,13 +1217,18 @@ module LSU #(
     //-------------------------------------------------------------------------
     // M3b: a new op must not collide with a background LFB refill's D-cache
     // port phase (rf_port_busy), and the deferred-load completion
-    // (lfb_cmplt_fire) takes the IDLE slot before a fresh issue. A drain
-    // yields only while the background refill OWNS the D-cache port
-    // (rf_port_busy: vpeek/commit); it must NOT be blocked for the whole time
-    // a load is deferred, else the STB can never drain and a full STB
-    // deadlocks (rv64ui-p-ld_st). Cacheable drains use the state FSM
-    // (ST_DCS->ST_REPLY), not the FRZ sub-FSM, so they interleave safely
-    // with the background refill's AXI phases.
+    // (lfb_cmplt_fire) takes the IDLE slot before a fresh issue. This OLD
+    // path now serves ONLY non-cacheable drains (was_hit=0: SC/AMO direct-
+    // AXI write-back, which run ST_DCS -> ST_FRZ -> MS_DIRECT_WRITE and
+    // touch no DCache port); cacheable drains (was_hit=1) drain through the
+    // DIRECT per-cycle data-port grant (issue_drain_d, FRZ section below)
+    // -- the donor-faithful fix, see that block's comment.
+    // LOST-STORE FIX (gate): the old path must not enter ST_FRZ while a
+    // background refill OWNS the shared miss sub-FSM (lfb_engine_active).
+    // Without this, the parked ST_FRZ would sample miss_done from the
+    // BACKGROUND refill's MS_DONE and retire the drain at ST_REPLY without
+    // ever running its own MS_DIRECT_WRITE -- the store's bytes would never
+    // reach memory (SC/AMO data loss under hit-under-miss).
     // M4 Task 5 (D1): issue_real now additionally requires mmu_lsu_pa_vld --
     // `ag_issue_ready` (SECTION AG WAIT-STATE above) is every OTHER gate
     // this wire used to spell out directly PLUS the `ag_wait_r` OR-term, so
@@ -1189,7 +1247,8 @@ module LSU #(
     // never commits.
     wire issue_real  = ag_issue_ready && mmu_lsu_pa_vld && !rtu_yy_xx_dbgon;
     wire issue_drain = (state == ST_IDLE) && !ag_valid && drain_want && !clean_active
-                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy;
+                       && !rf_port_busy && !lfb_cmplt_fire && !ptw_sv_busy
+                       && !lfb_engine_active;
     // M4 misalign fix (contract 3 + donor aq_lsu_ag.v, which raises misalign
     // at AG, NOT at the reply): a misaligned access must trap at its ISSUE
     // cycle. Raising it late at ST_REPLY let the front end keep dispatching
@@ -1247,8 +1306,13 @@ module LSU #(
     wire trig_fault_issue = issue_real && !ag_misalign && !mmu_fault_issue
                            && ag_halt_info_buf[TDT_HINFO_CANCEL];
 
+    // touches_array: a REAL op's AG-lookup touches the DCache when cacheable
+    // and not trapping-at-issue. Drains no longer contribute here: the old
+    // path (issue_drain) is non-cacheable-only (was_hit=0 -> no array
+    // request, its ST_DCS skips the response), and cacheable drains
+    // (was_hit=1) take the DCache port through the DIRECT grant's own
+    // `issue_drain_d` term in u_dc_req_vld below (FRZ section).
     wire touches_array = issue_real  ? (mmu_lsu_ca && !ag_misalign && !mmu_fault_issue && !trig_fault_issue)
-                        : issue_drain ? stb_was_hit[drain_pick]
                         : 1'b0;
 
     //-------------------------------------------------------------------------
@@ -1706,11 +1770,21 @@ module LSU #(
                                              // advances EX1 past an op LSU is
                                              // about to silently refuse, dropping
                                              // it forever (rv64ui-p-ld_st hang).
-                          || ptw_sv_busy;    // M4 Task 5 (D3): the array/AXI-read
+                          || ptw_sv_busy    // M4 Task 5 (D3): the array/AXI-read
                                              // port is committed to a PTE fetch
                                              // this cycle (this port's own walk OR
                                              // an ITLB walk sharing the same
                                              // servant) -- see SECTION PTW SERVANT.
+                          || drain_d_busy_r; // lost-store fix: the cycle after a
+                                             // DIRECT STB drain grant the DCache
+                                             // is in its one response cycle and
+                                             // cannot accept a new op's probe
+                                             // (single-ported, single-outstanding)
+                                             // -- hold EX1 that one cycle, exactly
+                                             // as the donor's data-port
+                                             // serialization stalls the DC stage
+                                             // behind an STB drain (see
+                                             // issue_drain_d, FRZ section).
     // Quiescent = pipe idle AND store buffer empty AND no clean walk in
     // flight AND no deferred load outstanding. state==ST_IDLE implies no
     // AG-issued op is in flight (issue_real leaves IDLE the cycle it fires)
@@ -1756,7 +1830,15 @@ module LSU #(
     reg [1:0]  victim_idx_r;
     reg [WAYS-1:0] victim_way_r;
     reg        victim_dirty_r;
-    reg [1:0]  rr_ctr;
+    // Donor per-set FIFO replacement pointer (LSU-owned; DCache.v's header
+    // delegates the policy to this module). A 2-bit count per set -- count N
+    // is the minimal faithful equivalent of the donor's 4-bit one-hot stored
+    // in the dirty row's upper nibble (donor: victim = the stored FIFO,
+    // aq_lsu_rdl.v:574-576; advanced on every same-set refill's tag commit,
+    // aq_lsu_lfb.v:1084-1087; reset to way 0 on invalidate-all,
+    // aq_lsu_icc.v:614-615).
+    reg [1:0] fifo_ptr [0:DCACHE_SETS-1];
+    integer fifo_ptr_i;
     // M3b Task B/C: single-entry victim buffer (donor aq_lsu_vb.v, ONE entry
     // :135-148) decouples the dirty-victim writeback from the refill
     // critical path (donor aq_lsu_rdl.v CHECK->WVB before evicting another
@@ -2139,17 +2221,32 @@ module LSU #(
         end
     end
 
-    // Replacement policy (LSU-owned, per DCache.v's header decision):
-    // prefer an invalid way, else the round-robin counter. The source of the
-    // set's way-valid/dirty is muxed: a background (LFB) refill reads the
-    // freshly re-read active-entry snapshot, the blocking FRZ reads the dc_*
-    // latches.
-    wire [WAYS-1:0] vic_src_vld   = lfb_engine_active ? lfb_way_vld_r   : dc_way_vld_r;
+    // Replacement policy (LSU-owned, per DCache.v's header decision): the
+    // donor's per-set FIFO replacement pointer. The victim for a refill into
+    // set S is the pointer's way; the pointer then rotates one step
+    // (p -> p+1 mod 4) on that commit, so a line just allocated into (or
+    // hitting) way w of S cannot be S's victim again until 3 further refills
+    // to S complete. That 3-commit MARGIN is the first of the donor's two
+    // defenses of a way holding a pending STB store; the second is the
+    // DIRECT per-cycle drain grant (issue_drain_d, below), which lands the
+    // store's bytes+dirty in the allocated way within a cycle or two (in
+    // the refill's own DRAM bus-wait window, as in the donor) -- so the
+    // margin is never exhausted. The pointer ALONE does not close the
+    // window (see the issue_drain_d block: a drain starved across the
+    // margin lets a 4th same-set commit re-victimize the store's way).
+    // Pure pointer, no prefer-invalid: the donor's rdl_data_way has no
+    // invalid-way preference (aq_lsu_rdl.v:574-576) -- and it is
+    // property-safe to drop anyway, since a pending-store way is
+    // necessarily valid and the pointer is the only way it can be
+    // re-selected.
     wire [WAYS-1:0] vic_src_dirty = lfb_engine_active ? lfb_way_dirty_r : dc_way_dirty_r;
-    wire [1:0] victim_idx_c = !vic_src_vld[0] ? 2'd0 :
-                              !vic_src_vld[1] ? 2'd1 :
-                              !vic_src_vld[2] ? 2'd2 :
-                              !vic_src_vld[3] ? 2'd3 : rr_ctr;
+    // victim_set = the set this refill allocates into. ONE set for BOTH the
+    // pointer read here and the pointer advance (always block below, at
+    // frz_issue_commit): frz_eff_index muxes the blocking FRZ target
+    // (dc_index_r) and the background LFB target (lfb_index[head]), and is
+    // stable across the whole MS_IDLE -> MS_COMMIT_ISSUE sequence.
+    wire [DCACHE_INDEX_W-1:0] victim_set = frz_eff_index;
+    wire [1:0] victim_idx_c = fifo_ptr[victim_set];
     wire [WAYS-1:0] victim_way_c = 4'b0001 << victim_idx_c;
     wire victim_dirty_c = (victim_idx_c == 2'd0) ? vic_src_dirty[0] :
                           (victim_idx_c == 2'd1) ? vic_src_dirty[1] :
@@ -2187,7 +2284,6 @@ module LSU #(
             vb_tag_r       <= {DCACHE_TAG_WIDTH{1'b0}};
             vb_index_r     <= {DCACHE_INDEX_W{1'b0}};
             vb_data_r      <= 512'd0;
-            rr_ctr         <= 2'd0;
             axi_w_active   <= 1'b0;
             axi_w_aw_sent  <= 1'b0;
             axi_w_w_sent   <= 1'b0;
@@ -2342,7 +2438,6 @@ module LSU #(
                             end else if (axi_r_data_hs) begin
                                 axi_r_active <= 1'b0;
                                 frz_rdata_r   <= axi_d_rdata;
-                                rr_ctr        <= rr_ctr + 2'd1;
                                 miss_state    <= MS_COMMIT_ISSUE;
                             end
                         end
@@ -2501,7 +2596,13 @@ module LSU #(
                     clean_set   <= {DCACHE_INDEX_W{1'b0}};
                 end
             end
-            CL_SET_READ: clean_state <= CL_SET_WAIT;
+            // Retry-until-accept (donor-faithful): the read/peek request is
+            // driven combinationally every cycle in these states, so it
+            // persists until the DCache (single-port, ST_IDLE-only accept)
+            // takes it. Only advance once u_dc_idle, else a direct-drain /
+            // PTW-probe use of the DCache on this cycle drops the request
+            // and the walk wedges waiting for a response that never comes.
+            CL_SET_READ: if (u_dc_idle) clean_state <= CL_SET_WAIT;
             CL_SET_WAIT: begin
                 if ((u_dc_resp_way_vld & u_dc_resp_way_dirty) == {WAYS{1'b0}}) begin
                     if (&clean_set) clean_state <= CL_IDLE;
@@ -2514,7 +2615,7 @@ module LSU #(
                     clean_state <= CL_PEEK_ISSUE;
                 end
             end
-            CL_PEEK_ISSUE: clean_state <= CL_PEEK_WAIT;
+            CL_PEEK_ISSUE: if (u_dc_idle) clean_state <= CL_PEEK_WAIT;
             CL_PEEK_WAIT:  if (u_dc_resp_vld) clean_state <= CL_WB;
             CL_WB:         if (axi_w_done)    clean_state <= CL_INV;
             CL_INV:        clean_state <= CL_INV_WAIT;
@@ -2549,12 +2650,31 @@ module LSU #(
     // vpeek/commit would collide with a concurrent hit-lookup still using
     // the shared response bus. rf_port_busy blocks NEW issues while the
     // background refill owns the port.
+    // the DCache is single-ported and only ACCEPTS a request in ST_IDLE
+    // (DCache.v:257-268) -- a request presented while it is in ST_DCS is
+    // silently dropped with no hold/replay. The LFB commit/vpeek/lfb-peek are
+    // one-shots that advance the miss FSM unconditionally (LSU.v:2444,2318),
+    // so a dropped request wedges the engine forever (MS_COMMIT_WAIT /
+    // MS_VPEEK_WAIT / MS_LFB_PEEK_WAIT wait for a response that never comes).
+    // The new direct cacheable-STB drain (issue_drain_d) and the PTW array
+    // probe are non-main-FSM port users that move the DCache ST_IDLE->ST_DCS
+    // WITHOUT moving the main FSM, so they can occupy the DCache on the cycle
+    // before a commit/peek fires. Donor C906 avoids this by making the LFB
+    // refill a LEVEL request that retries every cycle until the DCache accepts
+    // (aq_lsu_lfb.v:1068,1075 ref_vld/lfb_arb_dcache_sel; aq_lsu_lfb_entry.v:
+    // 323-326,376-397 beat state exits only on bus_cmplt_x). Faithful clone:
+    // gate each one-shot on u_dc_idle so it waits for the DCache accept state
+    // (retry-until-accept). The DCache returns to ST_IDLE one cycle after any
+    // use, so this cannot deadlock; the ST_FRZ branch is the non-cacheable
+    // path which never reaches MS_COMMIT/VPEEK_ISSUE with the DCache busy.
     wire frz_issue_vpeek  = (miss_state == MS_VPEEK_ISSUE)
                             && ((state == ST_FRZ)
-                                || (lfb_engine_active && (state == ST_IDLE || dc_wait_lfb_r)));
+                                || (lfb_engine_active && u_dc_idle
+                                    && (state == ST_IDLE || dc_wait_lfb_r)));
     wire frz_issue_commit = (miss_state == MS_COMMIT_ISSUE)
                             && ((state == ST_FRZ)
-                                || (lfb_engine_active && (state == ST_IDLE || dc_wait_lfb_r)));
+                                || (lfb_engine_active && u_dc_idle
+                                    && (state == ST_IDLE || dc_wait_lfb_r)));
     // Same anti-collision gate for the activation-time way_vld/way_dirty
     // re-read (MS_LFB_PEEK_ISSUE) -- lfb_engine_active is already guaranteed
     // true whenever miss_state reaches this value (see the LFB always
@@ -2562,7 +2682,10 @@ module LSU #(
     // via lfb_head_activatable one cycle earlier, so state is guaranteed to
     // still be ST_IDLE (or dc_wait_lfb_r) the cycle miss_state actually
     // becomes MS_LFB_PEEK_ISSUE -- no new op can have raced in and stolen it.
+    // u_dc_idle: same retry-until-accept as the commit/vpeek above (the PTW
+    // probe / direct drain can hold the DCache in ST_DCS this cycle).
     wire frz_issue_lfb_peek = (miss_state == MS_LFB_PEEK_ISSUE)
+                              && u_dc_idle
                               && (state == ST_IDLE || dc_wait_lfb_r);
     // While a background refill is using the D-cache port (activation peek,
     // vpeek/commit issue+response), a new op's lookup must not collide with it.
@@ -2580,19 +2703,219 @@ module LSU #(
                         || miss_state == MS_VPEEK_WAIT || miss_state == MS_COMMIT_ISSUE
                         || miss_state == MS_COMMIT_WAIT));
 
+    //-------------------------------------------------------------------------
+    // DIRECT cacheable STB drain -- the donor-faithful LOST-STORE fix.
+    //
+    // THE DONOR MECHANISM (verified end-to-end): the STB drain is a per-cycle
+    // DATA-PORT request/grant, NOT a main-pipeline-FSM transaction. Each
+    // draining entry sits in STB_WCA and asserts stb_entry_dcache_req
+    // (aq_lsu_stb_entry.v:448,642); the STB picks the oldest such entry
+    // (aq_lsu_stb.v:777-782) and drives stb_arb_data_req (aq_lsu_stb.v:833).
+    // The arbiter grants it whenever NO other data-array requester is active:
+    //     arb_stb_grant = !lfb_arb_dcache_sel & !rdl_arb_dcache_sel
+    //                    & !dc_arb_data_req & !mcic_arb_data_req
+    //                    & !ag_arb_data_req            (aq_lsu_arb.v:380)
+    // The grant cycle IS the commit cycle: the blind data+dirty write lands
+    // (aq_lsu_arb.v:632-642 for the data, :507-510 for the dirty set at
+    // aq_lsu_stb.v:843) and the entry pops on that same grant
+    // (aq_lsu_stb_entry.v:415-420, STB_WCA -> STB_IDLE on stb_wca_grant_x,
+    // fed back by aq_lsu_stb.v:847).
+    //
+    // CRUCIALLY, during a refill's DRAM BUS-WAIT every one of those
+    // exclusions is low: lfb_arb_dcache_sel = ref_vld = rvalid & !bus_acc_err
+    // & refbus[REF_EN] (aq_lsu_lfb.v:1068,1075) -- the bus R-valid is 0 while
+    // the refill waits for DRAM and asserts only during the refill's own
+    // 4-cycle data-write commit; rdl_arb_dcache_sel is 0 outside RDL's own
+    // tag/dirty/data/inv access cycles (aq_lsu_rdl.v:644); dc/mcic/ag data
+    // requests are transient per-access. So the donor DRAINS THE PENDING
+    // STORE CONCURRENTLY WITH THE REFILL'S DRAM WAIT -- the store's bytes
+    // and its dirty bit land in the allocated way within a cycle or two of
+    // the line being written, LONG before the per-set FIFO pointer (3
+    // same-set refill commits of margin) can rotate back to that way.
+    //
+    // WHAT rv906 DID INSTEAD (the bug): the cacheable drain ran only as a
+    // full main-FSM transaction gated on `state == ST_IDLE && !ag_valid`
+    // (issue_drain, above). A BLOCKING refill (wa=1 store-miss, AMO, the
+    // very refill that allocates the store's line) parks the main FSM in
+    // ST_FRZ for the whole DRAM wait -- no drain. And under a dense stream
+    // of memory ops, ag_valid==1 on every ST_IDLE cycle, so even with a
+    // background (hit-under-miss) refill idling the DCache in its DRAM wait
+    // (rf_port_busy==0 at MS_REFILL_READ) the drain starved. Each
+    // background same-set refill commit meanwhile advances the per-set FIFO
+    // pointer once; after 3 commits the store's way is re-victimized, and
+    // the victim writeback decision already made (from the activation-peek
+    // dirty snapshot, vic_src_dirty/lfb_way_dirty_r, which predates the
+    // never-landed drain) skips the writeback -- the refill commit then
+    // overwrites the way and the store's bytes never reach array or
+    // memory. The later blind drain (when it finally ran) wrote the store's
+    // bytes to a way holding a DIFFERENT line: lost store + corrupted line.
+    // (The global __stack_chk_guard reading 0 and the s0-120 slot holding a
+    // stale pointer are both this: the init/prologue store's line evicted
+    // CLEAN before the store's bytes arrived, refilled from stale DRAM.)
+    //
+    // THE FIX (this block): a cacheable STB entry (stb_was_hit=1) drains
+    // with a DIRECT one-cycle DCache data+dirty write granted whenever the
+    // DCache's own port is free -- i.e. its FSM is in the accept state
+    // (u_dc_idle) and no other requester is using the port this cycle.
+    // That is exactly the donor's arb_stb_grant mapped onto rv906's
+    // single-ported DCache, and it fires IN the refill's DRAM-bus-wait
+    // window (miss FSM at MS_REFILL_READ, DCache idle), for BOTH the
+    // background LFB refill and the blocking ST_FRZ refill.
+    //
+    //   * The write is the same blind (stb_index, stb_way, stb_data,
+    //     stb_byte_vld) + dirty-set, alloc=0 (no tag write) the old path
+    //     issued -- the donor's drain is blind too (aq_lsu_stb.v:833-843);
+    //     the FIFO pointer is what makes the blind target safe.
+    //   * The DCache commits the SRAM write on the grant edge (SRAM.v's
+    //     wr_cyc on the accept cycle); the entry retires the NEXT cycle
+    //     (the DCache's response cycle) -- the donor pops the entry on the
+    //     grant cycle (aq_lsu_stb_entry.v:415-420); rv906's one extra
+    //     cycle is the unified tag/data array's response latency and
+    //     changes no visibility (a younger load probing after the grant
+    //     edge reads the new data from the array; an in-flight older load
+    //     still forwards from the still-valid entry, which retires only
+    //     next cycle).
+    //   * drain_d_busy_r (the response cycle): the DCache is single-
+    //     outstanding, so a new main-pipe op must not probe during it --
+    //     its ST_DCS would consume the DRAIN's response. Hold EX1 one
+    //     cycle (lsu_idu_full) and defer the issue/PTW-probe admission
+    //     (ag_raw_ready/ag_issue_ready/ptw_sv_idle_free) by that cycle --
+    //     the one-cycle stall the donor's data-port serialization imposes
+    //     on the DC stage when the STB holds the data port.
+    //   * Mutual exclusion with every other DCache-port requester is
+    //     dcache_req_other below (the donor's lfb/rdl/dc/mcic/ag terms,
+    //     mapped onto rv906's request arms): a real op's probe and the
+    //     refill's vpeek/commit/activation-peek always WIN over the drain
+    //     (the donor's dcache_data_sel priority is LFB/RDL > DC > ... >
+    //     STB, aq_lsu_arb.v:526-531); the drain simply retries next free
+    //     cycle, exactly as the donor's entry stays in STB_WCA.
+    //   * It may fire on the SAME cycle the old (non-cacheable) drain
+    //     enters ST_DCS: disjoint entries, and the old path takes no
+    //     DCache port (touches_array=0 for it), so no port collision; the
+    //     old path's ST_DCS does not sample the response (its
+    //     dc_touched_array_r=0), so the drain's response on the next
+    //     cycle is invisible to it.
+    //-------------------------------------------------------------------------
+    // Every OTHER DCache data-port requester active THIS cycle (the
+    // donor's aq_lsu_arb.v:380 exclusions in rv906's request-arm terms).
+    wire dcache_req_other = (issue_real && touches_array)
+                         || frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit
+                         || clean_req || ptw_sv_probe_fire;
+    // The grant (donor aq_lsu_arb.v:380): the data array is free (u_dc_idle
+    // -- during a refill's DRAM bus-wait the miss FSM is at MS_REFILL_READ
+    // and the DCache is in its accept state, exactly the donor's window
+    // where lfb_arb_dcache_sel=ref_vld=0, aq_lsu_lfb.v:1068,1075) and no
+    // other requester owns the port this cycle. rf_port_busy/clean_active/
+    // ptw_sv_busy are redundant with dcache_req_other/u_dc_idle in most
+    // cycles but keep the grant's exclusions explicit, one-to-one with the
+    // donor's.
+    //
+    // DRAIN-VS-COMMIT RACE (the amomax/amomin regression): the drain's
+    // DCache write latches stb_data[drain_pick_d] COMBINATORIALLY (the
+    // DCache accepts from ST_IDLE this cycle, DCache.v:257-268). A store/SC/
+    // AMO commit that merges into the SAME entry on this posedge updates
+    // stb_data as a NON-BLOCKING assign -- so the drain latches the PRE-
+    // commit bytes, and the entry retires NEXT cycle (drain_d_done_r, below)
+    // with the committed payload never reaching the array: a lost store.
+    // Traced directly: amomax_d test 5 -- `sd x0` parks data=0 in the entry;
+    // the back-to-back `amomax.d` computes amo_new_c=1 at REPLY and merges it
+    // in on the posedge, but the drain fires the same cycle with stb_data=0
+    // and the entry retires next cycle -> the D$ line holds 0, not 1.
+    //
+    // The donor cannot hit this: a drain-in-progress entry is in STB_WCA,
+    // which is NON-mergeable (stb_cur_merg = state==STB_MERGE,
+    // aq_lsu_stb_entry.v:449; stb_entry_merge_en :594-597), so a racing
+    // commit allocates a NEW entry (stb_create_vld = dc_stb_req &
+    // !stb_merge_en, aq_lsu_stb.v:548) -- and the WCA entry POPS on the grant
+    // posedge (stb_entry_pop_vld_x, aq_lsu_stb_entry.v:455-457), so there is
+    // never a transient two-entries-for-one-dword state. rv906's drained
+    // entry retires one cycle AFTER the grant (documented response-cycle
+    // delay, below), so excluding it from merge and allocating a new entry
+    // would transiently break the at-most-one-entry-per-dword invariant
+    // (the DA forward, line ~2974, picks the lowest index and would read the
+    // stale drained entry). Instead: defer the drain one cycle when a commit
+    // is merging into the drained entry. The commit lands in the entry on
+    // this posedge; the drain retries next free cycle and writes the merged
+    // (correct) data. Net effect matches the donor: the racing commit's data
+    // is the final array state.
+    wire drain_commit_conflict =
+        ((reply_is_store && !reply_is_misalign && store_line_resident)
+          || reply_is_sc_commit || reply_is_amo_commit)
+        && !dc_store_cancel_r
+        && stb_match_here && (stb_match_idx == drain_pick_d);
+    wire issue_drain_d = any_stb_drainable_hit && u_dc_idle
+                        && !dcache_req_other && !rf_port_busy
+                        && !clean_active && !ptw_sv_busy
+                        && !drain_commit_conflict;
+
+    // One-cycle-late retire + the drain's own busy (response) cycle.
+    reg        drain_d_done_r;
+    reg [1:0]  drain_d_idx_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            drain_d_done_r <= 1'b0;
+            drain_d_idx_r  <= 2'd0;
+        end else begin
+            drain_d_done_r <= issue_drain_d;
+            if (issue_drain_d) drain_d_idx_r <= drain_pick_d;
+        end
+    end
+    // The cycle after the grant: the DCache is in its response state (not
+    // dc_idle) -- the new-op issue/PTW-probe admission gates above use this
+    // to hold EX1 for that one cycle (see the block comment; forward-
+    // referenced from the AG section, this file's established style).
+    wire drain_d_busy_r = drain_d_done_r;
+
+    //-------------------------------------------------------------------------
+    // Per-set FIFO replacement pointer state (single driver: reset, the
+    // refill-commit advance, and the fence.i invalidate-all reset).
+    //   * ADVANCE (donor aq_lsu_lfb.v:1084-1087): frz_issue_commit fires
+    //     exactly ONCE per refill -- it is gated on miss_state==MS_COMMIT_
+    //     ISSUE, and that case moves to MS_COMMIT_WAIT the same cycle -- and
+    //     it fires for BOTH the blocking FRZ (state==ST_FRZ) and the
+    //     background LFB (lfb_engine_active) paths. victim_set (== frz_eff_
+    //     index) is that refill's set in both, so the refilled set's pointer
+    //     rotates p -> p+1 mod 4 exactly once, on the cycle the new line is
+    //     written. The SAME victim_set the pointer-read above used.
+    //   * RESET (donor aq_lsu_icc.v:614-615): the fence.i clean walk visits
+    //     every set; reset that set's pointer to way 0 on its CL_SET_READ
+    //     cycle. A background-LFB commit on the same set in the same cycle
+    //     (rare) takes advance priority; the pointer is a non-functional
+    //     policy hint, so the skipped reset is harmless.
+    //-------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // Blocking (not <=): Verilator rejects a non-blocking array
+            // write inside this for loop (BLKLOOPINIT). Safe here -- the
+            // reset branch is mutually exclusive with the functional branch
+            // below and each iteration writes a constant to a distinct,
+            // never-read-in-this-loop index.
+            for (fifo_ptr_i = 0; fifo_ptr_i < DCACHE_SETS; fifo_ptr_i = fifo_ptr_i + 1)
+                fifo_ptr[fifo_ptr_i] = 2'd0;
+        end else if (frz_issue_commit) begin
+            fifo_ptr[victim_set] <= fifo_ptr[victim_set] + 2'd1;
+        end else if (clean_state == CL_SET_READ) begin
+            fifo_ptr[clean_set] <= 2'd0;
+        end
+    end
+
     // M4 Task 5: ptw_sv_probe_fire adds a fourth array requester (SECTION
     // PTW SERVANT, above) -- a plain read (way_sel=0, wr=0, alloc=0), so it
     // needs an explicit arm only where the existing fallback (ag_is_store,
     // driven by whatever is live in IDU's EX1 register regardless of
     // whether THIS cycle's array use is even a real instruction's) would
     // otherwise leak a stale write. ptw_sv_probe_fire is mutually exclusive
-    // with frz_issue_*/clean_req/issue_drain by construction (its own
-    // ptw_sv_idle_free gate), so it only needs to beat the ag_is_store
-    // fallback, not the other arms.
-    assign u_dc_req_vld       = touches_array || frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit || clean_req || ptw_sv_probe_fire;
+    // with frz_issue_*/clean_req/issue_drain/issue_drain_d by construction
+    // (its own ptw_sv_idle_free gate), so it only needs to beat the
+    // ag_is_store fallback, not the other arms. issue_drain_d is the
+    // DIRECT cacheable-drain grant (see its block above): all arms are
+    // mutually exclusive (dcache_req_other), so their order is defensive.
+    assign u_dc_req_vld       = touches_array || issue_drain_d
+                                || frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit || clean_req || ptw_sv_probe_fire;
     assign u_dc_req_way_sel   = frz_issue_vpeek ? victim_way_r : (frz_issue_commit ? victim_way_r
                                 : clean_issue_peek ? clean_way_oh
-                                : (issue_drain ? stb_way[drain_pick] : {WAYS{1'b0}}));
+                                : (issue_drain_d ? stb_way[drain_pick_d]
+                                : (issue_drain ? stb_way[drain_pick] : {WAYS{1'b0}})));
     assign u_dc_req_wr        = frz_issue_commit ? 1'b1 : ((frz_issue_lfb_peek || frz_issue_vpeek) ? 1'b0
                                 : (ptw_sv_probe_fire ? 1'b0
                                 // M7 Task 2: the DTU's store-suppression latch
@@ -2601,23 +2924,28 @@ module LSU #(
                                 // kept as the donor's commit-side CANCEL
                                 // consumption, see the dc_store_cancel_r
                                 // reset comment).
-                                : (issue_drain ? 1'b1 : (ag_is_store && !dc_store_cancel_r))));
+                                : ((issue_drain_d || issue_drain) ? 1'b1
+                                : (ag_is_store && !dc_store_cancel_r))));
     assign u_dc_req_alloc     = frz_issue_commit;
     assign u_dc_req_wdata      = frz_issue_commit ? frz_rdata_r
+                                : (issue_drain_d ? ({448'b0, stb_data[drain_pick_d]} << ({58'b0, stb_dw_off[drain_pick_d]} * 64))
                                 : (issue_drain ? ({448'b0, stb_data[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 64))
-                                : {448'b0, ag_store_data_positioned} << ({58'b0, ag_dw_off} * 64));
+                                : ({448'b0, ag_store_data_positioned} << ({58'b0, ag_dw_off} * 64))));
     assign u_dc_req_wstrb      = frz_issue_commit ? 64'hFFFF_FFFF_FFFF_FFFF
+                                : (issue_drain_d ? ({56'b0, stb_byte_vld[drain_pick_d]} << ({58'b0, stb_dw_off[drain_pick_d]} * 8))
                                 : (issue_drain ? ({56'b0, stb_byte_vld[drain_pick]} << ({58'b0, stb_dw_off[drain_pick]} * 8))
-                                : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8)));
+                                : ({56'b0, ag_byte_mask} << ({58'b0, ag_dw_off} * 8))));
     assign u_dc_req_dirty_set  = frz_issue_commit ? 1'b0 : (ptw_sv_probe_fire ? 1'b0
-                                : (issue_drain ? 1'b1 : (ag_is_store && !dc_store_cancel_r)));
+                                : ((issue_drain_d || issue_drain) ? 1'b1 : (ag_is_store && !dc_store_cancel_r)));
     assign u_dc_req_index      = frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit ? frz_eff_index
                                 : clean_req ? clean_set
                                 : ptw_sv_probe_fire ? ptw_sv_req_index
-                                : (issue_drain ? stb_index[drain_pick] : ag_dc_index);
+                                : (issue_drain_d ? stb_index[drain_pick_d]
+                                : (issue_drain ? stb_index[drain_pick] : ag_dc_index));
     assign u_dc_req_tag        = frz_issue_lfb_peek || frz_issue_vpeek || frz_issue_commit ? frz_eff_tag
                                 : ptw_sv_probe_fire ? ptw_sv_req_tag
-                                : (issue_drain ? stb_tag[drain_pick] : ag_dc_tag);
+                                : (issue_drain_d ? stb_tag[drain_pick_d]
+                                : (issue_drain ? stb_tag[drain_pick] : ag_dc_tag));
 
     //-------------------------------------------------------------------------
     // SECTION AXI D-side master (design doc S2.1) -- a single shared write
@@ -3001,6 +3329,15 @@ module LSU #(
             // drain retirement
             if ((state == ST_REPLY) && dc_is_drain_r && (!frz_is_direct_r || miss_done_latched))
                 stb_vld[dc_drain_idx_r] <= 1'b0;
+            // DIRECT drain retirement (lost-store fix): the blind data+dirty
+            // write committed on the grant edge (SRAM.v wr_cyc); retire the
+            // entry the next cycle -- the donor pops on the grant cycle
+            // (aq_lsu_stb_entry.v:415-420), rv906's unified tag/data array
+            // costs the one response cycle. Disjoint from the old path
+            // above by construction (was_hit=1 vs was_hit=0 entries), so
+            // the two NBAs can only ever target different array elements.
+            if (drain_d_done_r)
+                stb_vld[drain_d_idx_r] <= 1'b0;
             // store completion: merge into an existing entry, or allocate.
             // M3: a successful SC (reply_is_sc_commit) and an AMO
             // (reply_is_amo_commit) commit here too -- both are load-like
@@ -3287,5 +3624,6 @@ module LSU #(
 
     // rtu_lsu_expt_ack/_expt_exit are consumed by the LR/SC reservation
     // clear (SECTION LR buffer, donor aq_lsu_lm.v:135).
+
 
 endmodule

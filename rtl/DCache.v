@@ -95,6 +95,15 @@ module DCache (
                                                                // 11, victim
                                                                // writeback)
 
+    // The DCache's own FSM is in its accept state (ST_IDLE): it will take a
+    // dc_req_vld / dc_inv_vld presented THIS cycle. Exposed so LSU.v's
+    // donor-faithful per-cycle STB data-port drain grant (the direct
+    // cacheable-drain path) can key off "the data array is free" exactly as
+    // the donor's arb_stb_grant keys off no-other-data-requester (donor
+    // aq_lsu_arb.v:380) -- in rv906's single-ported DCache that is precisely
+    // this FSM's accept state.
+    output wire                            dc_idle,
+
     //=========================================================================
     // LSU -> DCache : invalidate (fence.i-adjacent D-side coherence /
     // explicit line invalidate).
@@ -176,19 +185,17 @@ module DCache (
     // way `dc_req_way_sel` names, falling back to the hit way when
     // `dc_req_way_sel` is all-zero.
     //
-    // REPLACEMENT POLICY IS NOT OWNED BY THIS MODULE (a deliberate,
-    // documented simplification vs. the donor, where dc.v forwards a
-    // stored-in-the-dirty-row "fifo" replacement pointer it does not itself
-    // update -- research found the actual pointer-advance logic lives
-    // outside the 4 files read, most likely aq_lsu_rdl.v, out of scope for
-    // this minimal clone). This module exposes exactly what a requester
-    // needs to run ANY replacement policy itself (`dc_resp_way_vld`/
-    // `dc_resp_way_dirty` at the index, plus the way-peek mechanism above);
-    // LSU.v (Task 6.3) is where the actual "prefer an invalid way, else a
-    // small round-robin counter" minimal policy lives -- "the mechanism, not
-    // the donor's full generality" (contract 11's own framing), matching
-    // this task's explicit instruction not to replicate `aq_lsu_vb.v`'s
-    // full per-set FIFO-pointer machinery.
+    // REPLACEMENT POLICY IS NOT OWNED BY THIS MODULE -- LSU.v runs it,
+    // exactly as the donor does (the pointer-advance logic lives in
+    // aq_lsu_rdl.v/aq_lsu_lfb.v, outside the D-cache arrays). This module
+    // exposes exactly what a requester needs to run ANY replacement policy
+    // itself (`dc_resp_way_vld`/`dc_resp_way_dirty` at the index, plus the
+    // way-peek mechanism above); LSU.v is where the donor's per-set FIFO
+    // replacement pointer now lives (fifo_ptr[], the 2-bit-count equivalent
+    // of the donor's 4-bit one-hot stored in the dirty row's upper nibble):
+    // victim = the pointer's way, advanced p -> p+1 mod 4 on every same-set
+    // refill commit, reset to way 0 on invalidate-all (see LSU.v's
+    // victim-select section for the full donor cites).
     //=========================================================================
 
     localparam WAYS       = DCACHE_WAYS;                 // 4
@@ -203,6 +210,8 @@ module DCache (
     localparam [1:0] ST_REPLY = 2'b11;
 
     reg [1:0] state;
+
+    assign dc_idle = (state == ST_IDLE);
 
     //-------------------------------------------------------------------------
     // Latched request fields (captured every time IDLE accepts a request,
